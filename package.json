@@ -1,0 +1,39 @@
+{
+  "name": "@toolplex/app-server",
+  "version": "0.1.0",
+  "description": "ToolPlex application server plugin — serves page definitions, data, actions, and context for ToolPlex Apps",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc",
+    "build:watch": "tsc --watch",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint 'src/**/*.ts'",
+    "lint:fix": "eslint --fix 'src/**/*.ts'",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "fastify-plugin": "^5.0.1"
+  },
+  "peerDependencies": {
+    "fastify": ">=5.0.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.24.0",
+    "@types/node": "^20.5.0",
+    "eslint": "^9.24.0",
+    "fastify": "^5.2.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.0.0",
+    "typescript-eslint": "^8.29.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
