@@ -40,8 +40,63 @@ export interface TableSection {
 export interface Column {
   key: string;
   label: string;
-  format?: "text" | "integer" | "number" | "percent" | "currency" | "date";
+  format?: ColumnFormat;
   width?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Column formatting — string shorthands for simple cases, objects for rich
+// ---------------------------------------------------------------------------
+
+export type ColumnFormat = SimpleFormat | RichFormat;
+
+/** String shorthands — cover 90% of columns */
+export type SimpleFormat =
+  | "text"       // String(value) — default
+  | "integer"    // toLocaleString, no decimals
+  | "number"     // toLocaleString with decimals
+  | "percent"    // (value * 100).toFixed(1) + "%"
+  | "currency"   // "$" + toLocaleString
+  | "date"       // date string formatting
+  | "boolean";   // ✓ / ✗
+
+/** Object format — richer visual treatment */
+export type RichFormat =
+  | StatusFormat
+  | DeltaFormat
+  | LinkFormat
+  | ImageFormat
+  | ProgressFormat;
+
+/** Colored badge — maps cell values to colors */
+export interface StatusFormat {
+  type: "status";
+  colors?: Record<string, string>; // e.g. { approved: "green", pending: "yellow", rejected: "red" }
+  // If omitted, renderer uses sensible defaults for common values
+}
+
+/** Signed delta — green positive, red negative */
+export interface DeltaFormat {
+  type: "delta";
+  format?: "number" | "percent"; // how to format the numeric value (default: "number")
+}
+
+/** Clickable URL */
+export interface LinkFormat {
+  type: "link";
+  label?: string; // static label text; if omitted, shows the URL value
+}
+
+/** Inline thumbnail */
+export interface ImageFormat {
+  type: "image";
+  width?: number;  // default: 32
+  height?: number; // default: 32
+}
+
+/** Progress bar for 0–1 values */
+export interface ProgressFormat {
+  type: "progress";
 }
 
 export interface Filter {
@@ -172,7 +227,7 @@ export interface Selection {
 export interface CardData {
   label: string;
   value: number | string;
-  format?: "text" | "integer" | "number" | "percent" | "currency" | "date";
+  format?: ColumnFormat;
 }
 
 // ---------------------------------------------------------------------------
@@ -200,7 +255,8 @@ export type DetailBlock =
   | DetailHeader
   | DetailField
   | DetailList
-  | DetailTable;
+  | DetailTable
+  | DetailImage;
 
 export interface DetailHeader {
   type: "header";
@@ -211,7 +267,7 @@ export interface DetailField {
   type: "field";
   label: string;
   value: string | number | boolean | null;
-  format?: "text" | "integer" | "number" | "percent" | "currency" | "date";
+  format?: ColumnFormat;
 }
 
 export interface DetailList {
@@ -220,7 +276,7 @@ export interface DetailList {
   items: {
     label: string;
     value?: string | number;
-    format?: "text" | "integer" | "number" | "percent" | "currency" | "date";
+    format?: ColumnFormat;
     id?: string | number;
   }[];
 }
@@ -228,8 +284,17 @@ export interface DetailList {
 export interface DetailTable {
   type: "table";
   label: string;
-  columns: { key: string; label: string; format?: Column["format"] }[];
+  columns: { key: string; label: string; format?: ColumnFormat }[];
   rows: Record<string, unknown>[];
+}
+
+export interface DetailImage {
+  type: "image";
+  label?: string;
+  url: string;
+  alt?: string;
+  width?: number;
+  height?: number;
 }
 
 // ---------------------------------------------------------------------------

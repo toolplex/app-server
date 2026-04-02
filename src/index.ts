@@ -17,6 +17,16 @@ export type {
   Filter,
   Action,
 
+  // Column formatting
+  ColumnFormat,
+  SimpleFormat,
+  RichFormat,
+  StatusFormat,
+  DeltaFormat,
+  LinkFormat,
+  ImageFormat,
+  ProgressFormat,
+
   // Handler contracts
   FetchRequest,
   FetchResponse,
@@ -25,13 +35,16 @@ export type {
   ContextRequest,
   ContextResponse,
   PageContextRequest,
+  PaginatedResponse,
+
+  // Row shape conventions
   CardData,
   DetailBlock,
   DetailHeader,
   DetailField,
   DetailList,
   DetailTable,
-  PaginatedResponse,
+  DetailImage,
 
   // Handler function types
   FetchHandler,
