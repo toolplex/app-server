@@ -1,11 +1,18 @@
 {
   "name": "@toolplex/app-server",
   "version": "0.1.0",
-  "description": "ToolPlex application server plugin — serves page definitions, data, actions, and context for ToolPlex Apps",
+  "description": "Fastify plugin for serving ToolPlex App Pages — page definitions, paginated data, actions, and agent context",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": ["dist"],
+  "license": "SEE LICENSE IN LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/toolplex/app-server"
+  },
+  "homepage": "https://github.com/toolplex/app-server#readme",
+  "keywords": ["toolplex", "fastify", "fastify-plugin", "app-server", "pages", "dashboard"],
   "scripts": {
     "build": "tsc",
     "build:watch": "tsc --watch",
