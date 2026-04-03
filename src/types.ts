@@ -113,12 +113,9 @@ export interface Action {
   action: string;
   params?: Record<string, unknown>;
   confirm?: string;
-  placement?: "toolbar" | "inline"; // default: "toolbar"
-  // toolbar: button in the toolbar above the table, operates on checkbox-selected rows
-  //   - selection_required: true → disabled until rows are selected
-  //   - selection_required: false → global action (e.g. "Export CSV", "Refresh")
-  // inline: button rendered on each table row, fires with that single row's ID
+  placement?: "toolbar" | "inline";
   selection_required?: boolean;
+  variant?: "default" | "primary" | "success" | "danger" | "warning";
 }
 
 // ---------------------------------------------------------------------------
