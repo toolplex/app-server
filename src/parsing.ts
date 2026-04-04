@@ -3,6 +3,7 @@ import type { FetchRequest, ContextRequest, SortSpec, Selection } from "./types.
 const DEFAULT_PAGE = 1;
 const DEFAULT_PAGE_SIZE = 50;
 const MAX_PAGE_SIZE = 500;
+const MAX_PAGE = 10_000;
 
 // ---------------------------------------------------------------------------
 // Parse query params into typed request objects
@@ -11,7 +12,7 @@ const MAX_PAGE_SIZE = 500;
 export function parseFetchParams(
   query: Record<string, string | undefined>,
 ): FetchRequest {
-  const page = clampInt(query.page, DEFAULT_PAGE, 1);
+  const page = clampInt(query.page, DEFAULT_PAGE, 1, MAX_PAGE);
   const pageSize = clampInt(query.pageSize, DEFAULT_PAGE_SIZE, 1, MAX_PAGE_SIZE);
   const sort = parseSort(query.sort);
   const filters = parseFilters(query);
