@@ -32,6 +32,7 @@ export interface TableSection {
   rowKey: string;
   columns: Column[];
   span?: number;
+  downloadable?: boolean; // allow CSV export of full dataset (default: false)
   detail?: {
     source: string; // resource fetched when a row is clicked, rendered as a detail drawer
   };

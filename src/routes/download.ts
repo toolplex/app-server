@@ -1,0 +1,152 @@
+import type { FastifyInstance } from "fastify";
+import type { AppServerConfig, FetchRequest } from "../types.js";
+import { parseFetchParams } from "../parsing.js";
+import { validateFetchResponse } from "../validation.js";
+
+/** Internal page size for chunked fetching — not exposed to clients */
+const DOWNLOAD_CHUNK_SIZE = 1000;
+
+/** Maximum rows to export (safety valve) */
+const MAX_DOWNLOAD_ROWS = 1_000_000;
+
+// ---------------------------------------------------------------------------
+// CSV helpers
+// ---------------------------------------------------------------------------
+
+function csvEscape(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  const str = String(value);
+  if (str.includes(",") || str.includes('"') || str.includes("\n") || str.includes("\r")) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
+}
+
+function csvRow(values: unknown[]): string {
+  return values.map(csvEscape).join(",") + "\r\n";
+}
+
+// ---------------------------------------------------------------------------
+// Route
+// ---------------------------------------------------------------------------
+
+export function registerDownloadRoutes(
+  fastify: FastifyInstance,
+  config: AppServerConfig,
+): void {
+  fastify.get<{
+    Params: { resource: string };
+    Querystring: Record<string, string>;
+  }>("/download/:resource", async (request, reply) => {
+    const { resource } = request.params;
+    const definition = config.resources[resource];
+
+    if (!definition) {
+      return reply.code(404).send({ error: `Resource "${resource}" not found` });
+    }
+
+    // Check that this resource is marked downloadable in at least one table section
+    if (!isResourceDownloadable(resource, config)) {
+      return reply.code(403).send({ error: `Resource "${resource}" is not downloadable` });
+    }
+
+    // Parse filters/sort from query params (page/pageSize ignored — we fetch all)
+    const baseParams = parseFetchParams(request.query);
+
+    // Parse column spec from query param: JSON array of {key, label}
+    let columns: { key: string; label: string }[] | undefined;
+    try {
+      if (request.query.columns) {
+        columns = JSON.parse(request.query.columns);
+      }
+    } catch {
+      // Ignore parse errors — we'll discover columns from data
+    }
+
+    // Set response headers for CSV download
+    const filename = `${resource}_${new Date().toISOString().slice(0, 10)}.csv`;
+    reply.raw.writeHead(200, {
+      "Content-Type": "text/csv; charset=utf-8",
+      "Content-Disposition": `attachment; filename="${filename}"`,
+      "Transfer-Encoding": "chunked",
+      "Cache-Control": "no-cache",
+    });
+
+    // Fetch page 1 to discover total and (if needed) column keys
+    const firstReq: FetchRequest = {
+      page: 1,
+      pageSize: DOWNLOAD_CHUNK_SIZE,
+      sort: baseParams.sort,
+      filters: baseParams.filters,
+    };
+
+    const firstPage = await definition.fetch(firstReq);
+    validateFetchResponse(resource, firstPage);
+
+    // Resolve columns — prefer explicit spec, fall back to keys from first row
+    if (!columns || columns.length === 0) {
+      if (firstPage.rows.length > 0) {
+        columns = Object.keys(firstPage.rows[0]).map((k) => ({ key: k, label: k }));
+      } else {
+        // Empty dataset — write empty CSV
+        reply.raw.end("");
+        return reply;
+      }
+    }
+
+    const keys = columns.map((c) => c.key);
+
+    // Write CSV header
+    reply.raw.write(csvRow(columns.map((c) => c.label)));
+
+    // Write first page rows
+    for (const row of firstPage.rows) {
+      reply.raw.write(csvRow(keys.map((k) => row[k])));
+    }
+
+    // Calculate remaining pages
+    const total = Math.min(firstPage.total, MAX_DOWNLOAD_ROWS);
+    const totalPages = Math.ceil(total / DOWNLOAD_CHUNK_SIZE);
+
+    // Fetch remaining pages and stream
+    for (let page = 2; page <= totalPages; page++) {
+      const req: FetchRequest = {
+        page,
+        pageSize: DOWNLOAD_CHUNK_SIZE,
+        sort: baseParams.sort,
+        filters: baseParams.filters,
+      };
+
+      const result = await definition.fetch(req);
+
+      for (const row of result.rows) {
+        reply.raw.write(csvRow(keys.map((k) => row[k])));
+      }
+    }
+
+    reply.raw.end();
+    return reply;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Check if a resource is marked downloadable in any page's table sections
+// ---------------------------------------------------------------------------
+
+function isResourceDownloadable(resource: string, config: AppServerConfig): boolean {
+  for (const page of Object.values(config.pages)) {
+    for (const sectionOrRow of page.sections) {
+      const sections = Array.isArray(sectionOrRow) ? sectionOrRow : [sectionOrRow];
+      for (const section of sections) {
+        if (
+          section.type === "table" &&
+          section.source === resource &&
+          section.downloadable === true
+        ) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}

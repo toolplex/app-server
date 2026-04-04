@@ -7,6 +7,7 @@ import { registerPageRoutes } from "./routes/pages.js";
 import { registerDataRoutes } from "./routes/data.js";
 import { registerActionRoutes } from "./routes/actions.js";
 import { registerContextRoutes } from "./routes/context.js";
+import { registerDownloadRoutes } from "./routes/download.js";
 
 async function appServerPlugin(
   fastify: FastifyInstance,
@@ -24,6 +25,7 @@ async function appServerPlugin(
   registerDataRoutes(fastify, config);
   registerActionRoutes(fastify, config);
   registerContextRoutes(fastify, config);
+  registerDownloadRoutes(fastify, config);
 
   // Catch handler errors and return structured responses
   fastify.setErrorHandler(async (error: Error & { statusCode?: number }, _request, reply) => {
