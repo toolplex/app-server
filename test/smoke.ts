@@ -38,10 +38,7 @@ await server.register(registerAppPages, {
         { key: "status", type: "dropdown", options: ["pending", "approved", "exported"], default: "pending" },
       ],
       actions: [
-        { label: "Approve", action: "approve_orders", placement: "inline" },
-        { label: "Reject", action: "reject_orders", placement: "inline", confirm: "Reject this order?" },
-        { label: "Approve Selected", action: "approve_orders", placement: "toolbar", selection_required: true, confirm: "Approve all selected?" },
-        { label: "Export CSV", action: "export_csv", placement: "toolbar" },
+        { label: "Export CSV", action: "export_csv", variant: "default" },
       ],
       suggestions: [
         "Approve all A-tier stores",
@@ -50,7 +47,10 @@ await server.register(registerAppPages, {
       sections: [
         { type: "card-row", source: "order_kpis" },
         [
-          { type: "table", source: "orders", rowKey: "order_id", span: 8, columns: [
+          { type: "table", source: "orders", rowKey: "order_id", span: 8, actions: [
+            { label: "Approve", action: "approve_orders", variant: "success" },
+            { label: "Reject", action: "reject_orders", variant: "danger" },
+          ], columns: [
             { key: "store", label: "Store" },
             { key: "sku", label: "SKU" },
             { key: "qty", label: "Qty", format: "integer" },

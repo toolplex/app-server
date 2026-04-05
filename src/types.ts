@@ -31,6 +31,7 @@ export interface TableSection {
   source: string;
   rowKey: string;
   columns: Column[];
+  actions?: Action[];  // table/row-level actions (inline per-row + toolbar when selected)
   span?: number;
   downloadable?: boolean; // allow CSV export of full dataset (default: false)
   detail?: {
@@ -112,11 +113,22 @@ export interface Filter {
 export interface Action {
   label: string;
   action: string;
-  params?: Record<string, unknown>;
-  confirm?: string;
-  placement?: "toolbar" | "inline";
-  selection_required?: boolean;
   variant?: "default" | "primary" | "success" | "danger" | "warning";
+  bulk?: boolean;              // appear in toolbar for multi-select? (default: true)
+  toolbar_only?: boolean;      // hide inline, show only in toolbar (default: false)
+  inputs?: ActionInput[];      // dynamic inputs collected in confirmation modal
+  params?: Record<string, unknown>;
+  context?: { source: string };  // resource fetched when modal opens, returns DetailBlock[]
+}
+
+export interface ActionInput {
+  key: string;
+  label: string;
+  type: "text" | "textarea" | "number" | "select";
+  options?: string[];
+  default?: string | number;
+  required?: boolean;          // default: true
+  placeholder?: string;
 }
 
 // ---------------------------------------------------------------------------
