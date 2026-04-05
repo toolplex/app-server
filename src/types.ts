@@ -42,6 +42,7 @@ export interface ChartSeries {
   key: string;
   label?: string;
   color?: string;
+  axis?: "left" | "right"; // which Y axis (default: "left"). Use "right" for a second scale.
 }
 
 /** Compact tab control on a chart — selected value passed as a filter to the fetch handler */
