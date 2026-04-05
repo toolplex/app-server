@@ -12,7 +12,7 @@ export interface PageDefinition {
   context?: PageContextHandler;
 }
 
-export type Section = CardRowSection | CardColumnSection | TableSection;
+export type Section = CardRowSection | CardColumnSection | TableSection | ChartSection;
 
 export interface CardRowSection {
   type: "card-row";
@@ -24,6 +24,23 @@ export interface CardColumnSection {
   type: "card-column";
   source: string;
   span?: number;
+}
+
+export interface ChartSection {
+  type: "chart";
+  source: string;
+  chart: "line" | "bar" | "pie";
+  title?: string;
+  x: { key: string; label?: string };
+  y: ChartSeries[];
+  span?: number;
+  height?: number; // px, default 280
+}
+
+export interface ChartSeries {
+  key: string;
+  label?: string;
+  color?: string;
 }
 
 export interface TableSection {
@@ -116,9 +133,17 @@ export interface Action {
   variant?: "default" | "primary" | "success" | "danger" | "warning";
   bulk?: boolean;              // appear in toolbar for multi-select? (default: true)
   toolbar_only?: boolean;      // hide inline, show only in toolbar (default: false)
+  condition?: ActionCondition; // show only when row matches (client-side, per-row for inline)
   inputs?: ActionInput[];      // dynamic inputs collected in confirmation modal
   params?: Record<string, unknown>;
   context?: { source: string };  // resource fetched when modal opens, returns DetailBlock[]
+}
+
+/** Show/hide an action based on a row value. Evaluated client-side. */
+export interface ActionCondition {
+  key: string;               // column key to check
+  eq?: unknown;              // show when value === eq
+  neq?: unknown;             // show when value !== neq
 }
 
 export interface ActionInput {
