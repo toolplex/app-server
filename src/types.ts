@@ -33,6 +33,7 @@ export interface ChartSection {
   title?: string;
   x: { key: string; label?: string };
   y: ChartSeries[];
+  controls?: ChartControl[]; // pill-tab controls rendered in chart header
   span?: number;
   height?: number; // px, default 280
 }
@@ -41,6 +42,14 @@ export interface ChartSeries {
   key: string;
   label?: string;
   color?: string;
+}
+
+/** Compact tab control on a chart — selected value passed as a filter to the fetch handler */
+export interface ChartControl {
+  key: string;
+  label?: string;
+  options: string[];
+  default?: string;
 }
 
 export interface TableSection {
