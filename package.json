@@ -1,6 +1,6 @@
 {
   "name": "@toolplex/app-server",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Fastify plugin for serving ToolPlex App Pages — page definitions, paginated data, actions, and agent context",
   "type": "module",
   "main": "dist/index.js",
