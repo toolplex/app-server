@@ -50,7 +50,9 @@ export function registerDownloadRoutes(
       return reply.code(403).send({ error: `Resource "${resource}" is not downloadable` });
     }
 
-    // Parse filters/sort from query params (page/pageSize ignored — we fetch all)
+    // Parse filters/sort from query params (page/pageSize ignored — we fetch all).
+    // baseParams already includes columnFilters split out of the filter bag;
+    // we pass them through to the handler on every chunk request.
     const baseParams = parseFetchParams(request.query);
 
     // Parse column spec from query param: JSON array of {key, label}
@@ -72,12 +74,15 @@ export function registerDownloadRoutes(
       "Cache-Control": "no-cache",
     });
 
-    // Fetch page 1 to discover total and (if needed) column keys
+    // Fetch page 1 to discover total and (if needed) column keys.
+    // The handler receives both filters AND columnFilters and is responsible
+    // for returning a correctly filtered + counted page.
     const firstReq: FetchRequest = {
       page: 1,
       pageSize: DOWNLOAD_CHUNK_SIZE,
       sort: baseParams.sort,
       filters: baseParams.filters,
+      columnFilters: baseParams.columnFilters,
     };
 
     const firstPage = await definition.fetch(firstReq);
@@ -104,7 +109,7 @@ export function registerDownloadRoutes(
       reply.raw.write(csvRow(keys.map((k) => row[k])));
     }
 
-    // Calculate remaining pages
+    // Calculate remaining pages from the handler's filtered total.
     const total = Math.min(firstPage.total, MAX_DOWNLOAD_ROWS);
     const totalPages = Math.ceil(total / DOWNLOAD_CHUNK_SIZE);
 
@@ -115,6 +120,7 @@ export function registerDownloadRoutes(
         pageSize: DOWNLOAD_CHUNK_SIZE,
         sort: baseParams.sort,
         filters: baseParams.filters,
+        columnFilters: baseParams.columnFilters,
       };
 
       const result = await definition.fetch(req);

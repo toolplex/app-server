@@ -170,11 +170,35 @@ export interface ActionInput {
 // Handler contracts — the interfaces developers implement
 // ---------------------------------------------------------------------------
 
+/**
+ * Per-column filter from the in-table column header UI.
+ *
+ * Wire format: query params with the convention `_cf_<columnKey>__<operator>=<value>`.
+ * Example: `_cf_status__equals=pending`. The framework parses these out of
+ * the query string and passes them to the handler as `columnFilters`; they
+ * NO LONGER appear in `filters` (which is reserved for top-of-page filters).
+ *
+ * Handlers MUST translate these to their data layer's filter mechanism (SQL
+ * WHERE clause, in-memory filter, etc.) and return correctly filtered rows
+ * AND a correct `total`. The framework does not post-filter.
+ *
+ * For in-memory data sources, the `applyColumnFilters` helper is exported
+ * from `@toolplex/app-server` and can be applied BEFORE pagination.
+ */
+export interface ColumnFilter {
+  columnKey: string;
+  operator: "equals" | "contains" | "gt" | "lt" | "empty" | "not_empty";
+  value: string;
+}
+
 export interface FetchRequest {
   page: number;
   pageSize: number;
   sort?: SortSpec;
+  /** Top-of-page filters (FilterBar dropdowns/text/date inputs). */
   filters?: Record<string, string>;
+  /** In-table column filters from per-column header UI. See ColumnFilter. */
+  columnFilters?: ColumnFilter[];
   selection?: Selection;
 }
 
@@ -197,6 +221,8 @@ export interface ActionResponse {
 
 export interface ContextRequest {
   filters?: Record<string, string>;
+  /** In-table column filters (mirrors FetchRequest.columnFilters). */
+  columnFilters?: ColumnFilter[];
   selection?: Selection;
 }
 

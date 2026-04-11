@@ -2,7 +2,13 @@
 
 export { registerAppPages } from "./plugin.js";
 
+// In-memory column filter helper for handlers that work with JS arrays
+// (dev/demo data sources). DB-backed handlers should translate
+// req.columnFilters into their query layer's WHERE clause instead.
+export { applyColumnFilters } from "./utils/columnFilters.js";
+
 export type {
+  ColumnFilter,
   // Plugin config
   AppServerConfig,
   ResourceDefinition,
