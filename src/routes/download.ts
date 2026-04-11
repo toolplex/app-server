@@ -3,11 +3,19 @@ import type { AppServerConfig, FetchRequest } from "../types.js";
 import { parseFetchParams } from "../parsing.js";
 import { validateFetchResponse } from "../validation.js";
 
-/** Internal page size for chunked fetching — not exposed to clients */
-const DOWNLOAD_CHUNK_SIZE = 1000;
+/**
+ * Internal page size for chunked fetching — not exposed to clients.
+ *
+ * Bumped from 1000 → 10000: handler.fetch() per-call overhead (auth, query
+ * planning, COUNT(*), result marshalling) is mostly fixed-cost. Increasing
+ * the chunk size 10× cuts per-call overhead by 10× without proportionally
+ * increasing per-query time. For a 1M row export this is the difference
+ * between 1000 round-trips and 100.
+ */
+const DOWNLOAD_CHUNK_SIZE = 10_000;
 
 /** Maximum rows to export (safety valve) */
-const MAX_DOWNLOAD_ROWS = 1_000_000;
+const MAX_DOWNLOAD_ROWS = 2_000_000;
 
 // ---------------------------------------------------------------------------
 // CSV helpers
@@ -77,6 +85,10 @@ export function registerDownloadRoutes(
     // Fetch page 1 to discover total and (if needed) column keys.
     // The handler receives both filters AND columnFilters and is responsible
     // for returning a correctly filtered + counted page.
+    //
+    // Chunk 1 MUST get the real total — we use it to compute totalPages
+    // and bound the chunk loop. Subsequent chunks pass skipTotal: true
+    // so handlers can skip the (often expensive) COUNT(*) query.
     const firstReq: FetchRequest = {
       page: 1,
       pageSize: DOWNLOAD_CHUNK_SIZE,
@@ -113,7 +125,9 @@ export function registerDownloadRoutes(
     const total = Math.min(firstPage.total, MAX_DOWNLOAD_ROWS);
     const totalPages = Math.ceil(total / DOWNLOAD_CHUNK_SIZE);
 
-    // Fetch remaining pages and stream
+    // Fetch remaining pages and stream. skipTotal: true tells handlers
+    // they can omit the COUNT(*) query — we already have the total from
+    // chunk 1 and never read result.total in this loop.
     for (let page = 2; page <= totalPages; page++) {
       const req: FetchRequest = {
         page,
@@ -121,6 +135,7 @@ export function registerDownloadRoutes(
         sort: baseParams.sort,
         filters: baseParams.filters,
         columnFilters: baseParams.columnFilters,
+        skipTotal: true,
       };
 
       const result = await definition.fetch(req);

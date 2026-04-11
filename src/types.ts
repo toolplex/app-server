@@ -214,6 +214,17 @@ export interface FetchRequest {
   /** In-table column filters from per-column header UI. See ColumnFilter. */
   columnFilters?: ColumnFilter[];
   selection?: Selection;
+  /**
+   * Framework hint that the handler MAY skip computing the total row count
+   * (e.g. SELECT COUNT(*)). Set by the /download route on chunks past the
+   * first — once the framework knows the total from chunk 1, subsequent
+   * chunks don't need it. Handlers that don't have a cheap row source can
+   * use this to skip a full COUNT(*) query and return total: 0.
+   *
+   * Handlers may ignore this and always count if their data source makes
+   * counting effectively free.
+   */
+  skipTotal?: boolean;
 }
 
 export interface FetchResponse {
