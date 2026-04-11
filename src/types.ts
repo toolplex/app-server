@@ -225,11 +225,36 @@ export interface FetchRequest {
    * counting effectively free.
    */
   skipTotal?: boolean;
+  /**
+   * Opaque cursor token from a prior response's `nextCursor`. Set by the
+   * /download route to advance through results via keyset pagination
+   * instead of OFFSET, which is O(N) on the offset position. Handlers
+   * that support cursor pagination should decode this token and use it
+   * to seek directly to the next chunk.
+   *
+   * Handlers that don't support cursors should ignore this field. The
+   * framework only enters cursor mode if the handler advertises support
+   * by returning a `nextCursor` on the FIRST chunk's response.
+   */
+  cursor?: string;
 }
 
 export interface FetchResponse {
   rows: Record<string, unknown>[];
   total: number;
+  /**
+   * Opaque cursor token that the framework can pass back as `cursor` on
+   * the next FetchRequest to continue keyset pagination. When present,
+   * the framework MAY switch to cursor mode for subsequent calls (used by
+   * the /download route to avoid OFFSET cost on large exports).
+   *
+   * - Return a non-null string if there are more rows to fetch.
+   * - Return null (or omit the field, then return undefined) when there
+   *   are no more rows.
+   * - Don't include this field at all if your handler doesn't support
+   *   cursor pagination — the framework falls back to page-based loops.
+   */
+  nextCursor?: string | null;
 }
 
 export interface ActionRequest {
