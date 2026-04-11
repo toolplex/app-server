@@ -1,4 +1,5 @@
 import type { FetchRequest, ContextRequest, SortSpec, Selection } from "./types.js";
+import { extractColumnFilters } from "./utils/columnFilters.js";
 
 const DEFAULT_PAGE = 1;
 const DEFAULT_PAGE_SIZE = 50;
@@ -15,17 +16,42 @@ export function parseFetchParams(
   const page = clampInt(query.page, DEFAULT_PAGE, 1, MAX_PAGE);
   const pageSize = clampInt(query.pageSize, DEFAULT_PAGE_SIZE, 1, MAX_PAGE_SIZE);
   const sort = parseSort(query.sort);
-  const filters = parseFilters(query);
+  const rawFilters = parseFilters(query);
+
+  // Split _cf_* keys out of the filter bag into a typed columnFilters array
+  // so handlers receive a clean separation between top-of-page filters and
+  // in-table column filters. Handlers must apply columnFilters themselves;
+  // the framework no longer post-filters (the post-filter only worked
+  // correctly for handlers that returned the full unpaginated dataset,
+  // which is impossible for any real DB-backed handler).
+  const columnFilters = extractColumnFilters(rawFilters);
+  const filters = stripColumnFilterKeys(rawFilters);
   const selection = parseSelection(query.selection);
 
-  return { page, pageSize, sort, filters, selection };
+  return { page, pageSize, sort, filters, columnFilters, selection };
+}
+
+function stripColumnFilterKeys(
+  filters: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+  if (!filters) return undefined;
+  const out: Record<string, string> = {};
+  let any = false;
+  for (const [k, v] of Object.entries(filters)) {
+    if (k.startsWith("_cf_")) continue;
+    out[k] = v;
+    any = true;
+  }
+  return any ? out : undefined;
 }
 
 export function parseContextParams(
   query: Record<string, string | undefined>,
 ): ContextRequest {
+  const rawFilters = parseFilters(query);
   return {
-    filters: parseFilters(query),
+    filters: stripColumnFilterKeys(rawFilters),
+    columnFilters: extractColumnFilters(rawFilters),
     selection: parseSelection(query.selection),
   };
 }
