@@ -71,6 +71,13 @@ export interface Column {
   label: string;
   format?: ColumnFormat;
   width?: number;
+  /**
+   * Optional human-friendly explanation of the column. Surfaced as a hover
+   * tooltip on the column header — useful for cryptic ERP-derived names
+   * like `mdco_r` or `served_knitt_out_packs` where the label alone isn't
+   * self-explanatory.
+   */
+  description?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -130,7 +137,14 @@ export interface ProgressFormat {
 
 export interface Filter {
   key: string;
-  type: "dropdown" | "text" | "date";
+  /**
+   * - dropdown / text / date — standard single-value controls
+   * - month-range — pair of month dropdowns for an inclusive [from, to]
+   *   range. Dispatches `<key>_from` and `<key>_to` as separate filter
+   *   keys; the resource handler is responsible for translating them.
+   *   For text-month columns ("April 2026"), use a TO_DATE BETWEEN.
+   */
+  type: "dropdown" | "text" | "date" | "month-range";
   label?: string;
   options?: string[];
   options_source?: string;
@@ -230,6 +244,12 @@ export interface ContextResponse {
   summary: string;
   selection?: string;
   suggestions?: string[];
+  /**
+   * Optional ISO timestamp of the latest data sync that backs this page.
+   * The desktop renders this as a "Synced Xh ago" pill in the page header
+   * so analysts know how fresh the numbers are at a glance.
+   */
+  lastSync?: string;
 }
 
 export interface PageContextRequest extends ContextRequest {
