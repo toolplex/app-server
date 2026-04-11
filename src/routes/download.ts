@@ -6,13 +6,24 @@ import { validateFetchResponse } from "../validation.js";
 /**
  * Internal page size for chunked fetching — not exposed to clients.
  *
- * Bumped from 1000 → 10000: handler.fetch() per-call overhead (auth, query
- * planning, COUNT(*), result marshalling) is mostly fixed-cost. Increasing
- * the chunk size 10× cuts per-call overhead by 10× without proportionally
- * increasing per-query time. For a 1M row export this is the difference
- * between 1000 round-trips and 100.
+ * 100_000 rows/chunk. The dominant cost on cloud-proxied deploys is the
+ * fixed per-call overhead (auth, proxy hops, token verification, fastify
+ * request lifecycle) — typically 1-2 seconds per chunk regardless of row
+ * count. Pushing the chunk size up amortizes that overhead across more
+ * rows. For a 1M row export this is 10 round-trips total (vs 1000 at the
+ * original 1k chunk size) — the per-chunk overhead is paid 10 times, not
+ * 1000 times.
+ *
+ * Memory cost: ~100k rows × ~500 bytes = ~50 MB JSON payload per chunk,
+ * with Node needing 2-3× that during marshalling (~150 MB peak per
+ * concurrent download). Comfortably within reasonable bounds even for
+ * 10 concurrent users.
+ *
+ * For handlers that support keyset cursor pagination (return `nextCursor`
+ * from their fetch handler), each chunk is also O(1) instead of O(N) —
+ * the OFFSET amplification disappears entirely.
  */
-const DOWNLOAD_CHUNK_SIZE = 10_000;
+const DOWNLOAD_CHUNK_SIZE = 100_000;
 
 /** Maximum rows to export (safety valve) */
 const MAX_DOWNLOAD_ROWS = 2_000_000;
@@ -117,31 +128,68 @@ export function registerDownloadRoutes(
     reply.raw.write(csvRow(columns.map((c) => c.label)));
 
     // Write first page rows
+    let rowsWritten = 0;
     for (const row of firstPage.rows) {
+      if (rowsWritten >= MAX_DOWNLOAD_ROWS) break;
       reply.raw.write(csvRow(keys.map((k) => row[k])));
+      rowsWritten++;
     }
 
-    // Calculate remaining pages from the handler's filtered total.
-    const total = Math.min(firstPage.total, MAX_DOWNLOAD_ROWS);
-    const totalPages = Math.ceil(total / DOWNLOAD_CHUNK_SIZE);
+    // Two loop modes — pick based on whether the handler advertises cursor
+    // pagination support by returning a nextCursor on chunk 1.
+    //
+    // CURSOR MODE (preferred for large exports):
+    //   The handler returned a non-null nextCursor on chunk 1, signalling
+    //   support for keyset pagination. We pass that cursor back on each
+    //   subsequent call. The handler uses it to seek directly to the next
+    //   chunk via WHERE (sort_cols) > (cursor_vals) — O(1) per chunk
+    //   regardless of position. Loop ends when nextCursor is null/absent.
+    //
+    // PAGE MODE (legacy fallback):
+    //   The handler omitted nextCursor entirely. We loop with page numbers
+    //   2..N as before, using firstPage.total to compute the page count.
+    //   This works for any handler but pays OFFSET cost on later chunks.
 
-    // Fetch remaining pages and stream. skipTotal: true tells handlers
-    // they can omit the COUNT(*) query — we already have the total from
-    // chunk 1 and never read result.total in this loop.
-    for (let page = 2; page <= totalPages; page++) {
-      const req: FetchRequest = {
-        page,
-        pageSize: DOWNLOAD_CHUNK_SIZE,
-        sort: baseParams.sort,
-        filters: baseParams.filters,
-        columnFilters: baseParams.columnFilters,
-        skipTotal: true,
-      };
-
-      const result = await definition.fetch(req);
-
-      for (const row of result.rows) {
-        reply.raw.write(csvRow(keys.map((k) => row[k])));
+    if (firstPage.nextCursor !== undefined && firstPage.nextCursor !== null) {
+      // CURSOR MODE
+      let cursor: string | null = firstPage.nextCursor;
+      while (cursor !== null && rowsWritten < MAX_DOWNLOAD_ROWS) {
+        const req: FetchRequest = {
+          page: 1, // ignored when cursor is set
+          pageSize: DOWNLOAD_CHUNK_SIZE,
+          sort: baseParams.sort,
+          filters: baseParams.filters,
+          columnFilters: baseParams.columnFilters,
+          cursor,
+          skipTotal: true,
+        };
+        const result = await definition.fetch(req);
+        for (const row of result.rows) {
+          if (rowsWritten >= MAX_DOWNLOAD_ROWS) break;
+          reply.raw.write(csvRow(keys.map((k) => row[k])));
+          rowsWritten++;
+        }
+        cursor = result.nextCursor ?? null;
+      }
+    } else {
+      // PAGE MODE (legacy)
+      const total = Math.min(firstPage.total, MAX_DOWNLOAD_ROWS);
+      const totalPages = Math.ceil(total / DOWNLOAD_CHUNK_SIZE);
+      for (let page = 2; page <= totalPages; page++) {
+        const req: FetchRequest = {
+          page,
+          pageSize: DOWNLOAD_CHUNK_SIZE,
+          sort: baseParams.sort,
+          filters: baseParams.filters,
+          columnFilters: baseParams.columnFilters,
+          skipTotal: true,
+        };
+        const result = await definition.fetch(req);
+        for (const row of result.rows) {
+          if (rowsWritten >= MAX_DOWNLOAD_ROWS) break;
+          reply.raw.write(csvRow(keys.map((k) => row[k])));
+          rowsWritten++;
+        }
       }
     }
 
