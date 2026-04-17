@@ -5,6 +5,14 @@
 export interface PageDefinition {
   id: string;
   title: string;
+  /**
+   * Optional top-level grouping label for the page list UI — e.g.
+   * "Sales & Delivery", "Forecasting". When ANY page declares a section
+   * the desktop groups pages by this label under small headers;
+   * otherwise the list renders flat. Pages without a section are
+   * rendered above the labeled groups without a header.
+   */
+  section?: string;
   filters?: Filter[];
   actions?: Action[];
   suggestions?: string[];
