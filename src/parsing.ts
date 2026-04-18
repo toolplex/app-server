@@ -99,7 +99,7 @@ function parseSelection(raw: string | undefined): Selection | undefined {
  * Extract filter params from query string.
  * Reserved keys (page, pageSize, sort, selection) are excluded.
  */
-const RESERVED_KEYS = new Set(["page", "pageSize", "sort", "selection"]);
+const RESERVED_KEYS = new Set(["page", "pageSize", "sort", "selection", "columns"]);
 
 function parseFilters(
   query: Record<string, string | undefined>,
