@@ -363,6 +363,12 @@ export interface CardData {
   label: string;
   value: number | string;
   format?: ColumnFormat;
+  /**
+   * Optional human-friendly explanation of the metric. Surfaced as an
+   * info-icon tooltip on the card — useful for non-obvious metrics
+   * where the label alone isn't self-explanatory.
+   */
+  description?: string;
 }
 
 // ---------------------------------------------------------------------------
