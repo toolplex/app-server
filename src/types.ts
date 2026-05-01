@@ -294,6 +294,21 @@ export interface ContextResponse {
    * so analysts know how fresh the numbers are at a glance.
    */
   lastSync?: string;
+  /**
+   * Optional staleness thresholds for the freshness pill, expressed in
+   * hours since `lastSync`. Lets each page tune the warning/critical
+   * cutoffs to its own update cadence (a daily-sync table should warn
+   * sooner than a weekly forecast). Backwards-compatible: when omitted,
+   * the desktop falls back to its built-in defaults (currently amber at
+   * 2 days). Optional `criticalMessage` is rendered next to the pill in
+   * the critical state — meant for "page outdated, contact your admin"
+   * style hints when self-recovery is unlikely.
+   */
+  freshness?: {
+    warningAfterHours?: number;
+    criticalAfterHours?: number;
+    criticalMessage?: string;
+  };
 }
 
 export interface PageContextRequest extends ContextRequest {
