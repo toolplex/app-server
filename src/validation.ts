@@ -47,6 +47,19 @@ export function validateConfig(config: AppServerConfig): void {
           `Page "${pageId}": references action "${action.action}" but no action handler is defined`,
         );
       }
+      validateActionInputs(pageId, action, errors);
+    }
+    for (const section of sections) {
+      if (section.type === "table") {
+        for (const action of section.actions ?? []) {
+          if (!config.actions[action.action]) {
+            errors.push(
+              `Page "${pageId}": table action "${action.action}" has no handler`,
+            );
+          }
+          validateActionInputs(pageId, action, errors);
+        }
+      }
     }
 
     // Filter options_source must reference a resource
@@ -125,6 +138,25 @@ export function validateActionResponse(
 
 function flattenSections(sections: (Section | Section[])[]): Section[] {
   return sections.flatMap((s) => (Array.isArray(s) ? s : [s]));
+}
+
+function validateActionInputs(
+  pageId: string,
+  action: { action: string; inputs?: { key: string; type: string; multiple?: boolean; accept?: string }[] },
+  errors: string[],
+): void {
+  for (const input of action.inputs ?? []) {
+    if (input.type === "file" && input.multiple !== undefined && typeof input.multiple !== "boolean") {
+      errors.push(
+        `Page "${pageId}", action "${action.action}", input "${input.key}": "multiple" must be boolean`,
+      );
+    }
+    if (input.type !== "file" && (input.multiple !== undefined || input.accept !== undefined)) {
+      errors.push(
+        `Page "${pageId}", action "${action.action}", input "${input.key}": "multiple" / "accept" only valid on type:"file"`,
+      );
+    }
+  }
 }
 
 class ResponseValidationError extends Error {

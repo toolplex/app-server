@@ -181,11 +181,39 @@ export interface ActionCondition {
 export interface ActionInput {
   key: string;
   label: string;
-  type: "text" | "textarea" | "number" | "select";
+  type: "text" | "textarea" | "number" | "select" | "file";
   options?: string[];
   default?: string | number;
   required?: boolean;          // default: true
   placeholder?: string;
+  /**
+   * For type="file" only: when true, the picker accepts multiple files
+   * and the action handler receives an array under files[key].
+   * (For single-file inputs, the array still has one entry.)
+   */
+  multiple?: boolean;
+  /**
+   * For type="file" only: comma-separated MIME patterns or extensions
+   * the file picker accepts (e.g. ".xlsx,.xls,application/pdf").
+   * Passed through to the desktop's <input type="file" accept="...">.
+   */
+  accept?: string;
+}
+
+/**
+ * A single uploaded file attached to an action invocation. Created by
+ * the multipart parser when an action declares `type: "file"` inputs.
+ *
+ * The buffer is held in memory; for large uploads (>~25 MB) handlers
+ * should write it to disk and process from there. Action handlers must
+ * not retain the buffer across the response — the server clears it
+ * after the action completes.
+ */
+export interface UploadedFile {
+  filename: string;
+  mimetype: string;
+  size: number;
+  buffer: Buffer;
 }
 
 // ---------------------------------------------------------------------------
@@ -269,6 +297,13 @@ export interface ActionRequest {
   ids: (string | number)[];       // selected row IDs (empty array for global actions)
   params: Record<string, unknown>; // static params from page def + dynamic params from caller
   filters: Record<string, string>; // current page filters (useful for "export current view")
+  /**
+   * Files uploaded by the caller, keyed by ActionInput.key. Present only
+   * when the action declares one or more `type: "file"` inputs and the
+   * request was sent as `multipart/form-data`. For single-file inputs the
+   * array still has one entry. Absent for JSON-only actions.
+   */
+  files?: Record<string, UploadedFile[]>;
 }
 
 export interface ActionResponse {

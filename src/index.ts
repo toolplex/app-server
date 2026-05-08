@@ -22,6 +22,8 @@ export type {
   Column,
   Filter,
   Action,
+  ActionInput,
+  UploadedFile,
 
   // Column formatting
   ColumnFormat,
