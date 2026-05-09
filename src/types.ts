@@ -486,6 +486,25 @@ export interface DetailTable {
   label: string;
   columns: { key: string; label: string; format?: ColumnFormat }[];
   rows: Record<string, unknown>[];
+  /**
+   * Optional row-level actions. When present, each row gets the actions
+   * rendered as buttons in a trailing column; clicking fires the action
+   * with `ids: [row[rowKey]]`. Mirrors TableSection's row-action shape
+   * for consistency. Use this for in-drawer per-row mutations like
+   * "remove this file" or "approve this entry" without leaving the
+   * distributor's context.
+   */
+  rowKey?: string;
+  actions?: DetailRowAction[];
+}
+
+/** Action button rendered next to each row of a DetailTable. */
+export interface DetailRowAction {
+  label: string;
+  action: string;
+  variant?: "default" | "primary" | "success" | "danger" | "warning";
+  /** Show only when the row matches the condition (client-side filter). */
+  condition?: ActionCondition;
 }
 
 export interface DetailImage {
