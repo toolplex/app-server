@@ -26,12 +26,17 @@ export interface CardRowSection {
   type: "card-row";
   source: string;
   span?: number;
+  /** Small heading rendered above the section. Use for self-describing
+   *  groups of cards (e.g. "Reconciliation"); leave undefined when the
+   *  card labels themselves already make the section's purpose obvious. */
+  title?: string;
 }
 
 export interface CardColumnSection {
   type: "card-column";
   source: string;
   span?: number;
+  title?: string;
 }
 
 export interface ChartSection {
@@ -72,6 +77,10 @@ export interface TableSection {
   detail?: {
     source: string; // resource fetched when a row is clicked, rendered as a detail drawer
   };
+  /** Small heading rendered above the table. Useful when a page has
+   *  multiple tables and "what is this listing?" isn't obvious from
+   *  the columns alone (e.g. "Distributors" vs "Files this month"). */
+  title?: string;
 }
 
 export interface Column {
