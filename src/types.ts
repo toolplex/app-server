@@ -300,6 +300,23 @@ export interface FetchResponse {
    *   cursor pagination — the framework falls back to page-based loops.
    */
   nextCursor?: string | null;
+  /**
+   * Optional out-of-band signals attached to a resource response. Read by
+   * surfaces that load this resource as context (e.g. an action modal's
+   * informational context source) to make the surface react beyond just
+   * rendering rows.
+   *
+   * Currently honored:
+   *   - `actionAllowed` (boolean) — when false, an action modal that loaded
+   *     this resource as `action.context` disables its Confirm button. Use
+   *     for "show the worker why they can't submit yet" preview UX.
+   *   - `actionDisabledReason` (string) — short hint rendered next to the
+   *     disabled Confirm; defaults to a generic message when omitted.
+   *
+   * Other keys are ignored by the framework but flow through to clients,
+   * so you can extend ad-hoc without a schema bump.
+   */
+  meta?: Record<string, unknown>;
 }
 
 export interface ActionRequest {
@@ -526,4 +543,6 @@ export interface PaginatedResponse {
   page: number;
   pageSize: number;
   totalPages: number;
+  /** See FetchResponse.meta — mirrored through unchanged for clients. */
+  meta?: Record<string, unknown>;
 }
