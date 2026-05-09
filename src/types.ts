@@ -379,6 +379,24 @@ export interface ContextResponse {
     criticalAfterHours?: number;
     criticalMessage?: string;
   };
+  /**
+   * Optional state surface for page-level Action.condition.
+   *
+   * The same `condition: { key, eq, neq }` shape that gates inline row
+   * actions against row data also gates toolbar (page-level) actions —
+   * those evaluate against `data[key]` from this object. Use for
+   * stage-aware actions ("Advance" only when stage='receive'),
+   * mode-aware actions ("Lock" only when mode='editing'), or any
+   * page-state gating that doesn't belong on a specific row.
+   *
+   * The desktop refetches the page context after every successful
+   * action, so a state-changing action automatically flips toolbar
+   * visibility on the next render — no manual refresh needed.
+   *
+   * Backwards-compatible: omit when the page has no state to gate by;
+   * toolbar actions without `condition` continue to show unconditionally.
+   */
+  data?: Record<string, unknown>;
 }
 
 export interface PageContextRequest extends ContextRequest {
