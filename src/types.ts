@@ -157,6 +157,15 @@ export interface Filter {
   options?: string[];
   options_source?: string;
   default?: string;
+  /**
+   * When true, the filter is treated as always-having-a-value:
+   *   - The "All" / empty placeholder is omitted from the dropdown
+   *   - "Clear filters" leaves this filter untouched
+   * Pair with `default` so the filter has a meaningful initial value.
+   * Useful for filters that scope an entire workflow (e.g. month picker
+   * on a receive page where "All months" makes no sense).
+   */
+  required?: boolean;
 }
 
 export interface Action {
