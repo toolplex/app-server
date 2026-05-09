@@ -52,6 +52,7 @@ export type {
   DetailField,
   DetailList,
   DetailTable,
+  DetailRowAction,
   DetailImage,
 
   // Handler function types
