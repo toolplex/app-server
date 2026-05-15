@@ -136,8 +136,29 @@ export function validateActionResponse(
 // Helpers
 // ---------------------------------------------------------------------------
 
-function flattenSections(sections: (Section | Section[])[]): Section[] {
-  return sections.flatMap((s) => (Array.isArray(s) ? s : [s]));
+/** A section that has a `source` (i.e. anything except SectionGroup). */
+type LeafSection = Exclude<Section, { type: "group" }>;
+
+/**
+ * Flatten a page's sections to leaf sections — i.e. non-group sections
+ * that have a `source` and can register resource handlers / be validated.
+ * Recursively descends through SectionGroup containers.
+ */
+function flattenSections(
+  sections: (Section | Section[])[],
+): LeafSection[] {
+  const result: LeafSection[] = [];
+  for (const entry of sections) {
+    const items = Array.isArray(entry) ? entry : [entry];
+    for (const section of items) {
+      if (section.type === "group") {
+        result.push(...flattenSections(section.sections));
+      } else {
+        result.push(section);
+      }
+    }
+  }
+  return result;
 }
 
 function validateActionInputs(

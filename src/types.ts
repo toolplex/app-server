@@ -20,7 +20,15 @@ export interface PageDefinition {
   context?: PageContextHandler;
 }
 
-export type Section = CardRowSection | CardColumnSection | TableSection | ChartSection;
+export type Section =
+  | CardRowSection
+  | CardColumnSection
+  | TableSection
+  | ChartSection
+  | SectionGroup
+  | LinkToPageSection
+  | TopNSection
+  | StatusGridSection;
 
 export interface CardRowSection {
   type: "card-row";
@@ -30,6 +38,14 @@ export interface CardRowSection {
    *  groups of cards (e.g. "Reconciliation"); leave undefined when the
    *  card labels themselves already make the section's purpose obvious. */
   title?: string;
+  /**
+   * When present, render these CardData rows directly without fetching
+   * from `source`. Useful for static or pre-baked data — notably
+   * agent-generated dashboards where the values are baked into the spec.
+   * The `source` string is still used as a stable identifier for
+   * selection / ask-agent flows even when data is inline.
+   */
+  inline_rows?: CardData[];
 }
 
 export interface CardColumnSection {
@@ -37,6 +53,8 @@ export interface CardColumnSection {
   source: string;
   span?: number;
   title?: string;
+  /** See CardRowSection.inline_rows. */
+  inline_rows?: CardData[];
 }
 
 export interface ChartSection {
@@ -49,6 +67,12 @@ export interface ChartSection {
   controls?: ChartControl[]; // pill-tab controls rendered in chart header
   span?: number;
   height?: number; // px, default 280
+  /**
+   * When present, render the chart from these rows directly (one row per
+   * X-axis point, with each Y series read by `y[].key`) without fetching
+   * from `source`. See CardRowSection.inline_rows for rationale.
+   */
+  inline_data?: Record<string, unknown>[];
 }
 
 export interface ChartSeries {
@@ -81,6 +105,144 @@ export interface TableSection {
    *  multiple tables and "what is this listing?" isn't obvious from
    *  the columns alone (e.g. "Distributors" vs "Files this month"). */
   title?: string;
+  /**
+   * When present, render these rows directly without fetching from
+   * `source`. See CardRowSection.inline_rows for rationale. Static
+   * tables (config, glossary, agent-baked dashboards) can ship the
+   * data inline rather than wiring a fetch handler.
+   */
+  inline_rows?: Record<string, unknown>[];
+}
+
+// ---------------------------------------------------------------------------
+// SectionGroup — labeled group of nested sections.
+//
+// Allows hierarchical organization of a page: a group has a label
+// (rendered as a heading) and contains its own sections. Used by
+// Pulse to encode slot semantics ("Now" / "Watch" / "Recent"), but
+// equally applicable to any hand-authored page that wants
+// sub-organization (e.g. forecast-accuracy grouped by region).
+//
+// Recursive: groups can contain groups. The renderer flattens visual
+// depth — there's no extra indentation past the first nesting level.
+// ---------------------------------------------------------------------------
+
+export interface SectionGroup {
+  type: "group";
+  /** Heading displayed above the group's sections. */
+  label: string;
+  /** Optional smaller subtitle under the label. */
+  subtitle?: string;
+  /** Sections within this group. Same shape as PageDefinition.sections. */
+  sections: (Section | Section[])[];
+  span?: number;
+}
+
+// ---------------------------------------------------------------------------
+// LinkToPageSection — CTA card that navigates to another Page.
+//
+// Use when the best surface for an item is a richer Page elsewhere
+// in the app — render a CTA on the source page that opens the target
+// Page with filters and (optionally) a row pre-selected.
+// ---------------------------------------------------------------------------
+
+export interface LinkToPageSection {
+  type: "link-to-page";
+  /** Stable identifier — used for selection. Even when the section has
+   *  no data resource, callers may want to select / ask-agent about it. */
+  source: string;
+  /** Required for visual hierarchy. */
+  title: string;
+  /** Description rendered above the CTA. */
+  description?: string;
+  /** Optional preview metric. Makes the card more substantive than a
+   *  bare button — useful when the metric *is* the reason to drill in. */
+  preview?: {
+    label: string;
+    value: number | string;
+    format?: ColumnFormat;
+  };
+  /** Where the CTA navigates to. */
+  link: PageLink;
+  /** Button text. Default: "Open". */
+  cta_label?: string;
+  span?: number;
+}
+
+// ---------------------------------------------------------------------------
+// TopNSection — ranked list with values.
+//
+// Use for "top 5 by metric X" / "biggest contributors" / "worst
+// offenders". Each item carries an optional drill-in link.
+// ---------------------------------------------------------------------------
+
+export interface TopNSection {
+  type: "top-n";
+  source: string;
+  title?: string;
+  /** Inline data path: when present, render directly. */
+  inline_items?: TopNItem[];
+  /** Format applied to item values when item.format is unset. */
+  default_format?: ColumnFormat;
+  /** Maximum items to render. Default 5. */
+  max_items?: number;
+  span?: number;
+}
+
+export interface TopNItem {
+  label: string;
+  value: number | string;
+  format?: ColumnFormat;
+  /** Smaller secondary text below the label. */
+  sublabel?: string;
+  /** Optional drill-in when this item is clicked. */
+  link?: PageLink;
+}
+
+// ---------------------------------------------------------------------------
+// StatusGridSection — colored cells for "health at a glance" views.
+// ---------------------------------------------------------------------------
+
+export interface StatusGridSection {
+  type: "status-grid";
+  source: string;
+  title?: string;
+  /** Inline data path: when present, render directly. */
+  inline_cells?: StatusCell[];
+  /** Number of columns. Renderer picks a sensible default based on
+   *  cell count when omitted. */
+  columns?: number;
+  /** Legend entries rendered below the grid. */
+  legend?: { color: StatusColor; label: string }[];
+  span?: number;
+}
+
+export interface StatusCell {
+  label: string;
+  status: StatusColor;
+  value?: string | number;
+  tooltip?: string;
+  link?: PageLink;
+}
+
+export type StatusColor = "green" | "yellow" | "red" | "gray" | "blue";
+
+// ---------------------------------------------------------------------------
+// PageLink — reference to another Page in app-server.
+//
+// Used by LinkToPageSection's CTA and by drill-in links on
+// TopNItem / StatusCell. The desktop's PageRenderer translates these
+// into navigation events to the target page with filters/selection
+// pre-applied.
+// ---------------------------------------------------------------------------
+
+export interface PageLink {
+  /** Page id (matches PageDefinition.id of the target). */
+  page_id: string;
+  /** Filter values keyed by the target page's filter keys. */
+  filters?: Record<string, string>;
+  /** Optional row id to pre-select when the target Page opens. */
+  selected_row_id?: string;
 }
 
 export interface Column {
@@ -472,6 +634,58 @@ export interface CardData {
    * where the label alone isn't self-explanatory.
    */
   description?: string;
+  /**
+   * Optional severity. When set, the card renders a left-edge stripe
+   * and a severity badge. Use for cards that demand attention vs. cards
+   * that just report a value.
+   *
+   *   - "critical": acute issue, threshold breached, immediate action
+   *   - "warning":  notable, worth investigating soon
+   *   - "info":     advisory, not urgent
+   */
+  severity?: "info" | "warning" | "critical";
+  /**
+   * Optional threshold context. Rendered inline near the value to make
+   * the severity claim concrete: "12.5% — threshold: >5%".
+   */
+  threshold?: {
+    operator: ">" | "<" | ">=" | "<=";
+    value: number;
+    /** Optional human-readable description; if absent, renderer composes
+     *  one from operator + value. */
+    description?: string;
+  };
+  /** Optional baseline context, e.g. "Normal: 1-2% typical". */
+  normal_range?: string;
+  /**
+   * Optional period-over-period delta. Rendered as a colored badge.
+   * Useful for both reporting cards (week-over-week revenue) and
+   * anomaly cards (current vs. previous period).
+   */
+  delta?: {
+    value: number;
+    format?: ColumnFormat;
+    /**
+     * Which direction is "good" for this metric. Drives delta color:
+     *   - "up":      positive is green, negative is red
+     *   - "down":    negative is green, positive is red (e.g. defect rate)
+     *   - "neutral": no color applied
+     */
+    direction_good: "up" | "down" | "neutral";
+    /** Optional comparison context, e.g. "vs last week". */
+    comparison?: string;
+  };
+  /**
+   * Optional drill-in link. When present, the card becomes a button
+   * that navigates to the target Page.
+   */
+  link?: PageLink;
+  /**
+   * Optional one-line reasoning from an agent. Surfaces a small "(i)"
+   * tooltip explaining why this card is being shown. Used by
+   * agent-generated pages (Pulse) but available to any card.
+   */
+  reasoning?: string;
 }
 
 // ---------------------------------------------------------------------------

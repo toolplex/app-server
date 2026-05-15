@@ -203,10 +203,19 @@ export function registerDownloadRoutes(
 // ---------------------------------------------------------------------------
 
 function isResourceDownloadable(resource: string, config: AppServerConfig): boolean {
-  for (const page of Object.values(config.pages)) {
-    for (const sectionOrRow of page.sections) {
-      const sections = Array.isArray(sectionOrRow) ? sectionOrRow : [sectionOrRow];
+  const matchesInSections = (
+    entries: (typeof config.pages[string]["sections"][number])[],
+  ): boolean => {
+    for (const sectionOrRow of entries) {
+      const sections = Array.isArray(sectionOrRow)
+        ? sectionOrRow
+        : [sectionOrRow];
       for (const section of sections) {
+        if (section.type === "group") {
+          // Recurse — a downloadable table may live inside a group.
+          if (matchesInSections(section.sections)) return true;
+          continue;
+        }
         if (
           section.type === "table" &&
           section.source === resource &&
@@ -216,6 +225,11 @@ function isResourceDownloadable(resource: string, config: AppServerConfig): bool
         }
       }
     }
+    return false;
+  };
+
+  for (const page of Object.values(config.pages)) {
+    if (matchesInSections(page.sections)) return true;
   }
   return false;
 }

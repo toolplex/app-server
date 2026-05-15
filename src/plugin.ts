@@ -82,8 +82,35 @@ function hasFileInputs(config: AppServerConfig): boolean {
   return false;
 }
 
-function flattenSections<T>(sections: (T | T[])[]): T[] {
-  return sections.flatMap((s) => (Array.isArray(s) ? s : [s]));
+/**
+ * Flatten a page's sections to leaf sections — recursively descends
+ * through SectionGroup containers so callers always get non-group
+ * sections back. Generic so it can be used for any section-like type
+ * that may have a "group" variant with a nested `sections` field.
+ */
+function flattenSections<T extends { type?: string }>(
+  sections: (T | T[])[],
+): T[] {
+  const result: T[] = [];
+  for (const entry of sections) {
+    const items = Array.isArray(entry) ? entry : [entry];
+    for (const section of items) {
+      if (
+        section?.type === "group" &&
+        "sections" in section &&
+        Array.isArray((section as { sections?: unknown }).sections)
+      ) {
+        result.push(
+          ...flattenSections<T>(
+            (section as unknown as { sections: (T | T[])[] }).sections,
+          ),
+        );
+      } else {
+        result.push(section);
+      }
+    }
+  }
+  return result;
 }
 
 export const registerAppPages = fp(appServerPlugin, {
