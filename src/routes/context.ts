@@ -56,14 +56,24 @@ export function registerContextRoutes(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/** Recursively collect unique `source` strings from a page's sections.
+ *  Descends through SectionGroup containers, which themselves don't
+ *  have a source. */
 function uniqueSources(sections: (Section | Section[])[]): string[] {
   const sources = new Set<string>();
-  for (const entry of sections) {
-    const items = Array.isArray(entry) ? entry : [entry];
-    for (const section of items) {
-      sources.add(section.source);
+  const walk = (items: (Section | Section[])[]) => {
+    for (const entry of items) {
+      const list = Array.isArray(entry) ? entry : [entry];
+      for (const section of list) {
+        if (section.type === "group") {
+          walk(section.sections);
+        } else {
+          sources.add(section.source);
+        }
+      }
     }
-  }
+  };
+  walk(sections);
   return [...sources];
 }
 
