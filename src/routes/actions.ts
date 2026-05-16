@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import type { AppServerConfig, UploadedFile } from "../types.js";
 import { validateActionResponse } from "../validation.js";
+import { readUserHeaders } from "../user.js";
 
 interface JsonActionBody {
   ids?: (string | number)[];
@@ -44,7 +45,8 @@ export function registerActionRoutes(
       filters = body.filters ?? {};
     }
 
-    const response = await handler({ ids, params, filters, files });
+    const user = readUserHeaders(request);
+    const response = await handler({ ids, params, filters, files, user });
 
     validateActionResponse(action, response);
 

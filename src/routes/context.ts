@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import type { AppServerConfig, ContextResponse, Section } from "../types.js";
 import { parseContextParams } from "../parsing.js";
+import { readUserHeaders } from "../user.js";
 
 export function registerContextRoutes(
   fastify: FastifyInstance,
@@ -21,7 +22,8 @@ export function registerContextRoutes(
     }
 
     const params = parseContextParams(request.query);
-    const response = await definition.context(params);
+    const user = readUserHeaders(request);
+    const response = await definition.context({ ...params, user });
     return reply.send(response);
   });
 
@@ -38,16 +40,17 @@ export function registerContextRoutes(
     }
 
     const params = parseContextParams(request.query);
+    const user = readUserHeaders(request);
     const sectionSources = uniqueSources(page.sections);
 
     // If page has a dedicated context handler, use it
     if (page.context) {
-      const response = await page.context({ ...params, sections: sectionSources });
+      const response = await page.context({ ...params, sections: sectionSources, user });
       return reply.send(response);
     }
 
     // Fallback: aggregate resource-level context handlers
-    const response = await aggregateContext(config, sectionSources, params);
+    const response = await aggregateContext(config, sectionSources, { ...params, user });
     return reply.send(response);
   });
 }
@@ -80,7 +83,11 @@ function uniqueSources(sections: (Section | Section[])[]): string[] {
 async function aggregateContext(
   config: AppServerConfig,
   sources: string[],
-  params: { filters?: Record<string, string>; selection?: { type: "row" | "rows"; ids?: (string | number)[] } },
+  params: {
+    filters?: Record<string, string>;
+    selection?: { type: "row" | "rows"; ids?: (string | number)[] };
+    user?: import("../types.js").UserIdentity;
+  },
 ): Promise<ContextResponse> {
   const summaries: string[] = [];
   let selectionText: string | undefined;
