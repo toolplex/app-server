@@ -22,6 +22,7 @@ export type {
   Column,
   Filter,
   Action,
+  ActionCondition,
   ActionInput,
   UploadedFile,
 

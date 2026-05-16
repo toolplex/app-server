@@ -163,7 +163,16 @@ function flattenSections(
 
 function validateActionInputs(
   pageId: string,
-  action: { action: string; inputs?: { key: string; type: string; multiple?: boolean; accept?: string }[] },
+  action: {
+    action: string;
+    inputs?: {
+      key: string;
+      type: string;
+      multiple?: boolean;
+      accept?: string;
+      condition?: { key?: unknown; eq?: unknown; neq?: unknown };
+    }[];
+  },
   errors: string[],
 ): void {
   for (const input of action.inputs ?? []) {
@@ -176,6 +185,18 @@ function validateActionInputs(
       errors.push(
         `Page "${pageId}", action "${action.action}", input "${input.key}": "multiple" / "accept" only valid on type:"file"`,
       );
+    }
+    if (input.condition !== undefined) {
+      if (typeof input.condition.key !== "string" || !input.condition.key) {
+        errors.push(
+          `Page "${pageId}", action "${action.action}", input "${input.key}": "condition.key" must be a non-empty string`,
+        );
+      }
+      if (input.condition.eq === undefined && input.condition.neq === undefined) {
+        errors.push(
+          `Page "${pageId}", action "${action.action}", input "${input.key}": "condition" must specify "eq" or "neq"`,
+        );
+      }
     }
   }
 }

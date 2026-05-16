@@ -378,6 +378,25 @@ export interface ActionInput {
    * Passed through to the desktop's <input type="file" accept="...">.
    */
   accept?: string;
+  /**
+   * Show this input only when the action's `context` resource returns a
+   * matching value in its `FetchResponse.meta`. Evaluated client-side
+   * when the modal opens, using the same shape and machinery as
+   * top-level `Action.condition` — `meta[condition.key]` compared
+   * against `eq` / `neq`.
+   *
+   * Use cases: a Changelog field that only renders for a re-publication
+   * (parent_publication_id != null in context.meta); a "merge target"
+   * field only when "transition type = merge"; any required input that
+   * only applies to a subset of the action's scenarios.
+   *
+   * When `condition` is set but the action declares no `context`
+   * resource, the input renders unconditionally (no meta to evaluate).
+   * When the condition does not match, the input is omitted from the
+   * form AND from the submitted params — handlers should not assume a
+   * value will be present.
+   */
+  condition?: ActionCondition;
 }
 
 /**
@@ -513,6 +532,23 @@ export interface FetchResponse {
    * so you can extend ad-hoc without a schema bump.
    */
   meta?: Record<string, unknown>;
+  /**
+   * Per-input default values for an action confirmation modal that
+   * loaded this resource as `action.context`. Keys match
+   * `ActionInput.key`; values prefill the form fields when the modal
+   * opens.
+   *
+   * Use this in place of an ad-hoc `meta.defaults` convention — the
+   * desktop reads `inputDefaults` specifically and treats it as the
+   * authoritative prefill source. Static `ActionInput.default` still
+   * applies when an input's key is absent from this map.
+   *
+   * For required inputs that depend on row state (e.g. an edit form
+   * pre-filling the entity's current values), handlers should provide
+   * a non-empty default here so the modal doesn't silently render
+   * required fields as empty.
+   */
+  inputDefaults?: Record<string, string | number | null>;
 }
 
 export interface ActionRequest {
