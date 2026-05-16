@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify";
 import type { AppServerConfig, PaginatedResponse } from "../types.js";
 import { parseFetchParams } from "../parsing.js";
 import { validateFetchResponse } from "../validation.js";
+import { readUserHeaders } from "../user.js";
 
 export function registerDataRoutes(
   fastify: FastifyInstance,
@@ -24,7 +25,8 @@ export function registerDataRoutes(
     // the rows the handler already returned for the requested page, so it
     // produced wrong results for any DB-backed handler.)
     const params = parseFetchParams(request.query);
-    const response = await definition.fetch(params);
+    const user = readUserHeaders(request);
+    const response = await definition.fetch({ ...params, user });
 
     validateFetchResponse(resource, response);
 

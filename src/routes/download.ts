@@ -1,5 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import type { AppServerConfig, FetchRequest } from "../types.js";
+import { readUserHeaders } from "../user.js";
 import { parseFetchParams } from "../parsing.js";
 import { validateFetchResponse } from "../validation.js";
 
@@ -73,6 +74,7 @@ export function registerDownloadRoutes(
     // baseParams already includes columnFilters split out of the filter bag;
     // we pass them through to the handler on every chunk request.
     const baseParams = parseFetchParams(request.query);
+    const user = readUserHeaders(request);
 
     // Parse column spec from query param: JSON array of {key, label}
     let columns: { key: string; label: string }[] | undefined;
@@ -106,6 +108,7 @@ export function registerDownloadRoutes(
       sort: baseParams.sort,
       filters: baseParams.filters,
       columnFilters: baseParams.columnFilters,
+      user,
     };
 
     const firstPage = await definition.fetch(firstReq);
@@ -162,6 +165,7 @@ export function registerDownloadRoutes(
           columnFilters: baseParams.columnFilters,
           cursor,
           skipTotal: true,
+          user,
         };
         const result = await definition.fetch(req);
         for (const row of result.rows) {
@@ -183,6 +187,7 @@ export function registerDownloadRoutes(
           filters: baseParams.filters,
           columnFilters: baseParams.columnFilters,
           skipTotal: true,
+          user,
         };
         const result = await definition.fetch(req);
         for (const row of result.rows) {

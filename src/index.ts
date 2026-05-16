@@ -64,4 +64,5 @@ export type {
   // Shared primitives
   SortSpec,
   Selection,
+  UserIdentity,
 } from "./types.js";

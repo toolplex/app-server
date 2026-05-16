@@ -421,6 +421,29 @@ export interface ColumnFilter {
   value: string;
 }
 
+/**
+ * The signed-in user behind the current request, as attested by the
+ * upstream proxy (toolplex-api) via X-Toolplex-User-* headers.
+ *
+ * The app-server does NOT independently verify identity — the connection-
+ * level bearer token already proves "this is toolplex-api talking," and
+ * toolplex-api is the identity authority (Firebase-backed). The user
+ * fields here are trusted as far as the proxy is trusted.
+ *
+ * Always optional — system / scheduled actions and direct ops-tooling
+ * calls won't have a user. Handlers that require attribution must check
+ * and refuse rather than fall back to a default.
+ */
+export interface UserIdentity {
+  /** Stable internal user id (toolplex-side primary key). */
+  id: string;
+  /** User's email — what worker-facing UIs render and audit logs store. */
+  email: string;
+  /** Org id the user is signed in under. Useful for handlers that
+   *  multiplex across orgs on a shared app-server deployment. */
+  orgId?: string;
+}
+
 export interface FetchRequest {
   page: number;
   pageSize: number;
@@ -430,6 +453,8 @@ export interface FetchRequest {
   /** In-table column filters from per-column header UI. See ColumnFilter. */
   columnFilters?: ColumnFilter[];
   selection?: Selection;
+  /** Signed-in user identity from the proxy. See UserIdentity. */
+  user?: UserIdentity;
   /**
    * Framework hint that the handler MAY skip computing the total row count
    * (e.g. SELECT COUNT(*)). Set by the /download route on chunks past the
@@ -501,6 +526,8 @@ export interface ActionRequest {
    * array still has one entry. Absent for JSON-only actions.
    */
   files?: Record<string, UploadedFile[]>;
+  /** Signed-in user identity from the proxy. See UserIdentity. */
+  user?: UserIdentity;
 }
 
 export interface ActionResponse {
@@ -514,6 +541,8 @@ export interface ContextRequest {
   /** In-table column filters (mirrors FetchRequest.columnFilters). */
   columnFilters?: ColumnFilter[];
   selection?: Selection;
+  /** Signed-in user identity from the proxy. See UserIdentity. */
+  user?: UserIdentity;
 }
 
 export interface ContextResponse {
