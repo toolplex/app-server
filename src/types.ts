@@ -851,4 +851,9 @@ export interface PaginatedResponse {
   totalPages: number;
   /** See FetchResponse.meta — mirrored through unchanged for clients. */
   meta?: Record<string, unknown>;
+  /** See FetchResponse.inputDefaults — mirrored through unchanged so action
+   *  confirmation modals that loaded this resource as context can prefill
+   *  their inputs. Without this passthrough the field is silently stripped
+   *  at the wire and prefill never works. */
+  inputDefaults?: Record<string, string | number | null>;
 }

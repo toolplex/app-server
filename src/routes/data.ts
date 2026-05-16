@@ -37,6 +37,7 @@ export function registerDataRoutes(
       pageSize: params.pageSize,
       totalPages: Math.ceil(response.total / params.pageSize),
       ...(response.meta ? { meta: response.meta } : {}),
+      ...(response.inputDefaults ? { inputDefaults: response.inputDefaults } : {}),
     };
 
     return reply.send(result);
