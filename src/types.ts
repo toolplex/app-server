@@ -367,6 +367,13 @@ export interface ActionInput {
   required?: boolean;          // default: true
   placeholder?: string;
   /**
+   * For type="textarea" only: visible row count. Defaults to a
+   * sensible body-text height; bump for code/JSON inputs where the
+   * worker needs to see ~15+ lines at once. Has no effect on other
+   * input types.
+   */
+  rows?: number;
+  /**
    * For type="file" only: when true, the picker accepts multiple files
    * and the action handler receives an array under files[key].
    * (For single-file inputs, the array still has one entry.)
