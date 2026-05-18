@@ -6,6 +6,12 @@ export interface PageDefinition {
   id: string;
   title: string;
   /**
+   * Optional one-sentence description of what this page is for. Rendered
+   * as a subtitle on the page list card so users can tell pages apart at
+   * a glance without opening each one.
+   */
+  description?: string;
+  /**
    * Optional top-level grouping label for the page list UI — e.g.
    * "Sales & Delivery", "Forecasting". When ANY page declares a section
    * the desktop groups pages by this label under small headers;
@@ -13,6 +19,13 @@ export interface PageDefinition {
    * rendered above the labeled groups without a header.
    */
   section?: string;
+  /**
+   * Optional short description of the page's section. The page list
+   * renders this beneath the section header so users can read what the
+   * group is for. Repeated across pages in the same section, the first
+   * non-empty value wins — set it on one page per section.
+   */
+  section_description?: string;
   filters?: Filter[];
   actions?: Action[];
   suggestions?: string[];
