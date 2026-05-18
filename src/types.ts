@@ -257,6 +257,19 @@ export interface Column {
    * self-explanatory.
    */
   description?: string;
+  /**
+   * Optional filter-based visibility gate. Evaluated against the page's
+   * current filter values, not row data: `condition.key` is looked up in
+   * the active filters and compared against `eq` / `neq`. Use this to
+   * hide kind-specific columns on a multi-shape table (e.g. a Master
+   * page that filters between customers and products, where each kind
+   * has its own field set).
+   *
+   * Different from `Action.condition` which evaluates against a single
+   * row. Columns are page-level so per-row evaluation doesn't make
+   * sense; filter-level does.
+   */
+  condition?: ActionCondition;
 }
 
 // ---------------------------------------------------------------------------
