@@ -1,18 +1,27 @@
 {
   "name": "@toolplex/app-server",
-  "version": "0.4.4",
+  "version": "0.5.0",
   "description": "Fastify plugin for serving ToolPlex App Pages — page definitions, paginated data, actions, and agent context",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
     "type": "git",
     "url": "https://github.com/toolplex/app-server"
   },
   "homepage": "https://github.com/toolplex/app-server#readme",
-  "keywords": ["toolplex", "fastify", "fastify-plugin", "app-server", "pages", "dashboard"],
+  "keywords": [
+    "toolplex",
+    "fastify",
+    "fastify-plugin",
+    "app-server",
+    "pages",
+    "dashboard"
+  ],
   "scripts": {
     "build": "tsc",
     "build:watch": "tsc --watch",
@@ -26,8 +35,8 @@
     "fastify-plugin": "^5.0.1"
   },
   "peerDependencies": {
-    "fastify": ">=5.0.0",
-    "@fastify/multipart": ">=9.0.0"
+    "@fastify/multipart": ">=9.0.0",
+    "fastify": ">=5.0.0"
   },
   "peerDependenciesMeta": {
     "@fastify/multipart": {

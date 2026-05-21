@@ -41,6 +41,8 @@ export type {
   FetchResponse,
   ActionRequest,
   ActionResponse,
+  StandardActionResponse,
+  FileActionResponse,
   ContextRequest,
   ContextResponse,
   PageContextRequest,
