@@ -35,6 +35,7 @@ export type {
   LinkFormat,
   ImageFormat,
   ProgressFormat,
+  CurrencyFormat,
 
   // Handler contracts
   FetchRequest,

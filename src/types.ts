@@ -307,7 +307,29 @@ export type RichFormat =
   | DeltaFormat
   | LinkFormat
   | ImageFormat
-  | ProgressFormat;
+  | ProgressFormat
+  | CurrencyFormat;
+
+/** Localised currency. Use this object form when the simple "currency"
+ *  string isn't enough — for non-USD currencies (PHP, EUR, etc.) or
+ *  when you want compact notation ("₱126.9M") for cards that would
+ *  otherwise clip the full digit string. Renders via Intl.NumberFormat
+ *  with the given currency code; falls back to USD when omitted so
+ *  client behaviour stays close to the legacy "currency" string. */
+export interface CurrencyFormat {
+  type: "currency";
+  /** ISO 4217 currency code (e.g. "PHP", "USD", "EUR"). Default: "USD". */
+  currency?: string;
+  /** BCP 47 locale tag for grouping/decimal conventions (e.g. "en-PH",
+   *  "de-DE"). Default: the user's browser locale. */
+  locale?: string;
+  /** "compact" → "₱126.9M" (short), "standard" → "₱126,899,928.31".
+   *  Default: "standard". Useful on summary cards where long values
+   *  get clipped by max-width. */
+  notation?: "standard" | "compact";
+  /** Decimal places. Default: 2 for standard, 1 for compact. */
+  fractionDigits?: number;
+}
 
 /** Colored badge — maps cell values to colors */
 export interface StatusFormat {
