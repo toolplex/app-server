@@ -375,6 +375,19 @@ export interface Action {
   inputs?: ActionInput[];      // dynamic inputs collected in confirmation modal
   params?: Record<string, unknown>;
   context?: { source: string };  // resource fetched when modal opens, returns DetailBlock[]
+  /**
+   * When true, the action's handler is expected to return a
+   * FileActionResponse (or a normal response that throws). The desktop
+   * skips its usual success-toast / data-refresh flow and instead
+   * streams the response body as a file download. Confirmation modals
+   * are bypassed for one-click downloads unless the action also
+   * declares `inputs`.
+   *
+   * The wire format is detected per-response — handlers returning a
+   * standard JSON ActionResponse still work; this flag is purely a UX
+   * hint so the desktop renders the click affordance correctly.
+   */
+  download?: boolean;
 }
 
 /** Show/hide an action based on a row value. Evaluated client-side. */
@@ -599,11 +612,47 @@ export interface ActionRequest {
   user?: UserIdentity;
 }
 
-export interface ActionResponse {
+export interface StandardActionResponse {
   affected: number;
   message?: string;
   data?: Record<string, unknown>;  // flexible return data (e.g., download URL, generated file path)
 }
+
+/**
+ * Action handlers can return this shape instead of the standard JSON
+ * response to stream a file to the client (browser save dialog). The
+ * actions route detects the `type: "file"` tag and streams the file
+ * with appropriate Content-Disposition / Content-Type headers.
+ *
+ * Either `path` (filesystem path on the server) or `buffer` (in-memory
+ * bytes) must be provided. Use `buffer` for generated content (e.g. a
+ * zip built on the fly); use `path` for existing files on disk. The
+ * path is streamed via fs.createReadStream — no buffering on the
+ * server side.
+ *
+ * Path safety: action handlers are responsible for validating the
+ * path against an allowlist before returning. The route does not
+ * second-guess what the handler decided was safe.
+ *
+ * The desktop hint is `Action.download: true` — when set, the desktop
+ * skips its success-toast / data-refresh flow and triggers a file
+ * save instead.
+ */
+export interface FileActionResponse {
+  type: "file";
+  /** Filesystem path on the server; streamed via fs.createReadStream. */
+  path?: string;
+  /** In-memory bytes; used when the file is generated dynamically. */
+  buffer?: Buffer;
+  /** Filename for the Content-Disposition header. Defaults to the
+   *  basename of `path` when omitted. */
+  filename?: string;
+  /** MIME type for the Content-Type header. Defaults to
+   *  application/octet-stream. */
+  mimetype?: string;
+}
+
+export type ActionResponse = StandardActionResponse | FileActionResponse;
 
 export interface ContextRequest {
   filters?: Record<string, string>;
@@ -840,7 +889,7 @@ export interface DetailList {
 export interface DetailTable {
   type: "table";
   label: string;
-  columns: { key: string; label: string; format?: ColumnFormat }[];
+  columns: { key: string; label: string; format?: ColumnFormat; width?: number }[];
   rows: Record<string, unknown>[];
   /**
    * Optional row-level actions. When present, each row gets the actions
@@ -854,13 +903,23 @@ export interface DetailTable {
   actions?: DetailRowAction[];
 }
 
-/** Action button rendered next to each row of a DetailTable. */
+/** Action button rendered next to each row of a DetailTable — or as a
+ *  toolbar button above the table when `toolbar_only` is set. */
 export interface DetailRowAction {
   label: string;
   action: string;
   variant?: "default" | "primary" | "success" | "danger" | "warning";
   /** Show only when the row matches the condition (client-side filter). */
   condition?: ActionCondition;
+  /** When true, render in the table's toolbar instead of per-row.
+   *  Used for bulk operations ("Download all (zip)", "Remove selected").
+   *  Toolbar actions receive the user's row selection (or all rows if
+   *  none are selected). Mirrors top-level Action.toolbar_only. */
+  toolbar_only?: boolean;
+  /** When true, the handler returns a file response and the desktop
+   *  triggers a browser save instead of refreshing data. Mirrors
+   *  top-level Action.download. See FileActionResponse. */
+  download?: boolean;
 }
 
 export interface DetailImage {

@@ -1,5 +1,13 @@
-import type { FastifyInstance, FastifyRequest } from "fastify";
-import type { AppServerConfig, UploadedFile } from "../types.js";
+import { createReadStream, existsSync, statSync } from "node:fs";
+import { basename } from "node:path";
+
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import type {
+  ActionResponse,
+  AppServerConfig,
+  FileActionResponse,
+  UploadedFile,
+} from "../types.js";
 import { validateActionResponse } from "../validation.js";
 import { readUserHeaders } from "../user.js";
 
@@ -48,10 +56,85 @@ export function registerActionRoutes(
     const user = readUserHeaders(request);
     const response = await handler({ ids, params, filters, files, user });
 
+    // File responses are streamed; everything else goes through standard
+    // JSON validation + send. The handler tags file responses with
+    // `type: "file"` so the route can disambiguate the union.
+    if (isFileResponse(response)) {
+      return sendFileResponse(reply, response, action);
+    }
+
     validateActionResponse(action, response);
 
     return reply.send(response);
   });
+}
+
+// --------------------------------------------------------------------------
+// File response handling
+// --------------------------------------------------------------------------
+
+function isFileResponse(r: ActionResponse): r is FileActionResponse {
+  return (
+    typeof r === "object" &&
+    r !== null &&
+    (r as { type?: string }).type === "file"
+  );
+}
+
+function sendFileResponse(
+  reply: FastifyReply,
+  response: FileActionResponse,
+  actionName: string,
+): unknown {
+  // Validate the payload: must have exactly one of path or buffer.
+  if (!response.path && !response.buffer) {
+    throw new Error(
+      `action "${actionName}" returned a file response with neither path nor buffer set`,
+    );
+  }
+  if (response.path && response.buffer) {
+    throw new Error(
+      `action "${actionName}" returned a file response with both path and buffer; pick one`,
+    );
+  }
+
+  const mimetype = response.mimetype ?? "application/octet-stream";
+  const filename =
+    response.filename ??
+    (response.path ? basename(response.path) : "download.bin");
+  // Sanitise filename for Content-Disposition (must be ASCII-safe; quotes
+  // escaped). Non-ASCII chars are replaced with underscores so the
+  // header itself is safe; the desktop can apply its own UTF-8 handling.
+  const safeFilename = filename.replace(/[\x00-\x1f"\\]/g, "_");
+
+  reply
+    .header("Content-Type", mimetype)
+    .header(
+      "Content-Disposition",
+      `attachment; filename="${safeFilename}"`,
+    );
+
+  if (response.buffer) {
+    reply.header("Content-Length", String(response.buffer.length));
+    return reply.send(response.buffer);
+  }
+
+  // Path-based response. The handler is responsible for path safety
+  // (allowlisting, traversal checks) — the route just streams.
+  const filePath = response.path!;
+  if (!existsSync(filePath)) {
+    throw new Error(
+      `action "${actionName}" returned a file response pointing at a missing path: ${filePath}`,
+    );
+  }
+  const st = statSync(filePath);
+  if (!st.isFile()) {
+    throw new Error(
+      `action "${actionName}" returned a file response that is not a file: ${filePath}`,
+    );
+  }
+  reply.header("Content-Length", String(st.size));
+  return reply.send(createReadStream(filePath));
 }
 
 /**
