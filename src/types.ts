@@ -99,6 +99,14 @@ export interface ChartSection {
    * on line/pie/scatter. Default: false.
    */
   stacked?: boolean;
+  /**
+   * Optional y-axis domain control. Pass [min, max] to clamp to fixed
+   * bounds, or "fit" to auto-zoom around the data range with a small pad
+   * (useful for percentage charts where values cluster in a narrow band
+   * like 75-90% and would otherwise look flat at the default 0→max
+   * scale). Default: Recharts auto (typically 0→max).
+   */
+  yDomain?: [number, number] | "fit";
 }
 
 export interface ChartSeries {
@@ -351,7 +359,8 @@ export type RichFormat =
   | ImageFormat
   | ProgressFormat
   | CurrencyFormat
-  | SparklineFormat;
+  | SparklineFormat
+  | ChipFormat;
 
 /** Localised currency. Use this object form when the simple "currency"
  *  string isn't enough — for non-USD currencies (PHP, EUR, etc.) or
@@ -419,6 +428,21 @@ export interface SparklineFormat {
   color?: string;
   /** Render a faint zero/baseline reference line. Default: false. */
   baseline?: boolean;
+}
+
+/**
+ * Auto-colored chip for non-semantic categoricals (department names, segment
+ * codes, store clusters). The renderer hashes each distinct cell value to a
+ * stable color from an internal palette so every value gets its own chip
+ * without needing an explicit colors map.
+ *
+ * Use ChipFormat for category labels. Use StatusFormat when the color carries
+ * semantic meaning (red = error, green = success).
+ */
+export interface ChipFormat {
+  type: "chip";
+  /** Optional palette name. Default: muted multi-color. */
+  palette?: "default" | "soft";
 }
 
 export interface Filter {
