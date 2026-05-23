@@ -73,7 +73,7 @@ export interface CardColumnSection {
 export interface ChartSection {
   type: "chart";
   source: string;
-  chart: "line" | "bar" | "pie";
+  chart: "line" | "bar" | "pie" | "scatter";
   title?: string;
   x: { key: string; label?: string };
   y: ChartSeries[];
@@ -86,6 +86,19 @@ export interface ChartSection {
    * from `source`. See CardRowSection.inline_rows for rationale.
    */
   inline_data?: Record<string, unknown>[];
+  /**
+   * Optional reference markers drawn over the chart. Common uses:
+   *  - vertical line at the current cutoff/today on a time series
+   *  - horizontal target/threshold line
+   *  - diagonal y=x line on a scatter (bias visualization)
+   * Multiple lines render in declaration order.
+   */
+  referenceLines?: ReferenceLine[];
+  /**
+   * For bar charts: stack series instead of grouping side-by-side. No effect
+   * on line/pie/scatter. Default: false.
+   */
+  stacked?: boolean;
 }
 
 export interface ChartSeries {
@@ -93,6 +106,35 @@ export interface ChartSeries {
   label?: string;
   color?: string;
   axis?: "left" | "right"; // which Y axis (default: "left"). Use "right" for a second scale.
+  /**
+   * Optional confidence band for line charts. Shades the area between the
+   * lower and upper row keys at each x-value. Use for forecast uncertainty
+   * ("likely range"). Ignored on bar/pie/scatter.
+   */
+  band?: {
+    lower_key: string;
+    upper_key: string;
+  };
+}
+
+/**
+ * Reference marker drawn over a chart. At least one of x or y must be set;
+ * `type: "diagonal"` ignores both and draws a y=x line (scatter only).
+ */
+export interface ReferenceLine {
+  /** Horizontal line at this y-value. Mutually exclusive with `x` and `type: "diagonal"`. */
+  y?: number;
+  /** Vertical line at this x-value. Categorical x-values pass as the same
+   *  string used in the data rows. */
+  x?: string | number;
+  /** When set to "diagonal", renders a y=x line — for scatter bias plots. */
+  type?: "diagonal";
+  /** Label rendered next to the line. */
+  label?: string;
+  /** Stroke color. Default: a neutral gray. */
+  color?: string;
+  /** Stroke style. Default: "dashed". */
+  style?: "solid" | "dashed";
 }
 
 /** Compact tab control on a chart — selected value passed as a filter to the fetch handler */
@@ -308,7 +350,8 @@ export type RichFormat =
   | LinkFormat
   | ImageFormat
   | ProgressFormat
-  | CurrencyFormat;
+  | CurrencyFormat
+  | SparklineFormat;
 
 /** Localised currency. Use this object form when the simple "currency"
  *  string isn't enough — for non-USD currencies (PHP, EUR, etc.) or
@@ -360,6 +403,22 @@ export interface ImageFormat {
 /** Progress bar for 0–1 values */
 export interface ProgressFormat {
   type: "progress";
+}
+
+/**
+ * Inline mini line chart inside a table cell. The cell value itself is
+ * ignored — the renderer reads an array of numbers from another column
+ * named `values_key` on the same row. Use for at-a-glance trend signals
+ * ("is this SKU's demand going up or down?") without leaving the table.
+ */
+export interface SparklineFormat {
+  type: "sparkline";
+  /** Column key on the same row containing the array of numeric values. */
+  values_key: string;
+  /** Stroke color. Default: theme accent. */
+  color?: string;
+  /** Render a faint zero/baseline reference line. Default: false. */
+  baseline?: boolean;
 }
 
 export interface Filter {
@@ -883,7 +942,8 @@ export type DetailBlock =
   | DetailField
   | DetailList
   | DetailTable
-  | DetailImage;
+  | DetailImage
+  | DetailChart;
 
 export interface DetailHeader {
   type: "header";
@@ -951,6 +1011,31 @@ export interface DetailImage {
   alt?: string;
   width?: number;
   height?: number;
+}
+
+/**
+ * Chart inside a detail drawer. Unlike ChartSection (which fetches its own
+ * source), DetailChart carries its data inline — the entire detail panel
+ * is one fetch, so chart data ships in the same payload.
+ *
+ * Shape mirrors ChartSection: x/y series, optional reference lines, optional
+ * confidence band on line series. Scatter and stacked-bar both supported.
+ */
+export interface DetailChart {
+  type: "chart";
+  /** Optional heading rendered above the chart. */
+  label?: string;
+  chart: "line" | "bar" | "scatter";
+  x: { key: string; label?: string };
+  y: ChartSeries[];
+  /** Data rows — one row per x-value. Required (no source fetch). */
+  rows: Record<string, unknown>[];
+  /** Height in pixels. Default: 240. */
+  height?: number;
+  /** Reference markers (see ChartSection.referenceLines). */
+  referenceLines?: ReferenceLine[];
+  /** Bar-chart stacking. */
+  stacked?: boolean;
 }
 
 // ---------------------------------------------------------------------------
