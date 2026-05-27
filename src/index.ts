@@ -25,6 +25,8 @@ export type {
   ActionCondition,
   ActionInput,
   UploadedFile,
+  DecisionFeedSection,
+  DecisionCard,
 
   // Column formatting
   ColumnFormat,
