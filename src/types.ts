@@ -107,6 +107,24 @@ export interface ChartSection {
    * scale). Default: Recharts auto (typically 0→max).
    */
   yDomain?: [number, number] | "fit";
+  /**
+   * Bar-chart orientation. Default "horizontal" = vertical bars rising from
+   * the X axis (the conventional layout). Set "vertical" to flip: horizontal
+   * bars extending right from the Y axis, with category names listed down
+   * the left. Use "vertical" when:
+   *   - Category names are long (no tilted-X-axis truncation needed)
+   *   - You have many categories (more vertical room than horizontal)
+   *   - The distribution is skewed and you want value labels readable
+   * Has no effect on line / pie / scatter.
+   */
+  layout?: "horizontal" | "vertical";
+  /**
+   * Bar-chart inline value labels. When true, every bar segment is annotated
+   * with its numeric value (formatted compactly: K/M/B). Useful for
+   * skewed distributions where the tail bars are too small to read by
+   * size alone. Default: false.
+   */
+  value_labels?: boolean;
 }
 
 export interface ChartSeries {
@@ -721,6 +739,25 @@ export interface StandardActionResponse {
   affected: number;
   message?: string;
   data?: Record<string, unknown>;  // flexible return data (e.g., download URL, generated file path)
+  /**
+   * When set, the desktop keeps the detail drawer open and navigates it to
+   * the specified row instead of closing after a successful action. Enables
+   * wizard-style sequential walkthroughs (e.g. HITL decision batches) where
+   * the handler knows which row to visit next.
+   *
+   * `row_id` — the `rowKey` value of the next row to open in the drawer.
+   * `section` — optional; reserved for future cross-section navigation.
+   *             Currently ignored by the desktop (single-table pages cover
+   *             the primary HITL use case), but including it in the type
+   *             now avoids a wire-breaking change later.
+   *
+   * When absent or null, the desktop closes the drawer and refreshes the
+   * table (existing behavior, unchanged).
+   */
+  open_next?: {
+    row_id: string | number;
+    section?: string;
+  };
 }
 
 /**
