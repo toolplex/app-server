@@ -41,7 +41,57 @@ export type Section =
   | SectionGroup
   | LinkToPageSection
   | TopNSection
-  | StatusGridSection;
+  | StatusGridSection
+  | DecisionFeedSection;
+
+// ---------------------------------------------------------------------------
+// DecisionFeedSection — triage-queue surface for sequential decision-making.
+//
+// Mental model: email inbox. One decision = one card. Cards stacked vertically.
+// The operator scrolls and clicks action buttons embedded in each card.
+// After each action the feed refetches from source — the server is the
+// source of truth for order (pending first, then deferred, then resolved).
+// ---------------------------------------------------------------------------
+
+export interface DecisionFeedSection {
+  type: "decision-feed";
+  /** Resource fetched by the desktop; handler returns { rows: DecisionCard[], total }. */
+  source: string;
+  /** Actions available on every card, rendered as inline buttons. */
+  actions?: Action[];
+  /** Shown centred when the feed is empty. */
+  empty_message?: string;
+  /** Grid-span, same as other sections. */
+  span?: number;
+}
+
+/**
+ * A single decision card in a DecisionFeedSection.
+ *
+ * The fetch handler returns these as the `rows` array (typed as
+ * Record<string, unknown>[] on the wire, cast by the renderer).
+ * Use `id` as the row key — it must be stable across refetches.
+ */
+export interface DecisionCard {
+  /** Stable identifier for this decision. */
+  id: string | number;
+  /** Top-line heading, e.g. "Limac · Identity decision". */
+  title: string;
+  /** Second line, smaller, e.g. "Workflow: limac_master_dedup · 3 entries". */
+  subtitle?: string;
+  /** Small right-aligned chip, e.g. "₱14.2M" or "Blocking". */
+  badge?: string;
+  /** Chip color treatment. Default: "default". */
+  badge_variant?: "default" | "success" | "warning" | "danger" | "info";
+  /** The actual question posed to the operator. Rendered larger. */
+  question: string;
+  /** Rich evidence blocks rendered inside the card using the DetailBlock renderer. */
+  evidence: DetailBlock[];
+  /** Downstream consequences of the decision, rendered as a tight field list. */
+  consequences?: { label: string; value: string }[];
+  /** Visual treatment. "pending" is full-color; decided variants dim the card. */
+  status?: "pending" | "decided_yes" | "decided_no" | "deferred";
+}
 
 export interface CardRowSection {
   type: "card-row";
