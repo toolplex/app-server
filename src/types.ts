@@ -45,6 +45,15 @@ export type Section =
   | DecisionFeedSection;
 
 // ---------------------------------------------------------------------------
+// min_desktop_version — section-level desktop version gate
+//
+// When set on a section, an older toolplex-desktop renders an "Update
+// required" placeholder in that section's slot instead of attempting to
+// render the section (which would fall through to "Unknown section type").
+// Format: numeric semver "X.Y.Z" — no prerelease tags. Absent = no gate.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
 // DecisionFeedSection — triage-queue surface for sequential decision-making.
 //
 // Mental model: email inbox. One decision = one card. Cards stacked vertically.
@@ -63,6 +72,8 @@ export interface DecisionFeedSection {
   empty_message?: string;
   /** Grid-span, same as other sections. */
   span?: number;
+  /** Minimum toolplex-desktop version required to render this section. See Section version gate docs. */
+  min_desktop_version?: string;
 }
 
 /**
@@ -109,6 +120,8 @@ export interface CardRowSection {
    * selection / ask-agent flows even when data is inline.
    */
   inline_rows?: CardData[];
+  /** Minimum toolplex-desktop version required to render this section. See Section version gate docs. */
+  min_desktop_version?: string;
 }
 
 export interface CardColumnSection {
@@ -118,6 +131,8 @@ export interface CardColumnSection {
   title?: string;
   /** See CardRowSection.inline_rows. */
   inline_rows?: CardData[];
+  /** Minimum toolplex-desktop version required to render this section. See Section version gate docs. */
+  min_desktop_version?: string;
 }
 
 export interface ChartSection {
@@ -175,6 +190,8 @@ export interface ChartSection {
    * size alone. Default: false.
    */
   value_labels?: boolean;
+  /** Minimum toolplex-desktop version required to render this section. See Section version gate docs. */
+  min_desktop_version?: string;
 }
 
 export interface ChartSeries {
@@ -243,6 +260,8 @@ export interface TableSection {
    * data inline rather than wiring a fetch handler.
    */
   inline_rows?: Record<string, unknown>[];
+  /** Minimum toolplex-desktop version required to render this section. See Section version gate docs. */
+  min_desktop_version?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -267,6 +286,8 @@ export interface SectionGroup {
   /** Sections within this group. Same shape as PageDefinition.sections. */
   sections: (Section | Section[])[];
   span?: number;
+  /** Minimum toolplex-desktop version required to render this section. See Section version gate docs. */
+  min_desktop_version?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -298,6 +319,8 @@ export interface LinkToPageSection {
   /** Button text. Default: "Open". */
   cta_label?: string;
   span?: number;
+  /** Minimum toolplex-desktop version required to render this section. See Section version gate docs. */
+  min_desktop_version?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -318,6 +341,8 @@ export interface TopNSection {
   /** Maximum items to render. Default 5. */
   max_items?: number;
   span?: number;
+  /** Minimum toolplex-desktop version required to render this section. See Section version gate docs. */
+  min_desktop_version?: string;
 }
 
 export interface TopNItem {
@@ -346,6 +371,8 @@ export interface StatusGridSection {
   /** Legend entries rendered below the grid. */
   legend?: { color: StatusColor; label: string }[];
   span?: number;
+  /** Minimum toolplex-desktop version required to render this section. See Section version gate docs. */
+  min_desktop_version?: string;
 }
 
 export interface StatusCell {
