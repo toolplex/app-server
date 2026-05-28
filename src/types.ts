@@ -563,6 +563,19 @@ export interface Filter {
    * on a receive page where "All months" makes no sense).
    */
   required?: boolean;
+  /**
+   * Other filter keys whose values this dropdown's options depend on.
+   * When any listed value changes, the desktop client re-fetches the
+   * options_source with the dependency values appended as query params.
+   * The resource handler reads them from its `filters` argument and
+   * scopes results accordingly. Without this, a dependent dropdown
+   * (e.g. a per-month version dropdown) keeps showing whatever options
+   * it was first loaded with after the parent filter changes.
+   *
+   * Requires toolplex-desktop ≥ 1.3.8. Older clients ignore the field
+   * and fall back to the previous one-shot-on-mount fetch — safe.
+   */
+  options_depends_on?: string[];
 }
 
 export interface Action {
