@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { extname, join } from "node:path";
 
@@ -55,6 +55,9 @@ const DEFAULTS = {
   maxResultBytes: 512 * 1024,
   queryTimeoutMs: 15_000,
   manifestSampleRows: 5,
+  maxConcurrentIngests: 4,
+  maxTotalBytes: 2 * 1024 * 1024 * 1024, // 2 GB
+  maxIngestRows: 2_000_000,
 };
 
 // Query-instance sandbox: read-only + no host filesystem access + config
@@ -69,6 +72,8 @@ const QUERY_INSTANCE_CONFIG = {
 export class FileStore {
   private cfg: ResolvedFilesConfig;
   private sweepTimer?: NodeJS.Timeout;
+  /** Ingests currently in flight in this process (concurrency guard). */
+  private activeIngests = 0;
 
   constructor(config: FilesConfig) {
     this.cfg = {
@@ -79,6 +84,9 @@ export class FileStore {
       maxResultBytes: config.maxResultBytes ?? DEFAULTS.maxResultBytes,
       queryTimeoutMs: config.queryTimeoutMs ?? DEFAULTS.queryTimeoutMs,
       manifestSampleRows: config.manifestSampleRows ?? DEFAULTS.manifestSampleRows,
+      maxConcurrentIngests: config.maxConcurrentIngests ?? DEFAULTS.maxConcurrentIngests,
+      maxTotalBytes: config.maxTotalBytes ?? DEFAULTS.maxTotalBytes,
+      maxIngestRows: config.maxIngestRows ?? DEFAULTS.maxIngestRows,
     };
   }
 
@@ -163,66 +171,121 @@ export class FileStore {
       );
     }
 
-    const fileId = randomUUID();
-    const uploadPath = join(this.cfg.dir, `${fileId}${extname(filename) || `.${kind}`}`);
-    const dbPath = join(this.cfg.dir, `${fileId}.duckdb`);
-    const notes: string[] = [];
-
-    await mkdir(this.cfg.dir, { recursive: true });
-    // CSV/TSV may be UTF-16 (Excel's "Unicode Text" export) or carry a BOM —
-    // DuckDB's read_csv_auto assumes UTF-8 and would otherwise ingest garbage
-    // (null-byte-laden column names). Transcode to clean UTF-8 first. XLSX is
-    // a binary zip handled by ExcelJS, so leave it untouched.
-    if (kind === "xlsx") {
-      await writeFile(uploadPath, buffer);
-    } else {
-      const { data, reencoded } = decodeTextBufferToUtf8(buffer);
-      await writeFile(uploadPath, data);
-      if (reencoded) notes.push(`Converted ${reencoded} text to UTF-8 for parsing.`);
-    }
-
-    let tables: FileTableManifest[];
-    try {
-      if (kind === "xlsx") {
-        tables = await this.ingestXlsx(uploadPath, dbPath, fileId, notes);
-      } else {
-        tables = await this.ingestDelimited(uploadPath, dbPath, kind, notes);
-      }
-    } catch (err) {
-      // Ingestion failed — leave nothing behind.
-      await this.removeFiles(fileId, { uploadPath, dbPath } as FileRecord);
+    // Concurrency guard — bound peak memory. Reject (rather than queue) when
+    // the process is already at capacity, so a burst of large/zip-bomb uploads
+    // can't pile up in memory at once.
+    if (this.activeIngests >= this.cfg.maxConcurrentIngests) {
       throw new FileStoreError(
-        422,
-        `Could not process file: ${err instanceof Error ? err.message : String(err)}`,
+        503,
+        "Server is busy processing other uploads. Please retry in a moment.",
       );
     }
+    this.activeIngests++;
+    try {
+      // Disk cap: if this upload would push the drop dir over the limit, run an
+      // eager sweep of expired files; if still over, reject.
+      if ((await this.dirSizeBytes()) + buffer.length > this.cfg.maxTotalBytes) {
+        await this.sweepExpired(() => {});
+        if ((await this.dirSizeBytes()) + buffer.length > this.cfg.maxTotalBytes) {
+          throw new FileStoreError(
+            507,
+            "File storage is temporarily full. Please try again shortly.",
+          );
+        }
+      }
 
-    if (tables.length === 0) {
-      await this.removeFiles(fileId, { uploadPath, dbPath } as FileRecord);
-      throw new FileStoreError(422, "File contained no readable tabular data.");
+      const fileId = randomUUID();
+      const uploadPath = join(this.cfg.dir, `${fileId}${extname(filename) || `.${kind}`}`);
+      const dbPath = join(this.cfg.dir, `${fileId}.duckdb`);
+      const notes: string[] = [];
+
+      await mkdir(this.cfg.dir, { recursive: true });
+      // CSV/TSV may be UTF-16 (Excel's "Unicode Text" export) or carry a BOM —
+      // DuckDB's read_csv_auto assumes UTF-8 and would otherwise ingest garbage
+      // (null-byte-laden column names). Transcode to clean UTF-8 first. XLSX is
+      // a binary zip handled by ExcelJS, so leave it untouched.
+      if (kind === "xlsx") {
+        await writeFile(uploadPath, buffer);
+      } else {
+        const { data, reencoded } = decodeTextBufferToUtf8(buffer);
+        await writeFile(uploadPath, data);
+        if (reencoded) notes.push(`Converted ${reencoded} text to UTF-8 for parsing.`);
+      }
+
+      let tables: FileTableManifest[];
+      try {
+        if (kind === "xlsx") {
+          tables = await this.ingestXlsx(uploadPath, dbPath, fileId, notes);
+        } else {
+          tables = await this.ingestDelimited(uploadPath, dbPath, kind, notes);
+        }
+      } catch (err) {
+        // Ingestion failed — leave nothing behind.
+        await this.removeFiles(fileId, { uploadPath, dbPath } as FileRecord);
+        throw new FileStoreError(
+          422,
+          `Could not process file: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+
+      if (tables.length === 0) {
+        await this.removeFiles(fileId, { uploadPath, dbPath } as FileRecord);
+        throw new FileStoreError(422, "File contained no readable tabular data.");
+      }
+
+      // Row cap: refuse absurdly large tables before they reach the query layer.
+      const oversized = tables.find((t) => t.rowCount > this.cfg.maxIngestRows);
+      if (oversized) {
+        await this.removeFiles(fileId, { uploadPath, dbPath } as FileRecord);
+        throw new FileStoreError(
+          413,
+          `File has too many rows (${oversized.rowCount.toLocaleString()}). Maximum is ${this.cfg.maxIngestRows.toLocaleString()}.`,
+        );
+      }
+
+      const manifest: FileManifest = {
+        fileId,
+        filename,
+        kind,
+        sizeBytes: buffer.length,
+        tables,
+        createdAt: new Date().toISOString(),
+        notes: notes.length > 0 ? notes : undefined,
+      };
+
+      const record: FileRecord = {
+        manifest,
+        uploadPath,
+        dbPath,
+        ownerUserId: requester.userId,
+        ownerOrgId: requester.orgId,
+        createdAtMs: Date.now(),
+      };
+      await writeFile(this.recordPath(fileId), JSON.stringify(record), "utf8");
+
+      return manifest;
+    } finally {
+      this.activeIngests--;
     }
+  }
 
-    const manifest: FileManifest = {
-      fileId,
-      filename,
-      kind,
-      sizeBytes: buffer.length,
-      tables,
-      createdAt: new Date().toISOString(),
-      notes: notes.length > 0 ? notes : undefined,
-    };
-
-    const record: FileRecord = {
-      manifest,
-      uploadPath,
-      dbPath,
-      ownerUserId: requester.userId,
-      ownerOrgId: requester.orgId,
-      createdAtMs: Date.now(),
-    };
-    await writeFile(this.recordPath(fileId), JSON.stringify(record), "utf8");
-
-    return manifest;
+  /** Total bytes currently held in the drop dir (best-effort). */
+  private async dirSizeBytes(): Promise<number> {
+    let total = 0;
+    let entries: string[];
+    try {
+      entries = await readdir(this.cfg.dir);
+    } catch {
+      return 0;
+    }
+    for (const entry of entries) {
+      try {
+        total += (await stat(join(this.cfg.dir, entry))).size;
+      } catch {
+        /* file vanished mid-scan */
+      }
+    }
+    return total;
   }
 
   /** CSV / TSV → a single table named `data`, types inferred by DuckDB. */

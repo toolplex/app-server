@@ -42,6 +42,24 @@ export interface FilesConfig {
   queryTimeoutMs?: number;
   /** Sample rows embedded per table in the manifest. Default: 5. */
   manifestSampleRows?: number;
+  // --- Resource guards (DoS hardening) ---
+  /**
+   * Max ingests running concurrently in this process. Excess uploads are
+   * rejected with 503 rather than queued, bounding peak memory (the main
+   * lever against zip-bomb / many-large-file memory exhaustion). Default: 4.
+   */
+  maxConcurrentIngests?: number;
+  /**
+   * Cap on the total bytes held in the drop dir. A new upload that would
+   * exceed it triggers an eager TTL sweep; if still over, it's rejected with
+   * 507. Bounds disk usage between sweeps. Default: 2 GB.
+   */
+  maxTotalBytes?: number;
+  /**
+   * Reject a file whose ingested table exceeds this row count. Prevents
+   * absurdly large tables reaching the query layer. Default: 2,000,000.
+   */
+  maxIngestRows?: number;
 }
 
 /** Resolved config with defaults applied — what the store actually uses. */
@@ -53,6 +71,9 @@ export interface ResolvedFilesConfig {
   maxResultBytes: number;
   queryTimeoutMs: number;
   manifestSampleRows: number;
+  maxConcurrentIngests: number;
+  maxTotalBytes: number;
+  maxIngestRows: number;
 }
 
 export interface FileColumn {
