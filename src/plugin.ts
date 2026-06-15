@@ -8,6 +8,8 @@ import { registerDataRoutes } from "./routes/data.js";
 import { registerActionRoutes } from "./routes/actions.js";
 import { registerContextRoutes } from "./routes/context.js";
 import { registerDownloadRoutes } from "./routes/download.js";
+import { registerFileRoutes } from "./routes/files.js";
+import { FileStore } from "./files/store.js";
 
 async function appServerPlugin(
   fastify: FastifyInstance,
@@ -20,10 +22,10 @@ async function appServerPlugin(
   const authHook = createAuthHook(config.authToken);
   fastify.addHook("onRequest", authHook);
 
-  // If any action declares a file input, register @fastify/multipart so
-  // /actions/:action can parse multipart bodies. Lazy-imported so plugin
-  // consumers that don't use file inputs don't need the dependency.
-  if (hasFileInputs(config)) {
+  // Register @fastify/multipart when either an action declares a file input
+  // OR the smart file-attachment feature is enabled — both parse multipart
+  // bodies. Lazy-imported so consumers that use neither don't need the dep.
+  if (hasFileInputs(config) || config.files?.enabled) {
     const multipartModule = await import("@fastify/multipart").catch(() => {
       throw new Error(
         "@toolplex/app-server: an action declares a file input but " +
@@ -45,6 +47,22 @@ async function appServerPlugin(
   registerActionRoutes(fastify, config);
   registerContextRoutes(fastify, config);
   registerDownloadRoutes(fastify, config);
+
+  // Smart file-attachment feature — ingest CSV/XLSX into an isolated,
+  // read-only DuckDB db and expose manifest + read-only SQL. Encapsulated in
+  // its own scope so its FileStoreError → HTTP-status error handler doesn't
+  // shadow the plugin-level one for the other route groups.
+  if (config.files?.enabled) {
+    const store = new FileStore(config.files);
+    await store.init();
+    await fastify.register(async (filesScope) => {
+      registerFileRoutes(filesScope, config, store);
+    });
+    store.startCleanup((msg) => fastify.log.info(msg));
+    fastify.addHook("onClose", async () => {
+      store.stopCleanup();
+    });
+  }
 
   // Catch handler errors and return structured responses
   fastify.setErrorHandler(async (error: Error & { statusCode?: number }, _request, reply) => {

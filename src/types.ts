@@ -1,3 +1,5 @@
+import type { FilesConfig } from "./files/types.js";
+
 // ---------------------------------------------------------------------------
 // Page Definition — the JSON schema that describes a page's layout and behavior
 // ---------------------------------------------------------------------------
@@ -973,6 +975,14 @@ export interface AppServerConfig {
   pages: Record<string, Omit<PageDefinition, "id">>;
   resources: Record<string, ResourceDefinition>;
   actions: Record<string, ActionHandler>;
+  /**
+   * Optional smart file-attachment handling. When `enabled`, the plugin
+   * mounts `/files` routes that ingest uploaded CSV/XLSX into an isolated,
+   * read-only DuckDB database and expose a compact manifest + read-only SQL
+   * query interface for the agent. See FilesConfig. Requires
+   * @fastify/multipart (auto-registered when enabled).
+   */
+  files?: FilesConfig;
 }
 
 // ---------------------------------------------------------------------------

@@ -176,6 +176,78 @@ order_detail: {
 
 **Context** — receives `{ filters?, selection? }`, returns `{ summary, selection?, suggestions? }`. Used by the ToolPlex agent to understand what's on screen.
 
+## File Attachments (smart CSV/XLSX handling)
+
+Large tabular attachments (CSV, TSV, XLSX) are token-heavy and
+hallucination-prone when dumped raw into the agent's context. Enable the
+`files` feature to ingest an uploaded file into an **isolated, read-only
+DuckDB database** instead: the agent receives a compact *manifest* (tables,
+columns + inferred types, row counts, a few sample rows) and pulls exactly
+what it needs on demand via **read-only SQL**.
+
+```typescript
+await server.register(registerAppPages, {
+  authToken: process.env.TOOLPLEX_APP_TOKEN,
+  pages: { /* … */ },
+  resources: { /* … */ },
+  actions: {},
+  files: {
+    enabled: true,
+    // dir defaults to <os.tmpdir>/toolplex-app-files
+    ttlMinutes: 1440,       // abandoned uploads are swept after this (24h)
+    maxUploadBytes: 100 * 1024 * 1024,
+    maxQueryRows: 1000,     // hard cap per query
+    maxResultBytes: 512 * 1024,
+    queryTimeoutMs: 15000,
+  },
+});
+```
+
+Requires `@fastify/multipart` (auto-registered when `files.enabled`). Adds
+`@duckdb/node-api` and `exceljs` as runtime dependencies.
+
+### Generated endpoints
+
+| Route | Method | Description |
+|-------|--------|-------------|
+| `/files` | POST | Multipart upload → ingest → returns `{ manifest }` |
+| `/files` | GET | List the caller's manifests |
+| `/files/:id/manifest` | GET | Re-fetch a single manifest |
+| `/files/:id/query` | POST | `{ sql }` → read-only query result (capped) |
+| `/files/:id` | DELETE | Remove an upload (idempotent) |
+
+### Isolation & safety
+
+Each upload becomes its **own** DuckDB database. Queries run on a connection
+opened with `access_mode: READ_ONLY`, `enable_external_access: false`, and
+`lock_configuration: true` — so a query can reach **neither** the host
+filesystem (`read_csv('/etc/passwd')`), the app's own reporting database
+(`ATTACH`), nor another upload's data, and cannot re-enable any of it via
+`SET`. A light statement guard additionally rejects multi-statement payloads
+and non-`SELECT` leading keywords before the SQL reaches DuckDB. Results are
+capped by row count and serialized byte size; queries have a wall-clock
+timeout.
+
+### Manifest shape
+
+```typescript
+{
+  fileId: string;
+  filename: string;
+  kind: "csv" | "tsv" | "xlsx";
+  sizeBytes: number;
+  tables: {
+    name: string;        // SQL table name (CSV → "data"; XLSX → sanitized sheet name)
+    sheetName?: string;  // original worksheet name (XLSX)
+    rowCount: number;
+    columns: { name: string; type: string }[];
+    sampleRows: Record<string, unknown>[];
+  }[];
+  createdAt: string;
+  notes?: string[];      // non-fatal ingestion notes (e.g. inferred-as-text)
+}
+```
+
 ## Validation
 
 The plugin validates configuration at startup. Misconfigurations throw immediately with descriptive errors:
