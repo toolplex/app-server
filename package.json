@@ -1,6 +1,6 @@
 {
   "name": "@toolplex/app-server",
-  "version": "0.6.5",
+  "version": "0.7.0",
   "description": "Fastify plugin for serving ToolPlex App Pages — page definitions, paginated data, actions, and agent context",
   "type": "module",
   "main": "dist/index.js",
@@ -32,6 +32,8 @@
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
+    "@duckdb/node-api": "^1.5.3-r.3",
+    "exceljs": "^4.4.0",
     "fastify-plugin": "^5.0.1"
   },
   "peerDependencies": {

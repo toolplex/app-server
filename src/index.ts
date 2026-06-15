@@ -72,3 +72,12 @@ export type {
   Selection,
   UserIdentity,
 } from "./types.js";
+
+// Smart file-attachment feature (opt-in via AppServerConfig.files)
+export type {
+  FilesConfig,
+  FileManifest,
+  FileTableManifest,
+  FileColumn,
+  FileQueryResult,
+} from "./files/types.js";
