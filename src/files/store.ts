@@ -169,7 +169,17 @@ export class FileStore {
     const notes: string[] = [];
 
     await mkdir(this.cfg.dir, { recursive: true });
-    await writeFile(uploadPath, buffer);
+    // CSV/TSV may be UTF-16 (Excel's "Unicode Text" export) or carry a BOM —
+    // DuckDB's read_csv_auto assumes UTF-8 and would otherwise ingest garbage
+    // (null-byte-laden column names). Transcode to clean UTF-8 first. XLSX is
+    // a binary zip handled by ExcelJS, so leave it untouched.
+    if (kind === "xlsx") {
+      await writeFile(uploadPath, buffer);
+    } else {
+      const { data, reencoded } = decodeTextBufferToUtf8(buffer);
+      await writeFile(uploadPath, data);
+      if (reencoded) notes.push(`Converted ${reencoded} text to UTF-8 for parsing.`);
+    }
 
     let tables: FileTableManifest[];
     try {
@@ -420,7 +430,7 @@ export class FileStore {
   ): Promise<FileTableManifest> {
     const descReader = await conn.runAndReadAll(`DESCRIBE ${quoteIdent(tableName)}`);
     const columns: FileColumn[] = descReader.getRowObjects().map((r) => ({
-      name: String(r.column_name),
+      name: stripNulls(String(r.column_name)),
       type: String(r.column_type),
     }));
 
@@ -515,6 +525,44 @@ export class FileStore {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Decode an uploaded text file (CSV/TSV) to a clean UTF-8 buffer. Excel often
+ * exports CSV as UTF-16 (LE/BE, usually with a BOM) or UTF-8-with-BOM; DuckDB's
+ * read_csv_auto assumes UTF-8 and produces garbage (null-byte-laden column
+ * names) otherwise. Detect the encoding and transcode, stripping any BOM.
+ * Returns the (possibly unchanged) buffer plus a label when re-encoded.
+ */
+function decodeTextBufferToUtf8(buffer: Buffer): { data: Buffer; reencoded?: string } {
+  if (buffer.length >= 2 && buffer[0] === 0xff && buffer[1] === 0xfe) {
+    return { data: Buffer.from(new TextDecoder("utf-16le").decode(buffer), "utf8"), reencoded: "UTF-16" };
+  }
+  if (buffer.length >= 2 && buffer[0] === 0xfe && buffer[1] === 0xff) {
+    return { data: Buffer.from(new TextDecoder("utf-16be").decode(buffer), "utf8"), reencoded: "UTF-16" };
+  }
+  if (buffer.length >= 3 && buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf) {
+    return { data: buffer.subarray(3), reencoded: "UTF-8 (BOM stripped)" }; // strip UTF-8 BOM
+  }
+  // No BOM: sniff for UTF-16 by null-byte density. ASCII text in UTF-16 has a
+  // null byte for (almost) every character — a strong, cheap signal.
+  const sample = buffer.subarray(0, Math.min(buffer.length, 4096));
+  let nullCount = 0;
+  for (let i = 0; i < sample.length; i++) if (sample[i] === 0x00) nullCount++;
+  if (sample.length > 0 && nullCount / sample.length > 0.2) {
+    // Guess LE vs BE: UTF-16LE puts the null in odd byte positions for ASCII.
+    let oddNulls = 0;
+    for (let i = 1; i < sample.length; i += 2) if (sample[i] === 0x00) oddNulls++;
+    const enc = oddNulls > nullCount / 2 ? "utf-16le" : "utf-16be";
+    return { data: Buffer.from(new TextDecoder(enc).decode(buffer), "utf8"), reencoded: "UTF-16" };
+  }
+  return { data: buffer };
+}
+
+/** Strip NUL bytes — they corrupt manifests and are rejected by some LLM APIs. */
+function stripNulls(s: string): string {
+  const NUL = String.fromCharCode(0);
+  return s.indexOf(NUL) === -1 ? s : s.split(NUL).join("");
+}
+
 function detectKind(filename: string): "csv" | "tsv" | "xlsx" | null {
   const ext = extname(filename).toLowerCase();
   if (ext === ".csv") return "csv";
@@ -592,11 +640,11 @@ function normalizeValue(v: unknown, maxStringLen?: number): unknown {
     return Number.isSafeInteger(n) ? n : (v as bigint).toString();
   }
   if (t === "number" || t === "boolean") return v;
-  if (t === "string") return capStr(v as string, maxStringLen);
+  if (t === "string") return capStr(stripNulls(v as string), maxStringLen);
   if (v instanceof Date) return v.toISOString();
   if (t === "object") {
     const s = safeToString(v);
-    if (s !== null) return capStr(s, maxStringLen);
+    if (s !== null) return capStr(stripNulls(s), maxStringLen);
     try {
       return JSON.parse(
         JSON.stringify(v, (_k, val) => (typeof val === "bigint" ? val.toString() : val)),
