@@ -119,13 +119,21 @@ export function registerDownloadRoutes(
       if (firstPage.rows.length > 0) {
         columns = Object.keys(firstPage.rows[0]).map((k) => ({ key: k, label: k }));
       } else {
-        // Empty dataset — write empty CSV
-        reply.raw.end("");
+        // Empty dataset — still emit BOM so Excel auto-detects UTF-8 if a
+        // user opens the file.
+        reply.raw.end("﻿");
         return reply;
       }
     }
 
     const keys = columns.map((c) => c.key);
+
+    // UTF-8 BOM. Without it, Excel on Windows reads CSVs as the system
+    // codepage (CP1252 on most installs) and non-ASCII characters get
+    // mojibake'd — e.g. Ñ (UTF-8 C3 91) is interpreted as Ã‘. The
+    // Content-Type charset=utf-8 header is correct but Excel ignores it
+    // for CSV imports; the BOM is the only reliable hint.
+    reply.raw.write("﻿");
 
     // Write CSV header
     reply.raw.write(csvRow(columns.map((c) => c.label)));
