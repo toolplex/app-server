@@ -550,8 +550,13 @@ export interface Filter {
    *   range. Dispatches `<key>_from` and `<key>_to` as separate filter
    *   keys; the resource handler is responsible for translating them.
    *   For text-month columns ("April 2026"), use a TO_DATE BETWEEN.
+   * - date-range — pair of HTML date pickers for an inclusive [from, to]
+   *   range over a real DATE column. Same `<key>_from` / `<key>_to`
+   *   dispatch shape as month-range. Values are ISO date strings
+   *   (YYYY-MM-DD) and can be compared against DATE columns directly,
+   *   no TO_DATE wrapping required.
    */
-  type: "dropdown" | "text" | "date" | "month-range";
+  type: "dropdown" | "text" | "date" | "month-range" | "date-range";
   label?: string;
   options?: string[];
   options_source?: string;
