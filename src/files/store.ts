@@ -49,7 +49,11 @@ export interface Requester {
 }
 
 const DEFAULTS = {
-  ttlMinutes: 1440, // 24h
+  // 7 days. Attachments are ephemeral, but a 24h TTL expired files mid-thread
+  // for multi-day engagements. Combined with refresh-on-use (querying a file
+  // bumps its clock), an actively-used file effectively never expires while the
+  // conversation is alive; abandoned files still get swept within a week.
+  ttlMinutes: 10080,
   maxUploadBytes: 100 * 1024 * 1024,
   maxQueryRows: 1000,
   maxResultBytes: 512 * 1024,
@@ -541,6 +545,11 @@ export class FileStore {
       // Don't leak existence to a non-owner.
       throw new FileStoreError(404, "File not found.");
     }
+    // Refresh-on-use: bump the TTL clock so a file that's still being queried in
+    // an active conversation doesn't get swept out from under it. Best-effort —
+    // never fail a read because the touch couldn't be persisted.
+    record.createdAtMs = Date.now();
+    writeFile(this.recordPath(fileId), JSON.stringify(record), "utf8").catch(() => {});
     return record;
   }
 
