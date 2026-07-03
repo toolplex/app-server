@@ -129,6 +129,54 @@ export function registerFileRoutes(
     },
   );
 
+  // GET /artifacts/:id/rows — server-side paginated/sorted/filtered page of an
+  // artifact, so tables of any size stream a page at a time. Query params match
+  // the desktop's page-data contract: page, pageSize, sort=key,dir, and column
+  // filters as _cf_<col>__<op>=value. Returns { rows, total, page, pageSize,
+  // totalPages, columns }.
+  fastify.get<{ Params: { id: string }; Querystring: Record<string, string> }>(
+    "/artifacts/:id/rows",
+    async (request, reply) => {
+      const q = request.query;
+      const page = Math.max(1, Number(q.page) || 1);
+      const pageSize = Math.min(Math.max(Number(q.pageSize) || 100, 1), 1000);
+
+      let sort: { key: string; direction: "asc" | "desc" } | undefined;
+      if (typeof q.sort === "string" && q.sort.includes(",")) {
+        const [key, dir] = q.sort.split(",");
+        if (key) sort = { key, direction: dir === "desc" ? "desc" : "asc" };
+      }
+
+      const filters: { column: string; operator: string; value: string }[] = [];
+      for (const [k, v] of Object.entries(q)) {
+        if (!k.startsWith("_cf_") || typeof v !== "string") continue;
+        const rest = k.slice(4);
+        const idx = rest.indexOf("__");
+        if (idx === -1) continue;
+        const operator = rest.slice(idx + 2);
+        // empty / not_empty carry no value; the rest need one.
+        if (v === "" && operator !== "empty" && operator !== "not_empty") continue;
+        filters.push({ column: rest.slice(0, idx), operator, value: v });
+      }
+
+      const result = await store.queryRows(request.params.id, requesterOf(request), {
+        page,
+        pageSize,
+        sort,
+        filters,
+      });
+      const totalPages = Math.max(1, Math.ceil(result.total / pageSize));
+      return reply.send({
+        rows: result.rows,
+        total: result.total,
+        page,
+        pageSize,
+        totalPages,
+        columns: result.columns,
+      });
+    },
+  );
+
   // POST /datasets/resolve — materialize a PINNED snapshot from a report file
   // the app-server can read (the report → artifact "pull" path). The pointer
   // path is allowlisted against config.reportDirs. Returns the same manifest
