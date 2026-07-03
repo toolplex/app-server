@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { extname, join } from "node:path";
+import { basename, extname, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
 
 import { DuckDBInstance } from "@duckdb/node-api";
 import ExcelJS from "exceljs";
@@ -93,6 +93,9 @@ export class FileStore {
       maxConcurrentIngests: config.maxConcurrentIngests ?? DEFAULTS.maxConcurrentIngests,
       maxTotalBytes: config.maxTotalBytes ?? DEFAULTS.maxTotalBytes,
       maxIngestRows: config.maxIngestRows ?? DEFAULTS.maxIngestRows,
+      // Canonicalize allowlist roots up front. Symlinked roots are re-resolved
+      // in init() (realpath needs the path to exist).
+      reportDirs: (config.reportDirs ?? []).map((d) => resolvePath(d)),
     };
   }
 
@@ -102,6 +105,20 @@ export class FileStore {
 
   async init(): Promise<void> {
     await mkdir(this.cfg.dir, { recursive: true });
+    // Resolve symlinks in the allowlist roots so the containment check below
+    // compares realpaths on both sides. Roots that don't exist are dropped —
+    // they can't be an ancestor of any real file anyway.
+    if (this.cfg.reportDirs.length > 0) {
+      const resolved: string[] = [];
+      for (const root of this.cfg.reportDirs) {
+        try {
+          resolved.push(await realpath(root));
+        } catch {
+          /* non-existent root — drop it */
+        }
+      }
+      this.cfg.reportDirs = resolved;
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -159,6 +176,7 @@ export class FileStore {
     filename: string,
     buffer: Buffer,
     requester: Requester,
+    opts: { pinned?: boolean } = {},
   ): Promise<FileManifest> {
     if (buffer.length === 0) {
       throw new FileStoreError(400, "Uploaded file is empty.");
@@ -267,6 +285,8 @@ export class FileStore {
         ownerUserId: requester.userId,
         ownerOrgId: requester.orgId,
         createdAtMs: Date.now(),
+        // Pinned (durable artifact from a resolved report) → never TTL-swept.
+        ...(opts.pinned ? { pinned: true } : {}),
       };
       await writeFile(this.recordPath(fileId), JSON.stringify(record), "utf8");
 
@@ -274,6 +294,78 @@ export class FileStore {
     } finally {
       this.activeIngests--;
     }
+  }
+
+  /**
+   * Resolve a report-generator's file pointer into a PINNED DuckDB snapshot.
+   * The path is canonicalized (symlinks resolved) and MUST live under one of
+   * the configured `reportDirs` roots — otherwise resolution is refused. This
+   * is the report → artifact "pull" entry point: the MCP tool triggers the
+   * report and returns a path the app-server can read; we read it here and
+   * materialize it exactly like an uploaded smart file, but durable.
+   */
+  async resolveFromPath(ref: string, requester: Requester): Promise<FileManifest> {
+    if (this.cfg.reportDirs.length === 0) {
+      throw new FileStoreError(403, "Report path resolution is not enabled on this server.");
+    }
+    if (typeof ref !== "string" || ref.trim().length === 0) {
+      throw new FileStoreError(400, "pointer.ref must be a non-empty path.");
+    }
+
+    // Resolve to an absolute realpath, THEN check containment — so a symlink
+    // inside an allowed dir can't point out, and traversal (../) can't escape.
+    // A relative ref is joined under each allowed root (the common case: the
+    // report API returns a path relative to its export dir); an absolute ref is
+    // taken as-is and must land under a root. realpath resolves symlinks and
+    // throws if the file is missing.
+    const candidates = isAbsolute(ref)
+      ? [ref]
+      : this.cfg.reportDirs.map((root) => join(root, ref));
+    let abs: string | null = null;
+    for (const cand of candidates) {
+      try {
+        const real = await realpath(cand);
+        if (this.isUnderReportDirs(real)) {
+          abs = real;
+          break;
+        }
+      } catch {
+        /* try the next root */
+      }
+    }
+    if (!abs) {
+      throw new FileStoreError(404, "Report file not found in the allowed directories.");
+    }
+
+    const st = await stat(abs).catch(() => null);
+    if (!st || !st.isFile()) {
+      throw new FileStoreError(404, "Report path is not a readable file.");
+    }
+    if (st.size > this.cfg.maxUploadBytes) {
+      throw new FileStoreError(
+        413,
+        `Report too large (${mb(st.size)} MB). Maximum is ${mb(this.cfg.maxUploadBytes)} MB.`,
+      );
+    }
+    if (!detectKind(abs)) {
+      throw new FileStoreError(
+        415,
+        `Unsupported report type "${extname(abs) || abs}". Supported: .csv, .tsv, .xlsx.`,
+      );
+    }
+
+    const buffer = await readFile(abs);
+    // Reuse the full ingest pipeline (transcode, type inference, row caps),
+    // pinned so it's a durable artifact snapshot.
+    return this.ingest(basename(abs), buffer, requester, { pinned: true });
+  }
+
+  /** True when `abs` (a realpath) is at or under one of the allowlist roots. */
+  private isUnderReportDirs(abs: string): boolean {
+    return this.cfg.reportDirs.some((root) => {
+      const rel = relative(root, abs);
+      return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+    });
   }
 
   /**
