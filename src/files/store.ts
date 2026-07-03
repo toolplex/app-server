@@ -625,6 +625,126 @@ export class FileStore {
     }
   }
 
+  /**
+   * Server-side paginated / sorted / filtered read of a snapshot — the engine
+   * behind arbitrary-size artifact tables. Builds a bounded SQL query against
+   * the pinned DuckDB (columns validated against the table's real schema, values
+   * single-quote-escaped) and runs it in the read-only sandbox. Returns one page
+   * of rows plus the total count for the current filter, so the client never
+   * loads more than a page regardless of report size.
+   */
+  async queryRows(
+    fileId: string,
+    requester: Requester,
+    opts: {
+      page: number;
+      pageSize: number;
+      sort?: { key: string; direction: "asc" | "desc" };
+      filters?: { column: string; operator: string; value: string }[];
+    },
+  ): Promise<{ rows: Record<string, unknown>[]; total: number; columns: FileColumn[] }> {
+    const record = await this.getOwnedRecord(fileId, requester);
+    const table = record.manifest.tables[0];
+    if (!table) throw new FileStoreError(404, "Artifact has no data table.");
+    const validCols = new Set(table.columns.map((c) => c.name));
+    const tbl = quoteIdent(table.name);
+
+    // WHERE — only recognized columns/operators; values are escaped. Semantics
+    // mirror the client's inline filters (case-insensitive contains/equals,
+    // numeric gt/lt, empty/not_empty).
+    const clauses: string[] = [];
+    for (const f of opts.filters ?? []) {
+      if (!validCols.has(f.column)) continue;
+      const col = quoteIdent(f.column);
+      const val = sqlString(f.value ?? "");
+      switch (f.operator) {
+        case "contains":
+          clauses.push(`strpos(lower(CAST(${col} AS VARCHAR)), lower(${val})) > 0`);
+          break;
+        case "equals":
+          clauses.push(`lower(CAST(${col} AS VARCHAR)) = lower(${val})`);
+          break;
+        case "gt":
+          clauses.push(`TRY_CAST(${col} AS DOUBLE) > TRY_CAST(${val} AS DOUBLE)`);
+          break;
+        case "lt":
+          clauses.push(`TRY_CAST(${col} AS DOUBLE) < TRY_CAST(${val} AS DOUBLE)`);
+          break;
+        case "empty":
+          clauses.push(`(${col} IS NULL OR CAST(${col} AS VARCHAR) = '')`);
+          break;
+        case "not_empty":
+          clauses.push(`(${col} IS NOT NULL AND CAST(${col} AS VARCHAR) <> '')`);
+          break;
+        default:
+          break;
+      }
+    }
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+
+    let orderBy = "";
+    if (opts.sort && validCols.has(opts.sort.key)) {
+      const dir = opts.sort.direction === "desc" ? "DESC" : "ASC";
+      orderBy = `ORDER BY ${quoteIdent(opts.sort.key)} ${dir} NULLS LAST`;
+    }
+
+    const pageSize = Math.min(Math.max(Math.floor(opts.pageSize) || 100, 1), 1000);
+    const page = Math.max(1, Math.floor(opts.page) || 1);
+    const offset = (page - 1) * pageSize;
+
+    const inst = await DuckDBInstance.create(record.dbPath, QUERY_INSTANCE_CONFIG);
+    try {
+      const conn = await inst.connect();
+      try {
+        const countReader = await withTimeout(
+          conn.runAndReadAll(`SELECT count(*) AS c FROM ${tbl} ${where}`),
+          this.cfg.queryTimeoutMs,
+          () => inst.closeSync(),
+        );
+        const total = Number(countReader.getRowObjects()[0]?.c ?? 0);
+
+        // `rowid` gives a stable per-row key for the client (the snapshot is
+        // immutable). It's added as `_id` and isn't in the manifest columns, so
+        // it never renders as a data column.
+        const reader = await withTimeout(
+          conn.runAndReadUntil(
+            `SELECT *, rowid AS _id FROM ${tbl} ${where} ${orderBy} LIMIT ${pageSize} OFFSET ${offset}`,
+            pageSize + 1,
+          ),
+          this.cfg.queryTimeoutMs,
+          () => inst.closeSync(),
+        );
+        const columns: FileColumn[] = reader
+          .columnNames()
+          .map((name, i) => ({ name, type: String(reader.columnTypes()[i]) }))
+          .filter((c) => c.name !== "_id");
+        let rows = reader.getRowObjects().map((r) => normalizeRow(r));
+        if (byteLen(rows) > this.cfg.maxResultBytes) {
+          while (rows.length > 0 && byteLen(rows) > this.cfg.maxResultBytes) {
+            rows = rows.slice(0, Math.max(1, Math.floor(rows.length * 0.8)) - 1);
+          }
+        }
+        conn.disconnectSync();
+        return { rows, total, columns };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message.split("\n")[0] : String(err);
+        throw new FileStoreError(400, `Query failed: ${msg}`);
+      } finally {
+        try {
+          conn.disconnectSync();
+        } catch {
+          /* instance may already be closed by the timeout path */
+        }
+      }
+    } finally {
+      try {
+        inst.closeSync();
+      } catch {
+        /* already closed */
+      }
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Lookup / delete
   // -------------------------------------------------------------------------
