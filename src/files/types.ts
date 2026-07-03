@@ -60,6 +60,16 @@ export interface FilesConfig {
    * absurdly large tables reaching the query layer. Default: 2,000,000.
    */
   maxIngestRows?: number;
+  /**
+   * Allowlisted root directories the app-server may read report files from
+   * when resolving a dataset pointer (`POST /datasets/resolve`). A pointer
+   * path is canonicalized (symlinks resolved) and must live under one of
+   * these roots — otherwise resolution is refused. Empty/absent (default)
+   * disables path-based resolution entirely. This is the ONLY place an
+   * external-ish filesystem path enters the un-sandboxed ingest instance, so
+   * the allowlist is mandatory, not advisory.
+   */
+  reportDirs?: string[];
 }
 
 /** Resolved config with defaults applied — what the store actually uses. */
@@ -74,6 +84,7 @@ export interface ResolvedFilesConfig {
   maxConcurrentIngests: number;
   maxTotalBytes: number;
   maxIngestRows: number;
+  reportDirs: string[];
 }
 
 export interface FileColumn {

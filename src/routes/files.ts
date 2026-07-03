@@ -129,6 +129,24 @@ export function registerFileRoutes(
     },
   );
 
+  // POST /datasets/resolve — materialize a PINNED snapshot from a report file
+  // the app-server can read (the report → artifact "pull" path). The pointer
+  // path is allowlisted against config.reportDirs. Returns the same manifest
+  // shape as an upload, so downstream it's queryable exactly like a smart file.
+  fastify.post<{ Body: { pointer?: { source?: string; ref?: string } } }>(
+    "/datasets/resolve",
+    async (request, reply) => {
+      const pointer = request.body?.pointer;
+      if (!pointer || pointer.source !== "path" || typeof pointer.ref !== "string") {
+        return reply
+          .code(400)
+          .send({ error: "Body must include pointer { source: 'path', ref: '<path>' }." });
+      }
+      const manifest = await store.resolveFromPath(pointer.ref, requesterOf(request));
+      return reply.send({ manifest });
+    },
+  );
+
   // Map FileStoreError → its HTTP status. Other errors fall through to the
   // plugin-level handler (500). Scoped to this encapsulated route context.
   fastify.setErrorHandler((error: Error & { statusCode?: number }, _req, reply: FastifyReply) => {
