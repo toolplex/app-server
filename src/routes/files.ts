@@ -66,6 +66,69 @@ export function registerFileRoutes(
     },
   );
 
+  // -------------------------------------------------------------------------
+  // Artifacts — durable, pinned snapshots (never TTL-swept). Same DuckDB store
+  // as files, so an artifact is queryable exactly like a smart file.
+  // -------------------------------------------------------------------------
+
+  // POST /artifacts — materialize JSON rows into a pinned DuckDB snapshot.
+  fastify.post<{ Body: { tableName?: string; rows?: Record<string, unknown>[] } }>(
+    "/artifacts",
+    async (request, reply) => {
+      const rows = request.body?.rows;
+      if (!Array.isArray(rows)) {
+        return reply.code(400).send({ error: "Body must include a 'rows' array." });
+      }
+      const manifest = await store.materialize(
+        request.body?.tableName || "data",
+        rows,
+        requesterOf(request),
+      );
+      return reply.send({ manifest });
+    },
+  );
+
+  // POST /artifacts/:id/query — run one read-only SQL statement (ask follow-ups).
+  fastify.post<{ Params: { id: string }; Body: { sql?: string } }>(
+    "/artifacts/:id/query",
+    async (request, reply) => {
+      const sql = request.body?.sql;
+      if (typeof sql !== "string") {
+        return reply.code(400).send({ error: "Body must include a 'sql' string." });
+      }
+      const result = await store.query(request.params.id, sql, requesterOf(request));
+      return reply.send(result);
+    },
+  );
+
+  // GET /artifacts/:id/data — the artifact's rows for the viewer (SELECT * LIMIT).
+  fastify.get<{ Params: { id: string }; Querystring: { limit?: string } }>(
+    "/artifacts/:id/data",
+    async (request, reply) => {
+      const manifest = await store.getManifest(request.params.id, requesterOf(request));
+      const table = manifest.tables[0];
+      if (!table) {
+        return reply.code(404).send({ error: "Artifact has no data table." });
+      }
+      const limit = Math.min(Math.max(Number(request.query.limit) || 1000, 1), 5000);
+      const result = await store.query(
+        request.params.id,
+        `SELECT * FROM "${table.name}" LIMIT ${limit}`,
+        requesterOf(request),
+      );
+      return reply.send({ manifest, ...result });
+    },
+  );
+
+  // DELETE /artifacts/:id — remove a pinned snapshot. Idempotent.
+  fastify.delete<{ Params: { id: string } }>(
+    "/artifacts/:id",
+    async (request, reply) => {
+      await store.delete(request.params.id, requesterOf(request));
+      return reply.send({ deleted: true });
+    },
+  );
+
   // Map FileStoreError → its HTTP status. Other errors fall through to the
   // plugin-level handler (500). Scoped to this encapsulated route context.
   fastify.setErrorHandler((error: Error & { statusCode?: number }, _req, reply: FastifyReply) => {

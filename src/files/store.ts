@@ -41,6 +41,8 @@ interface FileRecord {
   ownerUserId?: string;
   ownerOrgId?: string;
   createdAtMs: number;
+  // Durable snapshots (artifacts) are pinned — never removed by the TTL sweep.
+  pinned?: boolean;
 }
 
 export interface Requester {
@@ -140,7 +142,8 @@ export class FileStore {
       const fileId = entry.slice(0, -5);
       const record = await this.readRecord(fileId).catch(() => null);
       if (!record) continue;
-      if (record.createdAtMs < cutoff) {
+      // Pinned records (durable artifacts) are never swept.
+      if (!record.pinned && record.createdAtMs < cutoff) {
         await this.removeFiles(fileId, record);
         removed++;
       }
@@ -270,6 +273,85 @@ export class FileStore {
       return manifest;
     } finally {
       this.activeIngests--;
+    }
+  }
+
+  /**
+   * Materialize JSON rows into a fresh, PINNED DuckDB snapshot (an artifact —
+   * durable, never TTL-swept). Reuses the same DuckDB + manifest machinery as
+   * file ingest, so the resulting snapshot is queryable exactly like a smart
+   * file. Rows are written to a temp JSON file and loaded via read_json_auto so
+   * types are preserved.
+   */
+  async materialize(
+    tableName: string,
+    rows: Record<string, unknown>[],
+    requester: Requester,
+  ): Promise<FileManifest> {
+    if (!Array.isArray(rows) || rows.length === 0) {
+      throw new FileStoreError(400, "Artifact has no rows.");
+    }
+    if (rows.length > this.cfg.maxIngestRows) {
+      throw new FileStoreError(
+        413,
+        `Artifact has too many rows (${rows.length.toLocaleString()}). Maximum is ${this.cfg.maxIngestRows.toLocaleString()}.`,
+      );
+    }
+    // SQL-safe table name (identifier) — fall back to "data".
+    const safeTable = /^[a-zA-Z_][a-zA-Z0-9_]{0,62}$/.test(tableName) ? tableName : "data";
+
+    const fileId = randomUUID();
+    const jsonPath = join(this.cfg.dir, `${fileId}.rows.json`);
+    const dbPath = join(this.cfg.dir, `${fileId}.duckdb`);
+
+    await mkdir(this.cfg.dir, { recursive: true });
+    try {
+      await writeFile(jsonPath, JSON.stringify(rows), "utf8");
+
+      let tables: FileTableManifest[];
+      const inst = await DuckDBInstance.create(dbPath);
+      try {
+        const conn = await inst.connect();
+        await conn.run(
+          `CREATE TABLE ${safeTable} AS SELECT * FROM read_json_auto(${sqlString(jsonPath)})`,
+        );
+        const table = await this.describeTable(conn, safeTable);
+        conn.disconnectSync();
+        tables = [table];
+      } finally {
+        inst.closeSync();
+      }
+
+      // Drop the temp source — the DuckDB is the source of truth.
+      await rm(jsonPath, { force: true }).catch(() => {});
+
+      const manifest: FileManifest = {
+        fileId,
+        filename: `${safeTable}.artifact`,
+        kind: "csv",
+        sizeBytes: 0,
+        tables,
+        createdAt: new Date().toISOString(),
+      };
+      const record: FileRecord = {
+        manifest,
+        uploadPath: jsonPath,
+        dbPath,
+        ownerUserId: requester.userId,
+        ownerOrgId: requester.orgId,
+        createdAtMs: Date.now(),
+        pinned: true,
+      };
+      await writeFile(this.recordPath(fileId), JSON.stringify(record), "utf8");
+      return manifest;
+    } catch (err) {
+      await rm(jsonPath, { force: true }).catch(() => {});
+      await this.removeFiles(fileId, { uploadPath: jsonPath, dbPath } as FileRecord).catch(() => {});
+      if (err instanceof FileStoreError) throw err;
+      throw new FileStoreError(
+        422,
+        `Could not create artifact: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
 
