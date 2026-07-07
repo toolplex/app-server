@@ -685,10 +685,10 @@ export class FileStore {
           clauses.push(`lower(CAST(${col} AS VARCHAR)) = lower(${val})`);
           break;
         case "gt":
-          clauses.push(`TRY_CAST(${col} AS DOUBLE) > TRY_CAST(${val} AS DOUBLE)`);
+          clauses.push(`${numericCoerce(col)} > ${numericCoerce(val)}`);
           break;
         case "lt":
-          clauses.push(`TRY_CAST(${col} AS DOUBLE) < TRY_CAST(${val} AS DOUBLE)`);
+          clauses.push(`${numericCoerce(col)} < ${numericCoerce(val)}`);
           break;
         case "empty":
           clauses.push(`(${col} IS NULL OR CAST(${col} AS VARCHAR) = '')`);
@@ -705,7 +705,13 @@ export class FileStore {
     let orderBy = "";
     if (opts.sort && validCols.has(opts.sort.key)) {
       const dir = opts.sort.direction === "desc" ? "DESC" : "ASC";
-      orderBy = `ORDER BY ${quoteIdent(opts.sort.key)} ${dir} NULLS LAST`;
+      const col = quoteIdent(opts.sort.key);
+      // Sort numerically even when the column is stored as text because of
+      // display formatting ("98.20%", "4,600", "₱1,234") — otherwise ORDER BY
+      // collates as strings and "8.71%" lands above "78.16%". Genuine text
+      // (e.g. "May 2026") coerces to NULL, so it falls through to the
+      // lexicographic tie-break; native numeric columns are unaffected.
+      orderBy = `ORDER BY ${numericCoerce(col)} ${dir} NULLS LAST, ${col} ${dir} NULLS LAST`;
     }
 
     const pageSize = Math.min(Math.max(Math.floor(opts.pageSize) || 100, 1), 1000);
@@ -910,6 +916,19 @@ export class FileStore {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * SQL expression that coerces a numeric-looking value to DOUBLE for sorting and
+ * comparison, even when the column is stored as text because of display
+ * formatting — "98.20%", "4,600", "₱1,234". Strips a whitelist of formatting
+ * characters (percent, thousands separators, currency symbols, spaces) then
+ * TRY_CASTs; the minus sign is preserved so negatives still parse. Genuine text
+ * (e.g. "May 2026") doesn't reduce to a number → NULL, so callers fall back to
+ * a text comparison. `expr` must already be a quoted identifier or literal.
+ */
+function numericCoerce(expr: string): string {
+  return `TRY_CAST(regexp_replace(CAST(${expr} AS VARCHAR), '[%,$€£₱ ]', '', 'g') AS DOUBLE)`;
+}
 
 /**
  * True when `dir` resolves at or under the OS temp dir. Checks both the raw
