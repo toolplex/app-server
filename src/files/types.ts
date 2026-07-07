@@ -18,9 +18,17 @@ export interface FilesConfig {
   /** Master switch. When false/absent, no file routes are registered. */
   enabled: boolean;
   /**
-   * Drop-zone directory holding uploaded files, their per-file DuckDB
-   * databases, and sidecar manifests. Created on demand. Default:
-   * `<os.tmpdir>/toolplex-app-files`.
+   * The single persistent store holding uploaded files (smart attachments) AND
+   * durable pinned snapshots (artifacts), their per-file DuckDB databases, and
+   * sidecar manifests. Created on demand. Default:
+   * `<process.cwd()>/.toolplex-app-files`.
+   *
+   * MUST be on durable storage — it is a startup error for this to resolve
+   * under the OS temp dir. Lifecycle is app-controlled only (our TTL sweep of
+   * abandoned attachments + explicit deletes); the OS must never delete our
+   * data. macOS in particular clears `$TMPDIR` on reboot and prunes it after
+   * ~3 days, which would silently destroy saved reports, charts, and in-use
+   * attachments.
    */
   dir?: string;
   /**

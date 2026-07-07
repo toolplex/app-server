@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, extname, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
 
 import { DuckDBInstance } from "@duckdb/node-api";
@@ -83,7 +83,14 @@ export class FileStore {
 
   constructor(config: FilesConfig) {
     this.cfg = {
-      dir: config.dir ?? join(tmpdir(), "toolplex-app-files"),
+      // One persistent, app-controlled store for everything (attachments AND
+      // durable artifacts). Never the OS temp dir — the OS must not delete our
+      // data out from under us (macOS clears $TMPDIR on reboot and prunes it
+      // after ~3 days). Lifecycle is ours alone: the TTL sweep below and
+      // explicit deletes. Default under the home dir (not cwd — cwd sits in the
+      // deploy/repo tree and a clean redeploy could wipe it; home survives both
+      // redeploys and reboots).
+      dir: resolvePath(config.dir ?? join(homedir(), ".toolplex-app-files")),
       ttlMinutes: config.ttlMinutes ?? DEFAULTS.ttlMinutes,
       maxUploadBytes: config.maxUploadBytes ?? DEFAULTS.maxUploadBytes,
       maxQueryRows: config.maxQueryRows ?? DEFAULTS.maxQueryRows,
@@ -104,6 +111,19 @@ export class FileStore {
   }
 
   async init(): Promise<void> {
+    // The store must never live under the OS temp dir: macOS clears $TMPDIR on
+    // reboot and prunes it after ~3 days, which would silently delete our data
+    // (both durable artifacts and in-use attachments) even though the TTL sweep
+    // spares pinned ones. We control lifecycle, not the OS — fail fast at
+    // startup rather than lose data quietly later.
+    if (await isUnderTmp(this.cfg.dir)) {
+      throw new Error(
+        `[app-server] files.dir must be on durable storage, not the OS temp dir ` +
+          `(resolved: ${this.cfg.dir}). Data under the temp dir is wiped on reboot/tmp-clean, ` +
+          `silently losing saved reports, charts, and in-use attachments. Set files.dir to a ` +
+          `persistent path.`,
+      );
+    }
     await mkdir(this.cfg.dir, { recursive: true });
     // Resolve symlinks in the allowlist roots so the containment check below
     // compares realpaths on both sides. Roots that don't exist are dropped —
@@ -890,6 +910,27 @@ export class FileStore {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * True when `dir` resolves at or under the OS temp dir. Checks both the raw
+ * temp path and its realpath (on macOS `/tmp` → `/private/tmp`, and `$TMPDIR`
+ * lives under `/var/folders/...`) so a symlinked or canonical form is caught
+ * either way. Used to reject a store dir that the OS would wipe on reboot.
+ */
+async function isUnderTmp(dir: string): Promise<boolean> {
+  const target = resolvePath(dir);
+  const roots = new Set<string>([resolvePath(tmpdir())]);
+  try {
+    roots.add(await realpath(tmpdir()));
+  } catch {
+    /* tmpdir always exists in practice; ignore */
+  }
+  for (const root of roots) {
+    const rel = relative(root, target);
+    if (rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))) return true;
+  }
+  return false;
+}
 
 /**
  * Decode an uploaded text file (CSV/TSV) to a clean UTF-8 buffer. Excel often
