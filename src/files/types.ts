@@ -120,9 +120,18 @@ export interface FileTableManifest {
 export interface FileManifest {
   fileId: string;
   filename: string;
-  kind: "csv" | "tsv" | "xlsx";
+  /**
+   * Ingest kind. Tabular (csv/tsv/xlsx) files land in an isolated DuckDB db and
+   * are queryable via `POST /files/:id/query`. `raw` files (PDF/image/docx and
+   * anything else non-tabular) skip DuckDB entirely — the bytes are stored
+   * as-is and streamed back via `GET /files/:id/raw`. `raw` entries have an
+   * empty `tables[]` and a populated `mimeType`.
+   */
+  kind: "csv" | "tsv" | "xlsx" | "raw";
   sizeBytes: number;
   tables: FileTableManifest[];
+  /** IANA MIME type. Populated for `kind === "raw"`; absent for tabular kinds. */
+  mimeType?: string;
   /** ISO timestamp of ingestion. */
   createdAt: string;
   /**
