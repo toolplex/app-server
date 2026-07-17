@@ -150,13 +150,12 @@ async function runOcr(inputPath: string, outputPath: string): Promise<Buffer | n
     await execFileAsync(
       "ocrmypdf",
       [
-        // Force OCR even if a text layer already exists — we only reach this
-        // path when Stage 1 failed, so any existing layer is noise.
+        // Force OCR on every page, ignoring any existing text layer — we
+        // only reach this path when Stage 1 already returned empty/garbage,
+        // so we KNOW the PDF is image-based. OCRmyPDF v17 makes
+        // --force-ocr / --skip-text / --redo-ocr mutually exclusive; pick
+        // one, no ambiguity.
         "--force-ocr",
-        // Skip pages that OCRmyPDF's own text detector says already have
-        // text. Defensive against edge cases where --force-ocr conflicts
-        // with mixed-content PDFs.
-        "--skip-text",
         // Deskew crooked scans (phone photos of docs, etc.). Small accuracy
         // win at negligible cost.
         "--deskew",
