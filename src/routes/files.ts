@@ -1,8 +1,11 @@
+import { createReadStream } from "node:fs";
+
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { AppServerConfig, UploadedFile } from "../types.js";
 import { readUserHeaders } from "../user.js";
 import { FileStore, FileStoreError, type Requester } from "../files/store.js";
+import type { XlsxDocSpec } from "../files/documents.js";
 
 // ---------------------------------------------------------------------------
 // File routes — upload, manifest, read-only query, delete.
@@ -25,6 +28,36 @@ export function registerFileRoutes(
       return reply.code(400).send({ error: "No file found in the upload." });
     }
     const manifest = await store.ingest(file.filename, file.buffer, requesterOf(request));
+    return reply.send({ manifest });
+  });
+
+  // POST /files/raw — JSON upload of a non-tabular ("raw") file. Body is
+  // { filename, mimeType, dataBase64 }. Used by the cloud-agent to persist
+  // PDF/image/docx bytes the desktop sent as base64 so the agent can re-read
+  // them across turns via read_attachment. Multipart is not required because
+  // the caller (cloud-agent) already has the bytes in memory as base64.
+  fastify.post<{
+    Body: { filename?: string; mimeType?: string; dataBase64?: string };
+  }>("/files/raw", async (request, reply) => {
+    const body = request.body || {};
+    if (typeof body.filename !== "string" || body.filename.length === 0) {
+      return reply.code(400).send({ error: "Body must include a 'filename' string." });
+    }
+    if (typeof body.mimeType !== "string" || body.mimeType.length === 0) {
+      return reply.code(400).send({ error: "Body must include a 'mimeType' string." });
+    }
+    if (typeof body.dataBase64 !== "string" || body.dataBase64.length === 0) {
+      return reply.code(400).send({ error: "Body must include a 'dataBase64' string." });
+    }
+    let buffer: Buffer;
+    try {
+      buffer = Buffer.from(body.dataBase64, "base64");
+    } catch {
+      return reply.code(400).send({ error: "Invalid base64 payload." });
+    }
+    const manifest = await store.ingest(body.filename, buffer, requesterOf(request), {
+      rawMimeType: body.mimeType,
+    });
     return reply.send({ manifest });
   });
 
@@ -53,6 +86,28 @@ export function registerFileRoutes(
       }
       const result = await store.query(request.params.id, sql, requesterOf(request));
       return reply.send(result);
+    },
+  );
+
+  // GET /files/:id/raw — stream the original bytes of a non-tabular ("raw")
+  // upload. Used by the cloud-agent's read_attachment tool to re-inject a PDF /
+  // image into a later LLM turn without the desktop having to re-attach it.
+  // Rejects with 400 if the fileId points at a tabular DuckDB snapshot — those
+  // must go through /query instead.
+  fastify.get<{ Params: { id: string } }>(
+    "/files/:id/raw",
+    async (request, reply) => {
+      const { manifest, uploadPath } = await store.getRawFile(
+        request.params.id,
+        requesterOf(request),
+      );
+      reply.header("Content-Type", manifest.mimeType || "application/octet-stream");
+      reply.header("Content-Length", String(manifest.sizeBytes));
+      reply.header(
+        "Content-Disposition",
+        `attachment; filename="${manifest.filename.replace(/"/g, "")}"`,
+      );
+      return reply.send(createReadStream(uploadPath));
     },
   );
 
@@ -88,6 +143,22 @@ export function registerFileRoutes(
     },
   );
 
+  // POST /documents — render an xlsx artifact from a spec: a blank build
+  // (sheets from data sources) or a copy-forward (copy a base binary + ops).
+  // Returns the same manifest shape as /artifacts, so it's queryable like any
+  // snapshot. The agent never emits OOXML — see files/documents.ts.
+  fastify.post<{ Body: { spec?: XlsxDocSpec } }>(
+    "/documents",
+    async (request, reply) => {
+      const spec = request.body?.spec;
+      if (!spec || typeof spec !== "object") {
+        return reply.code(400).send({ error: "Body must include a 'spec' object." });
+      }
+      const manifest = await store.renderXlsx(spec, requesterOf(request));
+      return reply.send({ manifest });
+    },
+  );
+
   // POST /artifacts/:id/query — run one read-only SQL statement (ask follow-ups).
   fastify.post<{ Params: { id: string }; Body: { sql?: string } }>(
     "/artifacts/:id/query",
@@ -102,13 +173,17 @@ export function registerFileRoutes(
   );
 
   // GET /artifacts/:id/data — the artifact's rows for the viewer (SELECT * LIMIT).
-  fastify.get<{ Params: { id: string }; Querystring: { limit?: string } }>(
+  // ?table= selects a sheet (name or original sheetName); default = first.
+  fastify.get<{ Params: { id: string }; Querystring: { limit?: string; table?: string } }>(
     "/artifacts/:id/data",
     async (request, reply) => {
       const manifest = await store.getManifest(request.params.id, requesterOf(request));
-      const table = manifest.tables[0];
+      const wanted = request.query.table;
+      const table = wanted
+        ? manifest.tables.find((t) => t.name === wanted || t.sheetName === wanted)
+        : manifest.tables[0];
       if (!table) {
-        return reply.code(404).send({ error: "Artifact has no data table." });
+        return reply.code(404).send({ error: "Artifact has no matching data table." });
       }
       const limit = Math.min(Math.max(Number(request.query.limit) || 1000, 1), 5000);
       const result = await store.query(
@@ -116,7 +191,40 @@ export function registerFileRoutes(
         `SELECT * FROM "${table.name}" LIMIT ${limit}`,
         requesterOf(request),
       );
-      return reply.send({ manifest, ...result });
+      return reply.send({ manifest, table: table.name, ...result });
+    },
+  );
+
+  // GET /artifacts/:id/file — stream the pinned workbook binary (xlsx download).
+  fastify.get<{ Params: { id: string } }>(
+    "/artifacts/:id/file",
+    async (request, reply) => {
+      const info = await store.getBinaryInfo(request.params.id, requesterOf(request));
+      reply.header(
+        "Content-Type",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      );
+      reply.header(
+        "Content-Disposition",
+        `attachment; filename="${sanitizeFilename(info.filename)}"`,
+      );
+      return reply.send(createReadStream(info.path));
+    },
+  );
+
+  // GET /artifacts/:id/export?format=csv|xlsx&table= — on-the-fly rendition of a
+  // report snapshot (NOT persisted). Powers "Download as…" on table artifacts.
+  fastify.get<{ Params: { id: string }; Querystring: { format?: string; table?: string } }>(
+    "/artifacts/:id/export",
+    async (request, reply) => {
+      const format = request.query.format === "xlsx" ? "xlsx" : "csv";
+      const out = await store.exportRows(request.params.id, requesterOf(request), {
+        format,
+        table: request.query.table,
+      });
+      reply.header("Content-Type", out.contentType);
+      reply.header("Content-Disposition", `attachment; filename="${sanitizeFilename(out.filename)}"`);
+      return reply.send(out.buffer);
     },
   );
 
@@ -164,6 +272,7 @@ export function registerFileRoutes(
         pageSize,
         sort,
         filters,
+        table: typeof q.table === "string" ? q.table : undefined,
       });
       const totalPages = Math.max(1, Math.ceil(result.total / pageSize));
       return reply.send({
@@ -214,6 +323,11 @@ export function registerFileRoutes(
 function requesterOf(request: FastifyRequest): Requester {
   const user = readUserHeaders(request);
   return { userId: user?.id, orgId: user?.orgId };
+}
+
+/** Strip CR/LF/quotes so a filename is safe inside a Content-Disposition header. */
+function sanitizeFilename(name: string): string {
+  return name.replace(/[\r\n"]/g, "").slice(0, 200) || "download";
 }
 
 /**

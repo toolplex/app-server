@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, extname, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
 
@@ -15,6 +15,15 @@ import type {
   ResolvedFilesConfig,
 } from "./types.js";
 import { validateReadOnlySql } from "./sqlGuard.js";
+import {
+  applyOps,
+  buildWorkbook,
+  type DocSource,
+  type ResolvedOp,
+  type ResolvedSheet,
+  type XlsxDocSpec,
+  type XlsxOpSpec,
+} from "./documents.js";
 
 // ---------------------------------------------------------------------------
 // Errors — carry an HTTP status so the route can map them directly.
@@ -65,6 +74,10 @@ const DEFAULTS = {
   maxTotalBytes: 2 * 1024 * 1024 * 1024, // 2 GB
   maxIngestRows: 2_000_000,
 };
+
+// Cap for on-the-fly CSV/XLSX exports of a snapshot (held in memory). Larger
+// exports would need a streaming writer — a follow-up (see DOCUMENT_ARTIFACTS_SCOPING.md).
+const EXPORT_MAX_ROWS = 100_000;
 
 // Query-instance sandbox: read-only + no host filesystem access + config
 // locked so the agent's SQL can't re-enable any of it. Verified to block
@@ -196,7 +209,7 @@ export class FileStore {
     filename: string,
     buffer: Buffer,
     requester: Requester,
-    opts: { pinned?: boolean } = {},
+    opts: { pinned?: boolean; rawMimeType?: string } = {},
   ): Promise<FileManifest> {
     if (buffer.length === 0) {
       throw new FileStoreError(400, "Uploaded file is empty.");
@@ -206,6 +219,14 @@ export class FileStore {
         413,
         `File too large (${mb(buffer.length)} MB). Maximum is ${mb(this.cfg.maxUploadBytes)} MB.`,
       );
+    }
+
+    // Non-tabular ("raw") branch — PDF/image/docx/etc. Skip DuckDB, just
+    // persist the bytes as-is with a `raw` manifest. Callers opt in explicitly
+    // by passing `rawMimeType`; auto-detecting from the filename would silently
+    // absorb tabular typos (e.g. a mis-extensioned CSV) into the raw bucket.
+    if (opts.rawMimeType) {
+      return this.ingestRaw(filename, buffer, requester, opts.rawMimeType, opts.pinned);
     }
 
     const kind = detectKind(filename);
@@ -314,6 +335,95 @@ export class FileStore {
     } finally {
       this.activeIngests--;
     }
+  }
+
+  /**
+   * Ingest a non-tabular ("raw") upload — PDF, image, docx, etc. Same disk-cap
+   * and concurrency guardrails as the tabular path, but no DuckDB parse: the
+   * bytes are written verbatim and the manifest carries `kind: "raw"` +
+   * `mimeType`. Retrieved via `getRawFile()` / `GET /files/:id/raw`.
+   */
+  private async ingestRaw(
+    filename: string,
+    buffer: Buffer,
+    requester: Requester,
+    mimeType: string,
+    pinned?: boolean,
+  ): Promise<FileManifest> {
+    if (this.activeIngests >= this.cfg.maxConcurrentIngests) {
+      throw new FileStoreError(
+        503,
+        "Server is busy processing other uploads. Please retry in a moment.",
+      );
+    }
+    this.activeIngests++;
+    try {
+      if ((await this.dirSizeBytes()) + buffer.length > this.cfg.maxTotalBytes) {
+        await this.sweepExpired(() => {});
+        if ((await this.dirSizeBytes()) + buffer.length > this.cfg.maxTotalBytes) {
+          throw new FileStoreError(
+            507,
+            "File storage is temporarily full. Please try again shortly.",
+          );
+        }
+      }
+
+      const fileId = randomUUID();
+      // Preserve the original extension so the on-disk file is directly
+      // openable if an operator inspects the drop dir. Fall back to `.bin`
+      // when the filename has no extension.
+      const uploadPath = join(this.cfg.dir, `${fileId}${extname(filename) || ".bin"}`);
+      await mkdir(this.cfg.dir, { recursive: true });
+      await writeFile(uploadPath, buffer);
+
+      const manifest: FileManifest = {
+        fileId,
+        filename,
+        kind: "raw",
+        mimeType,
+        sizeBytes: buffer.length,
+        tables: [],
+        createdAt: new Date().toISOString(),
+      };
+
+      const record: FileRecord = {
+        manifest,
+        uploadPath,
+        // dbPath is unused for raw entries but the type requires it; empty
+        // string is safe because removeFiles filters falsy entries.
+        dbPath: "",
+        ownerUserId: requester.userId,
+        ownerOrgId: requester.orgId,
+        createdAtMs: Date.now(),
+        ...(pinned ? { pinned: true } : {}),
+      };
+      await writeFile(this.recordPath(fileId), JSON.stringify(record), "utf8");
+
+      return manifest;
+    } finally {
+      this.activeIngests--;
+    }
+  }
+
+  /**
+   * Fetch a raw (non-tabular) file's bytes. Enforces ownership; bumps the TTL
+   * clock so an in-use file doesn't get swept. Callers stream `uploadPath`
+   * with the manifest's `mimeType` as Content-Type. Throws 400 for tabular
+   * fileIds so a mis-routed `/raw` call fails loudly instead of returning a
+   * DuckDB binary.
+   */
+  async getRawFile(
+    fileId: string,
+    requester: Requester,
+  ): Promise<{ manifest: FileManifest; uploadPath: string }> {
+    const record = await this.getOwnedRecord(fileId, requester);
+    if (record.manifest.kind !== "raw") {
+      throw new FileStoreError(
+        400,
+        `File "${fileId}" is a tabular file — use /query, not /raw.`,
+      );
+    }
+    return { manifest: record.manifest, uploadPath: record.uploadPath };
   }
 
   /**
@@ -465,6 +575,170 @@ export class FileStore {
         `Could not create artifact: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
+  }
+
+  /**
+   * Render an xlsx artifact from a spec — either a BLANK BUILD (sheets from
+   * resolved data sources) or a COPY-FORWARD (copy a base xlsx binary, then
+   * apply data-focused ops to the copy). Writes a PINNED binary + a DuckDB
+   * projection, so the result is both downloadable and queryable exactly like
+   * any snapshot. The agent never emits OOXML — see files/documents.ts. The
+   * base binary on disk is never mutated.
+   */
+  async renderXlsx(spec: XlsxDocSpec, requester: Requester): Promise<FileManifest> {
+    const hasBase = !!spec.base?.fileId;
+    if (hasBase) {
+      if (!spec.ops || spec.ops.length === 0) {
+        throw new FileStoreError(400, "Copy-forward from a base requires at least one op.");
+      }
+    } else if (!spec.sheets || spec.sheets.length === 0) {
+      throw new FileStoreError(
+        400,
+        "A document needs either sheets (blank build) or base + ops (copy-forward).",
+      );
+    }
+
+    // Same concurrency guard as ingest — rendering + projection hold memory.
+    if (this.activeIngests >= this.cfg.maxConcurrentIngests) {
+      throw new FileStoreError(503, "Server is busy processing other work. Please retry in a moment.");
+    }
+    this.activeIngests++;
+
+    const fileId = randomUUID();
+    const xlsxPath = join(this.cfg.dir, `${fileId}.xlsx`);
+    const dbPath = join(this.cfg.dir, `${fileId}.duckdb`);
+    const notes: string[] = [];
+
+    try {
+      await mkdir(this.cfg.dir, { recursive: true });
+
+      if (hasBase) {
+        // Copy the base binary, then mutate the COPY — the base is never touched.
+        const baseRec = await this.getOwnedRecord(spec.base!.fileId, requester);
+        if (baseRec.manifest.kind !== "xlsx") {
+          throw new FileStoreError(
+            400,
+            "The copy-forward base must be an xlsx workbook (this file has no workbook to copy).",
+          );
+        }
+        await copyFile(baseRec.uploadPath, xlsxPath);
+        const wb = new ExcelJS.Workbook();
+        await wb.xlsx.readFile(xlsxPath);
+        applyOps(wb, await this.resolveOps(spec.ops!, requester));
+        await wb.xlsx.writeFile(xlsxPath);
+      } else {
+        const sheets: ResolvedSheet[] = [];
+        for (const s of spec.sheets!) {
+          sheets.push({
+            name: s.name,
+            rows: await this.resolveSource(s.source, requester),
+            columns: s.columns,
+            style: s.style,
+          });
+        }
+        const wb = buildWorkbook(sheets, { theme: spec.theme });
+        await wb.xlsx.writeFile(xlsxPath);
+      }
+
+      // Build the queryable projection (one DuckDB table per sheet), exactly
+      // like an ingested xlsx smart file — this is what makes the artifact
+      // viewable + queryable in-app.
+      const tables = await this.ingestXlsx(xlsxPath, dbPath, fileId, notes);
+      if (tables.length === 0) {
+        throw new FileStoreError(422, "The rendered workbook contained no readable data.");
+      }
+
+      const baseName = (spec.downloadName || spec.title || "workbook").replace(/\.xlsx$/i, "");
+      const manifest: FileManifest = {
+        fileId,
+        filename: `${baseName || "workbook"}.xlsx`,
+        kind: "xlsx",
+        sizeBytes: (await stat(xlsxPath)).size,
+        tables,
+        createdAt: new Date().toISOString(),
+        notes: notes.length > 0 ? notes : undefined,
+      };
+      const record: FileRecord = {
+        manifest,
+        uploadPath: xlsxPath,
+        dbPath,
+        ownerUserId: requester.userId,
+        ownerOrgId: requester.orgId,
+        createdAtMs: Date.now(),
+        pinned: true,
+      };
+      await writeFile(this.recordPath(fileId), JSON.stringify(record), "utf8");
+      return manifest;
+    } catch (err) {
+      await this.removeFiles(fileId, { uploadPath: xlsxPath, dbPath } as FileRecord).catch(() => {});
+      if (err instanceof FileStoreError) throw err;
+      throw new FileStoreError(
+        422,
+        `Could not render document: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      this.activeIngests--;
+    }
+  }
+
+  /** Resolve a document source (inline rows, or a SQL read of a local snapshot) to rows. */
+  private async resolveSource(
+    source: DocSource,
+    requester: Requester,
+  ): Promise<Record<string, unknown>[]> {
+    if (Array.isArray(source.rows)) return source.rows;
+    if (!source.fileId) {
+      throw new FileStoreError(400, "Each document source needs a fileId or inline rows.");
+    }
+    let sql = source.sql;
+    if (!sql || !sql.trim()) {
+      const rec = await this.getOwnedRecord(source.fileId, requester);
+      const t = rec.manifest.tables[0];
+      if (!t) throw new FileStoreError(422, "Source snapshot has no table to read.");
+      sql = `SELECT * FROM ${quoteIdent(t.name)}`;
+    }
+    // NOTE: query() caps at maxQueryRows / maxResultBytes, so a document source
+    // currently reads up to ~1000 rows. A streaming reader for large exports is
+    // a follow-up (see DOCUMENT_ARTIFACTS_SCOPING.md §8).
+    const res = await this.query(source.fileId, sql, requester);
+    return res.rows;
+  }
+
+  /** Resolve each op's data source to rows for the pure applyOps builder. */
+  private async resolveOps(ops: XlsxOpSpec[], requester: Requester): Promise<ResolvedOp[]> {
+    const out: ResolvedOp[] = [];
+    for (const op of ops) {
+      switch (op.op) {
+        case "set_cell":
+          out.push({ op: "set_cell", sheet: op.sheet, cell: op.cell, value: op.value });
+          break;
+        case "populate_sheet":
+          out.push({
+            op: "populate_sheet",
+            sheet: op.sheet,
+            startCell: op.startCell,
+            rows: await this.resolveSource(op.source, requester),
+          });
+          break;
+        case "append_rows":
+          out.push({
+            op: "append_rows",
+            sheet: op.sheet,
+            rows: await this.resolveSource(op.source, requester),
+          });
+          break;
+        case "add_sheet":
+          out.push({
+            op: "add_sheet",
+            name: op.name,
+            rows: await this.resolveSource(op.source, requester),
+            columns: op.columns,
+            style: op.style,
+          });
+          break;
+      }
+    }
+    return out;
   }
 
   /** Total bytes currently held in the drop dir (best-effort). */
@@ -661,11 +935,12 @@ export class FileStore {
       pageSize: number;
       sort?: { key: string; direction: "asc" | "desc" };
       filters?: { column: string; operator: string; value: string }[];
+      /** Which sheet/table to page (name or original sheetName); default = first. */
+      table?: string;
     },
   ): Promise<{ rows: Record<string, unknown>[]; total: number; columns: FileColumn[] }> {
     const record = await this.getOwnedRecord(fileId, requester);
-    const table = record.manifest.tables[0];
-    if (!table) throw new FileStoreError(404, "Artifact has no data table.");
+    const table = selectTable(record.manifest, opts.table);
     const validCols = new Set(table.columns.map((c) => c.name));
     const tbl = quoteIdent(table.name);
 
@@ -755,6 +1030,90 @@ export class FileStore {
       } catch (err) {
         const msg = err instanceof Error ? err.message.split("\n")[0] : String(err);
         throw new FileStoreError(400, `Query failed: ${msg}`);
+      } finally {
+        try {
+          conn.disconnectSync();
+        } catch {
+          /* instance may already be closed by the timeout path */
+        }
+      }
+    } finally {
+      try {
+        inst.closeSync();
+      } catch {
+        /* already closed */
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Binary download / export
+  // -------------------------------------------------------------------------
+
+  /**
+   * Path + name of a snapshot's pinned binary, for streaming a native download.
+   * Only xlsx artifacts carry a workbook binary; rows-only snapshots don't.
+   */
+  async getBinaryInfo(
+    fileId: string,
+    requester: Requester,
+  ): Promise<{ path: string; filename: string }> {
+    const record = await this.getOwnedRecord(fileId, requester);
+    if (record.manifest.kind !== "xlsx") {
+      throw new FileStoreError(400, "This artifact has no downloadable workbook file.");
+    }
+    return { path: record.uploadPath, filename: record.manifest.filename };
+  }
+
+  /**
+   * On-the-fly CSV / XLSX rendition of a snapshot table — the "Download as…"
+   * path for report artifacts. NOT persisted; rendered in memory (capped at
+   * EXPORT_MAX_ROWS). For xlsx it's a single, default-styled sheet.
+   */
+  async exportRows(
+    fileId: string,
+    requester: Requester,
+    opts: { format: "csv" | "xlsx"; table?: string },
+  ): Promise<{ buffer: Buffer; filename: string; contentType: string }> {
+    const record = await this.getOwnedRecord(fileId, requester);
+    const table = selectTable(record.manifest, opts.table);
+    const rows = await this.readTableRows(record.dbPath, table.name, EXPORT_MAX_ROWS);
+    const base = (record.manifest.filename || "export").replace(/\.[^.]+$/, "") || "export";
+
+    if (opts.format === "xlsx") {
+      const wb = buildWorkbook([{ name: table.sheetName || table.name, rows }]);
+      const buffer = Buffer.from(await wb.xlsx.writeBuffer());
+      return {
+        buffer,
+        filename: `${base}.xlsx`,
+        contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      };
+    }
+    // CSV — prepend a UTF-8 BOM so Excel detects the encoding.
+    const csv = rowsToCsv(rows, table.columns.map((c) => c.name));
+    return {
+      buffer: Buffer.from(`﻿${csv}`, "utf8"),
+      filename: `${base}.csv`,
+      contentType: "text/csv; charset=utf-8",
+    };
+  }
+
+  /** Read up to `limit` rows of a table from a snapshot's DuckDB (read-only sandbox). */
+  private async readTableRows(
+    dbPath: string,
+    tableName: string,
+    limit: number,
+  ): Promise<Record<string, unknown>[]> {
+    const inst = await DuckDBInstance.create(dbPath, QUERY_INSTANCE_CONFIG);
+    try {
+      const conn = await inst.connect();
+      try {
+        const reader = await withTimeout(
+          conn.runAndReadUntil(`SELECT * FROM ${quoteIdent(tableName)} LIMIT ${limit}`, limit + 1),
+          this.cfg.queryTimeoutMs,
+          () => inst.closeSync(),
+        );
+        return reader.getRowObjects().slice(0, limit).map((r) => normalizeRow(r));
       } finally {
         try {
           conn.disconnectSync();
@@ -916,6 +1275,33 @@ export class FileStore {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/** Pick a snapshot table by name/sheetName, defaulting to the first. */
+function selectTable(manifest: FileManifest, name?: string): FileTableManifest {
+  if (!name) {
+    const t = manifest.tables[0];
+    if (!t) throw new FileStoreError(404, "Artifact has no data table.");
+    return t;
+  }
+  const t = manifest.tables.find((x) => x.name === name || x.sheetName === name);
+  if (!t) {
+    const have = manifest.tables.map((x) => x.sheetName || x.name).join(", ");
+    throw new FileStoreError(404, `Sheet "${name}" not found. Available: ${have || "(none)"}.`);
+  }
+  return t;
+}
+
+/** Serialize rows to RFC-4180 CSV in the given column order. */
+function rowsToCsv(rows: Record<string, unknown>[], columns: string[]): string {
+  const esc = (v: unknown): string => {
+    if (v === null || v === undefined) return "";
+    const s = String(v);
+    return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const lines = [columns.map(esc).join(",")];
+  for (const r of rows) lines.push(columns.map((c) => esc(r[c])).join(","));
+  return lines.join("\r\n");
+}
 
 /**
  * SQL expression that coerces a numeric-looking value to DOUBLE for sorting and
