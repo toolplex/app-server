@@ -36,9 +36,15 @@ export function registerFileRoutes(
   // PDF/image/docx bytes the desktop sent as base64 so the agent can re-read
   // them across turns via read_attachment. Multipart is not required because
   // the caller (cloud-agent) already has the bytes in memory as base64.
+  //
+  // bodyLimit is 150MB: FileStore.maxUploadBytes caps at 100MB per file, and
+  // base64 expands the payload by 4/3 (plus JSON envelope). The host Fastify
+  // instance's default bodyLimit is 1MB — without this per-route override,
+  // real-world PDFs (5MB+) would be rejected before reaching the handler
+  // with an unhelpful "Request body is too large".
   fastify.post<{
     Body: { filename?: string; mimeType?: string; dataBase64?: string };
-  }>("/files/raw", async (request, reply) => {
+  }>("/files/raw", { bodyLimit: 150 * 1024 * 1024 }, async (request, reply) => {
     const body = request.body || {};
     if (typeof body.filename !== "string" || body.filename.length === 0) {
       return reply.code(400).send({ error: "Body must include a 'filename' string." });
