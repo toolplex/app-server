@@ -89,15 +89,20 @@ export function registerFileRoutes(
     },
   );
 
-  // GET /files/:id/raw — stream the original bytes of a non-tabular ("raw")
-  // upload. Used by the cloud-agent's read_attachment tool to re-inject a PDF /
-  // image into a later LLM turn without the desktop having to re-attach it.
-  // Rejects with 400 if the fileId points at a tabular DuckDB snapshot — those
-  // must go through /query instead.
+  // GET /files/:id/raw — stream the original bytes of a non-tabular file
+  // (kind: "raw" OR "text" — text-kind files also keep their original bytes
+  // for callers that need the image, e.g. layout questions on a PDF that was
+  // also text-extracted). Used by the cloud-agent's read_attachment tool to
+  // re-inject bytes into a later LLM turn as multimodal content.
+  //
+  // Rejects with 400 if the fileId points at a tabular DuckDB snapshot —
+  // those must go through /query instead. `.replace(/[\r\n"]/g, "")` on the
+  // Content-Disposition filename guards against header injection via crafted
+  // uploaded filenames (defense-in-depth; the call chain is auth-gated).
   fastify.get<{ Params: { id: string } }>(
     "/files/:id/raw",
     async (request, reply) => {
-      const { manifest, uploadPath } = await store.getRawFile(
+      const { manifest, uploadPath } = await store.getRawOrTextBytes(
         request.params.id,
         requesterOf(request),
       );
@@ -105,9 +110,30 @@ export function registerFileRoutes(
       reply.header("Content-Length", String(manifest.sizeBytes));
       reply.header(
         "Content-Disposition",
-        `attachment; filename="${manifest.filename.replace(/"/g, "")}"`,
+        `attachment; filename="${manifest.filename.replace(/[\r\n"]/g, "")}"`,
       );
       return reply.send(createReadStream(uploadPath));
+    },
+  );
+
+  // GET /files/:id/text — return the extracted text of a text-kind file
+  // (PDF that succeeded pdfjs or ocrmypdf extraction). Optional `?page=N`
+  // (1-indexed) returns a single page; omitted or out-of-range returns all
+  // pages joined by blank lines. Rejects non-text-kind fileIds with 400 so
+  // callers routing /raw fileIds to /text fail loudly.
+  //
+  // Response shape: { manifest, text, page?, pageCount }.
+  fastify.get<{ Params: { id: string }; Querystring: { page?: string } }>(
+    "/files/:id/text",
+    async (request, reply) => {
+      const pageNum = request.query.page ? Number(request.query.page) : undefined;
+      const page = pageNum !== undefined && Number.isFinite(pageNum) ? pageNum : undefined;
+      const result = await store.getFileText(
+        request.params.id,
+        requesterOf(request),
+        page,
+      );
+      return reply.send(result);
     },
   );
 

@@ -24,6 +24,7 @@ import {
   type XlsxDocSpec,
   type XlsxOpSpec,
 } from "./documents.js";
+import { extractPdfText } from "./textExtract.js";
 
 // ---------------------------------------------------------------------------
 // Errors — carry an HTTP status so the route can map them directly.
@@ -338,10 +339,16 @@ export class FileStore {
   }
 
   /**
-   * Ingest a non-tabular ("raw") upload — PDF, image, docx, etc. Same disk-cap
-   * and concurrency guardrails as the tabular path, but no DuckDB parse: the
-   * bytes are written verbatim and the manifest carries `kind: "raw"` +
-   * `mimeType`. Retrieved via `getRawFile()` / `GET /files/:id/raw`.
+   * Ingest a non-tabular upload — PDF, image, docx, etc. Same disk-cap and
+   * concurrency guardrails as the tabular path, but no DuckDB parse.
+   *
+   * For PDFs we try a two-stage text extraction (embedded text stream, then
+   * OCR fallback via ocrmypdf if available). Success upgrades the manifest to
+   * `kind: "text"` with a text sidecar served by `/files/:id/text`, so the
+   * agent can read cheap text instead of expensive base64 image tokens. If
+   * both stages fail (image-only PDF with no OCR, unreadable input) we keep
+   * `kind: "raw"` and serve the bytes via `/files/:id/raw`. Non-PDFs skip
+   * extraction entirely and land as `raw`.
    */
   private async ingestRaw(
     filename: string,
@@ -373,31 +380,75 @@ export class FileStore {
       // openable if an operator inspects the drop dir. Fall back to `.bin`
       // when the filename has no extension.
       const uploadPath = join(this.cfg.dir, `${fileId}${extname(filename) || ".bin"}`);
+      const textPath = this.textPath(fileId);
       await mkdir(this.cfg.dir, { recursive: true });
       await writeFile(uploadPath, buffer);
+
+      // Try text extraction for PDFs. Non-PDFs and extraction failures land
+      // as `raw`; success upgrades the manifest to `kind: "text"` and writes
+      // a text sidecar for `/files/:id/text`. Extraction never throws (the
+      // helper catches and returns null), so no cleanup path needed here.
+      let kind: "raw" | "text" = "raw";
+      let textStats: FileManifest["textStats"];
+      if (mimeType === "application/pdf") {
+        const extracted = await extractPdfText(buffer, this.cfg.dir, fileId);
+        if (extracted) {
+          kind = "text";
+          textStats = {
+            pageCount: extracted.pages.length,
+            wordCount: extracted.wordCount,
+            charCount: extracted.charCount,
+            firstPagePreview: extracted.firstPagePreview,
+            ocrApplied: extracted.ocrApplied,
+          };
+          try {
+            await writeFile(
+              textPath,
+              JSON.stringify({ pages: extracted.pages }),
+              "utf8",
+            );
+          } catch {
+            // Sidecar write failed — downgrade to raw. Better to lose the
+            // text-cheap path for this file than to record kind:"text" with
+            // no readable text file to serve.
+            kind = "raw";
+            textStats = undefined;
+          }
+        }
+      }
 
       const manifest: FileManifest = {
         fileId,
         filename,
-        kind: "raw",
+        kind,
         mimeType,
         sizeBytes: buffer.length,
         tables: [],
+        ...(textStats ? { textStats } : {}),
         createdAt: new Date().toISOString(),
       };
 
       const record: FileRecord = {
         manifest,
         uploadPath,
-        // dbPath is unused for raw entries but the type requires it; empty
-        // string is safe because removeFiles filters falsy entries.
+        // dbPath is unused for raw/text entries but the type requires it;
+        // empty string is safe because removeFiles filters falsy entries.
         dbPath: "",
         ownerUserId: requester.userId,
         ownerOrgId: requester.orgId,
         createdAtMs: Date.now(),
         ...(pinned ? { pinned: true } : {}),
       };
-      await writeFile(this.recordPath(fileId), JSON.stringify(record), "utf8");
+      try {
+        await writeFile(this.recordPath(fileId), JSON.stringify(record), "utf8");
+      } catch (err) {
+        // Sidecar (JSON record) write failed AFTER the upload file already
+        // landed on disk. Without the sidecar the TTL sweep can't find these
+        // files (it iterates .json entries only), so clean up manually.
+        await this.removeFiles(fileId, { uploadPath, dbPath: "" } as FileRecord);
+        await rm(textPath, { force: true }).catch(() => {});
+        throw err;
+      }
 
       return manifest;
     } finally {
@@ -406,18 +457,74 @@ export class FileStore {
   }
 
   /**
-   * Fetch a raw (non-tabular) file's bytes. Enforces ownership; bumps the TTL
-   * clock so an in-use file doesn't get swept. Callers stream `uploadPath`
-   * with the manifest's `mimeType` as Content-Type. Throws 400 for tabular
-   * fileIds so a mis-routed `/raw` call fails loudly instead of returning a
-   * DuckDB binary.
+   * Path to the per-file text sidecar (JSON with per-page text array).
+   * Present only for `kind === "text"` entries.
    */
-  async getRawFile(
+  private textPath(fileId: string): string {
+    return join(this.cfg.dir, `${fileId}.text.json`);
+  }
+
+  /**
+   * Fetch a text-kind file's extracted text. Ownership-checked; bumps the TTL
+   * clock so an in-use file doesn't get swept mid-conversation. Optional
+   * `page` argument (1-indexed) returns just that page's text; omitted or
+   * out-of-range returns all pages joined.
+   *
+   * Throws 400 for non-text-kind fileIds so a mis-routed `/text` call fails
+   * loudly instead of silently returning empty content.
+   */
+  async getFileText(
+    fileId: string,
+    requester: Requester,
+    page?: number,
+  ): Promise<{ manifest: FileManifest; text: string; page?: number; pageCount: number }> {
+    const record = await this.getOwnedRecord(fileId, requester);
+    if (record.manifest.kind !== "text") {
+      throw new FileStoreError(
+        400,
+        `File "${fileId}" has no extracted text (kind: ${record.manifest.kind}). ` +
+          `Use /raw for byte content or /query for tabular data.`,
+      );
+    }
+    let sidecar: { pages: string[] };
+    try {
+      const raw = await readFile(this.textPath(fileId), "utf8");
+      sidecar = JSON.parse(raw) as { pages: string[] };
+    } catch {
+      throw new FileStoreError(
+        404,
+        `Extracted text for "${fileId}" is missing on disk. The file may have partially expired.`,
+      );
+    }
+    const pageCount = sidecar.pages.length;
+    if (typeof page === "number" && page >= 1 && page <= pageCount) {
+      return { manifest: record.manifest, text: sidecar.pages[page - 1], page, pageCount };
+    }
+    return {
+      manifest: record.manifest,
+      text: sidecar.pages.join("\n\n"),
+      pageCount,
+    };
+  }
+
+  /**
+   * Fetch the original bytes of a non-tabular file. Both `raw` and `text`
+   * kinds keep their original bytes on disk — `text` also has an extracted-
+   * text sidecar for the cheap-tokens path, but the raw bytes remain
+   * available when a caller needs the actual image (e.g. layout questions on
+   * a text-extracted PDF). Rejects tabular kinds so a mis-routed `/raw` call
+   * fails loudly instead of returning a DuckDB binary.
+   *
+   * Enforces ownership; bumps the TTL clock so an in-use file doesn't get
+   * swept mid-conversation. Callers stream `uploadPath` with the manifest's
+   * `mimeType` as Content-Type.
+   */
+  async getRawOrTextBytes(
     fileId: string,
     requester: Requester,
   ): Promise<{ manifest: FileManifest; uploadPath: string }> {
     const record = await this.getOwnedRecord(fileId, requester);
-    if (record.manifest.kind !== "raw") {
+    if (record.manifest.kind !== "raw" && record.manifest.kind !== "text") {
       throw new FileStoreError(
         400,
         `File "${fileId}" is a tabular file — use /query, not /raw.`,
