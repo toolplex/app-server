@@ -121,17 +121,40 @@ export interface FileManifest {
   fileId: string;
   filename: string;
   /**
-   * Ingest kind. Tabular (csv/tsv/xlsx) files land in an isolated DuckDB db and
-   * are queryable via `POST /files/:id/query`. `raw` files (PDF/image/docx and
-   * anything else non-tabular) skip DuckDB entirely — the bytes are stored
-   * as-is and streamed back via `GET /files/:id/raw`. `raw` entries have an
-   * empty `tables[]` and a populated `mimeType`.
+   * Ingest kind. Tabular (csv/tsv/xlsx) files land in an isolated DuckDB db
+   * and are queryable via `POST /files/:id/query`. `text` files (PDF/docx
+   * with a successful text extraction — either from an embedded text stream
+   * or from an OCR pass) skip DuckDB but keep an extracted-text sidecar,
+   * served by `GET /files/:id/text`; the raw bytes are still available on
+   * `/raw` for callers that need the image. `raw` files (images, scanned
+   * PDFs where extraction failed, anything else non-tabular) skip DuckDB
+   * entirely — the bytes are stored as-is and streamed back via
+   * `GET /files/:id/raw`. Both `text` and `raw` carry `mimeType`; `text`
+   * additionally carries `textStats` with overview counts + a first-page
+   * preview so the agent can decide what to fetch. Both `text` and `raw`
+   * have an empty `tables[]`.
    */
-  kind: "csv" | "tsv" | "xlsx" | "raw";
+  kind: "csv" | "tsv" | "xlsx" | "raw" | "text";
   sizeBytes: number;
   tables: FileTableManifest[];
-  /** IANA MIME type. Populated for `kind === "raw"`; absent for tabular kinds. */
+  /** IANA MIME type. Populated for `kind === "raw" | "text"`; absent for tabular kinds. */
   mimeType?: string;
+  /**
+   * Overview of the extracted text — populated only for `kind === "text"`.
+   * Lets the agent see totals + a snippet without fetching the whole text
+   * blob. `firstPagePreview` is the first ~500 chars of page 1.
+   * `ocrApplied` is true iff Stage 2 (OCRmyPDF) ran during ingest, meaning
+   * the source was image-based and the text came from OCR rather than an
+   * embedded text stream — useful for the agent to know when accuracy is
+   * lower than usual.
+   */
+  textStats?: {
+    pageCount: number;
+    wordCount: number;
+    charCount: number;
+    firstPagePreview: string;
+    ocrApplied: boolean;
+  };
   /** ISO timestamp of ingestion. */
   createdAt: string;
   /**
