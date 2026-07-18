@@ -55,12 +55,17 @@ export function registerFileRoutes(
     if (typeof body.dataBase64 !== "string" || body.dataBase64.length === 0) {
       return reply.code(400).send({ error: "Body must include a 'dataBase64' string." });
     }
-    let buffer: Buffer;
-    try {
-      buffer = Buffer.from(body.dataBase64, "base64");
-    } catch {
+    // `Buffer.from(str, "base64")` silently decodes garbage — never throws. So
+    // the try/catch that was here before was dead code, and malformed input
+    // would become a partial-junk buffer that later failed PDF extraction with
+    // an inscrutable error. Validate the shape up front: base64 alphabet only,
+    // length %4 with at most two `=` pad chars. Whitespace is tolerated (some
+    // clients wrap long payloads) but explicit control chars are rejected.
+    const compact = body.dataBase64.replace(/\s+/g, "");
+    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(compact) || compact.length % 4 !== 0) {
       return reply.code(400).send({ error: "Invalid base64 payload." });
     }
+    const buffer = Buffer.from(compact, "base64");
     const manifest = await store.ingest(body.filename, buffer, requesterOf(request), {
       rawMimeType: body.mimeType,
     });

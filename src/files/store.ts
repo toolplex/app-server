@@ -153,6 +153,22 @@ export class FileStore {
       }
       this.cfg.reportDirs = resolved;
     }
+    // Sweep any lingering OCR staging files. extractPdfText writes
+    // `${fileId}.ocr-in.pdf` / `${fileId}.ocr-out.pdf` next to the record and
+    // cleans them in a finally block, but SIGKILL / OOM / hard restart mid-OCR
+    // leaks them. The TTL sweep doesn't handle these (only `.json` records);
+    // catching them here on boot keeps the drop dir tidy across restarts.
+    try {
+      const entries = await readdir(this.cfg.dir);
+      const orphans = entries.filter(
+        (e) => e.endsWith(".ocr-in.pdf") || e.endsWith(".ocr-out.pdf"),
+      );
+      await Promise.all(
+        orphans.map((e) => rm(join(this.cfg.dir, e), { force: true }).catch(() => {})),
+      );
+    } catch {
+      /* dir empty / gone */
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -357,6 +373,19 @@ export class FileStore {
     mimeType: string,
     pinned?: boolean,
   ): Promise<FileManifest> {
+    // Validate the client-declared mimeType — RFC 6838 shape
+    // (`type/subtype[+suffix][; params]`). Untrusted input flows straight into
+    // the `Content-Type` header when the file is later read via `/files/:id/raw`;
+    // a `\r\n` or other control char would make Node reject the header and 500
+    // the response. Reject bad mimeTypes here so the failure is loud and
+    // scoped to ingest, not a delayed 500 on a later read.
+    if (!isSafeMimeType(mimeType)) {
+      throw new FileStoreError(
+        400,
+        `Invalid mimeType "${mimeType.slice(0, 60)}". Expected a standard `
+          + `"type/subtype" media type without control characters.`,
+      );
+    }
     if (this.activeIngests >= this.cfg.maxConcurrentIngests) {
       throw new FileStoreError(
         503,
@@ -386,12 +415,25 @@ export class FileStore {
 
       // Try text extraction for PDFs. Non-PDFs and extraction failures land
       // as `raw`; success upgrades the manifest to `kind: "text"` and writes
-      // a text sidecar for `/files/:id/text`. Extraction never throws (the
-      // helper catches and returns null), so no cleanup path needed here.
+      // a text sidecar for `/files/:id/text`.
+      //
+      // extractPdfText is DOCUMENTED as never throwing, but its Stage 2 OCR
+      // path does `writeFile(inputPath, buffer)` outside a try/catch — a
+      // disk-full or EPERM there would throw. Without our own wrapper, the
+      // exception would propagate up while `uploadPath` was already on disk
+      // and BEFORE `writeFile(recordPath)` runs; sweep can't see the orphan
+      // (no `.json` record) and it leaks forever. Wrapping degrades the file
+      // to `raw` (no text) rather than aborting the whole ingest, so at
+      // worst the user loses cheap text mode for that file.
       let kind: "raw" | "text" = "raw";
       let textStats: FileManifest["textStats"];
       if (mimeType === "application/pdf") {
-        const extracted = await extractPdfText(buffer, this.cfg.dir, fileId);
+        let extracted: Awaited<ReturnType<typeof extractPdfText>> = null;
+        try {
+          extracted = await extractPdfText(buffer, this.cfg.dir, fileId);
+        } catch {
+          extracted = null;
+        }
         if (extracted) {
           kind = "text";
           textStats = {
@@ -1360,7 +1402,14 @@ export class FileStore {
     const targets = [
       record.uploadPath,
       record.dbPath,
-      isSafeId(fileId) ? this.recordPath(fileId) : undefined,
+      isSafeId(fileId)
+        ? this.recordPath(fileId)
+        : undefined,
+      // Text-kind PDFs write a `${fileId}.text.json` sidecar next to the record.
+      // The TTL sweep never sees it (isSafeId rejects the `${uuid}.text` slug
+      // it would derive), so if we don't remove it here it leaks forever on
+      // both explicit DELETE and TTL expiry.
+      isSafeId(fileId) ? this.textPath(fileId) : undefined,
     ].filter(Boolean) as string[];
     await Promise.all(targets.map((p) => rm(p, { force: true }).catch(() => {})));
     // Sweep any leftover per-sheet scratch CSVs (xlsx ingestion).
@@ -1527,6 +1576,21 @@ function uniqueIdent(raw: string, used: Set<string>): string {
 /** fileIds are UUIDs we generate — reject anything that isn't, to keep paths safe. */
 function isSafeId(id: string): boolean {
   return /^[0-9a-fA-F-]{8,64}$/.test(id);
+}
+
+/**
+ * Loose RFC 6838 media-type shape: `type/subtype[+suffix][; parameter]`. The
+ * strict grammar is fiddly and we only need enough validation to reject
+ * control characters (which would corrupt the `Content-Type` header at read
+ * time) and obviously-malformed strings. Kept permissive on parameter syntax
+ * because real-world uploads include quoted charsets, boundary marks, etc.
+ */
+function isSafeMimeType(m: string): boolean {
+  if (typeof m !== "string" || m.length === 0 || m.length > 255) return false;
+  // No control chars, no CR/LF (header injection).
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1f\x7f]/.test(m)) return false;
+  return /^[a-zA-Z0-9][a-zA-Z0-9!#$&^_\-.+]*\/[a-zA-Z0-9!#$&^_\-.+]+(;.*)?$/.test(m);
 }
 
 function byteLen(rows: unknown): number {
