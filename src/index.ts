@@ -19,6 +19,7 @@ export type {
   CardRowSection,
   CardColumnSection,
   TableSection,
+  TextSection,
   Column,
   Filter,
   Action,

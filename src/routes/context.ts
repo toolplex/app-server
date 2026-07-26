@@ -70,6 +70,8 @@ function uniqueSources(sections: (Section | Section[])[]): string[] {
       for (const section of list) {
         if (section.type === "group") {
           walk(section.sections);
+        } else if (section.type === "text") {
+          // Inline prose — no source to aggregate context from.
         } else {
           sources.add(section.source);
         }

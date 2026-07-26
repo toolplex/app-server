@@ -44,7 +44,8 @@ export type Section =
   | LinkToPageSection
   | TopNSection
   | StatusGridSection
-  | DecisionFeedSection;
+  | DecisionFeedSection
+  | TextSection;
 
 // ---------------------------------------------------------------------------
 // min_desktop_version — section-level desktop version gate
@@ -256,6 +257,13 @@ export interface TableSection {
    *  the columns alone (e.g. "Distributors" vs "Files this month"). */
   title?: string;
   /**
+   * Optional longer-form description rendered beneath the table's title,
+   * giving the reader extra context — what the data is, caveats, how to
+   * read it. Fully optional. Distinct from per-column `description`
+   * (which is a header-hover tooltip on a single column).
+   */
+  description?: string;
+  /**
    * When present, render these rows directly without fetching from
    * `source`. See CardRowSection.inline_rows for rationale. Static
    * tables (config, glossary, agent-baked dashboards) can ship the
@@ -278,6 +286,32 @@ export interface TableSection {
 // Recursive: groups can contain groups. The renderer flattens visual
 // depth — there's no extra indentation past the first nesting level.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// TextSection — free-form prose block.
+//
+// A plain block of explanatory text rendered directly on the page body.
+// Unlike every other section it has NO `source` and fetches nothing — the
+// text is authored inline in the page definition. It is NOT selectable (the
+// agent can't be asked to act on it) and renders WITHOUT a card/background,
+// so it reads as narration rather than a widget. Use it for definitions,
+// caveats, methodology notes, or a short narrative between data sections.
+//
+// The agent still SEES the prose: it's part of the page definition, so the
+// cloud-agent folds each text block's content into the page system prompt.
+// ---------------------------------------------------------------------------
+
+export interface TextSection {
+  type: "text";
+  /** The prose to render. Supports light markdown — bold, links, lists,
+   *  and paragraphs (separate paragraphs with a blank line). */
+  text: string;
+  /** Optional small heading rendered above the text. */
+  title?: string;
+  span?: number;
+  /** Minimum toolplex-desktop version required to render this section. See Section version gate docs. */
+  min_desktop_version?: string;
+}
 
 export interface SectionGroup {
   type: "group";

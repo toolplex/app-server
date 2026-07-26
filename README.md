@@ -108,12 +108,25 @@ sections: [
 - `card-row` — Horizontal row of metric cards
 - `card-column` — Vertical stack of cards (useful as a sidebar)
 - `table` — Paginated, sortable data grid with row selection
+- `text` — Free-form prose block (no data source; not selectable)
 
-Tables support a `detail` field for a slide-out drawer:
+Tables support a `detail` field for a slide-out drawer, plus optional
+`title` / `description` headings:
 
 ```typescript
 { type: 'table', source: 'orders', rowKey: 'id', columns: [...],
+  title: 'Orders',
+  description: 'All orders placed this month. Amounts are net of returns.',
   detail: { source: 'order_detail' } }
+```
+
+Text sections render explanatory prose directly on the page — use them for
+definitions, caveats, or a short narrative between data sections. They fetch
+nothing and aren't selectable, but the agent still reads their content:
+
+```typescript
+{ type: 'text', title: 'How to read this',
+  text: 'Non-moving = no sales in 90 days. Figures exclude in-transit stock.' }
 ```
 
 ### Column Formatting

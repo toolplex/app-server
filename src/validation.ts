@@ -136,13 +136,15 @@ export function validateActionResponse(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** A section that has a `source` (i.e. anything except SectionGroup). */
-type LeafSection = Exclude<Section, { type: "group" }>;
+/** A section that has a `source` — anything except SectionGroup (a
+ *  container) and TextSection (inline prose, no source/handler). */
+type LeafSection = Exclude<Section, { type: "group" } | { type: "text" }>;
 
 /**
  * Flatten a page's sections to leaf sections — i.e. non-group sections
  * that have a `source` and can register resource handlers / be validated.
- * Recursively descends through SectionGroup containers.
+ * Recursively descends through SectionGroup containers. Text sections are
+ * dropped: they have no source or handler, so there's nothing to validate.
  */
 function flattenSections(
   sections: (Section | Section[])[],
@@ -153,6 +155,8 @@ function flattenSections(
     for (const section of items) {
       if (section.type === "group") {
         result.push(...flattenSections(section.sections));
+      } else if (section.type === "text") {
+        // Inline prose — no source/handler to validate.
       } else {
         result.push(section);
       }
