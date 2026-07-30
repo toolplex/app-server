@@ -12,7 +12,7 @@
  * denoise), runs Tesseract, and writes a NEW PDF with a text layer added.
  * We then re-run Stage 1 on that OCR'd PDF and take the resulting text.
  *
- * OCRmyPDF is an optional system binary (`brew install ocrmypdf` on the
+ * OCRmyPDF is an optional system binary (`brew install ocrmypdf` on
  * macOS, apt on Linux). If it's not installed, Stage 2 is skipped
  * and the caller falls back to serving the raw bytes to the agent. That
  * degrades cleanly — non-OCR orgs just don't get scanned-PDF support.
