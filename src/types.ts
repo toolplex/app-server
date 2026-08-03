@@ -535,10 +535,30 @@ export interface StatusFormat {
   // If omitted, renderer uses sensible defaults for common values
 }
 
-/** Signed delta — green positive, red negative */
+/**
+ * Signed delta — shows an explicit +/- and colours by direction.
+ *
+ * Green-positive is only correct when up is genuinely better. Two escapes
+ * for when it isn't, because a wrongly-coloured delta doesn't merely look
+ * off — it asserts the opposite of the truth, and colour is read before
+ * the number is.
+ */
 export interface DeltaFormat {
   type: "delta";
   format?: "number" | "percent"; // how to format the numeric value (default: "number")
+  /**
+   * DOWN is the good direction: error rates, defect counts, cost overrun,
+   * days late, error reduction. Without it a 23% fall in forecast error is
+   * coloured the same red as a 23% fall in revenue.
+   */
+  invert?: boolean;
+  /**
+   * NEITHER direction is good — forecast bias, variance around a target,
+   * net position. The value keeps its sign so the reader can see which way
+   * it points, but stays uncoloured rather than claiming a verdict the
+   * metric doesn't support. Takes precedence over `invert`.
+   */
+  neutral?: boolean;
 }
 
 /** Clickable URL */
