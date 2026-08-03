@@ -164,12 +164,50 @@ export function registerFileRoutes(
   // -------------------------------------------------------------------------
 
   // POST /artifacts — materialize JSON rows into a pinned DuckDB snapshot.
-  fastify.post<{ Body: { tableName?: string; rows?: Record<string, unknown>[] } }>(
+  //
+  // Two body shapes:
+  //   { tableName?, rows[] }   single dataset (original; still the common case)
+  //   { datasets: [{ name, rows[] }, …] }   several, for composite artifacts
+  //
+  // With `datasets`, ORDER MATTERS: the first is what a client that doesn't
+  // understand sections will render, because `selectTable` defaults to
+  // tables[0]. Put the primary dataset first.
+  fastify.post<{
+    Body: {
+      tableName?: string;
+      rows?: Record<string, unknown>[];
+      datasets?: { name?: string; rows?: Record<string, unknown>[] }[];
+    };
+  }>(
     "/artifacts",
     async (request, reply) => {
+      const datasets = request.body?.datasets;
+
+      if (Array.isArray(datasets)) {
+        if (datasets.length === 0) {
+          return reply.code(400).send({ error: "'datasets' must not be empty." });
+        }
+        const bad = datasets.findIndex((d) => !d || !Array.isArray(d.rows));
+        if (bad !== -1) {
+          return reply
+            .code(400)
+            .send({ error: `datasets[${bad}] must include a 'rows' array.` });
+        }
+        const manifest = await store.materializeDatasets(
+          datasets.map((d, i) => ({
+            name: d.name || (i === 0 ? "data" : `data${i + 1}`),
+            rows: d.rows as Record<string, unknown>[],
+          })),
+          requesterOf(request),
+        );
+        return reply.send({ manifest });
+      }
+
       const rows = request.body?.rows;
       if (!Array.isArray(rows)) {
-        return reply.code(400).send({ error: "Body must include a 'rows' array." });
+        return reply
+          .code(400)
+          .send({ error: "Body must include a 'rows' array or a 'datasets' array." });
       }
       const manifest = await store.materialize(
         request.body?.tableName || "data",

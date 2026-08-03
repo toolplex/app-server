@@ -659,43 +659,113 @@ export class FileStore {
     rows: Record<string, unknown>[],
     requester: Requester,
   ): Promise<FileManifest> {
-    if (!Array.isArray(rows) || rows.length === 0) {
+    return this.materializeDatasets(
+      [{ name: tableName, rows }],
+      requester,
+    );
+  }
+
+  /**
+   * Snapshot one or more named datasets into a SINGLE artifact.
+   *
+   * Composite artifacts render several sections (prose, charts, tables) from
+   * one artifact, and those sections generally need different data — so an
+   * artifact has to be able to hold more than one table. The snapshot format
+   * already allowed it (`FileManifest.tables` is an array, and `selectTable`
+   * resolves `?table=` by name); only this writer assumed exactly one.
+   *
+   * Deliberately emits the same manifest shape `ingestXlsx` produces, so a
+   * dataset written here and a worksheet ingested from a rendered workbook are
+   * indistinguishable downstream. That's what lets a future file-backed
+   * artifact (xlsx/pdf) be referenced by sections with no new plumbing.
+   *
+   * Dataset order is significant: `selectTable` returns `tables[0]` when no
+   * table is named, so the FIRST dataset is what a client that knows nothing
+   * about sections will render. Callers should put the primary one first.
+   */
+  async materializeDatasets(
+    datasets: { name: string; rows: Record<string, unknown>[] }[],
+    requester: Requester,
+  ): Promise<FileManifest> {
+    if (!Array.isArray(datasets) || datasets.length === 0) {
+      throw new FileStoreError(400, "Artifact has no datasets.");
+    }
+
+    const totalRows = datasets.reduce(
+      (n, d) => n + (Array.isArray(d.rows) ? d.rows.length : 0),
+      0,
+    );
+    if (totalRows === 0) {
       throw new FileStoreError(400, "Artifact has no rows.");
     }
-    if (rows.length > this.cfg.maxIngestRows) {
+    // Cap on the TOTAL across datasets — the limit protects the box, and it
+    // shouldn't be sidestepped by splitting one huge table into several.
+    if (totalRows > this.cfg.maxIngestRows) {
       throw new FileStoreError(
         413,
-        `Artifact has too many rows (${rows.length.toLocaleString()}). Maximum is ${this.cfg.maxIngestRows.toLocaleString()}.`,
+        `Artifact has too many rows (${totalRows.toLocaleString()}). Maximum is ${this.cfg.maxIngestRows.toLocaleString()}.`,
       );
     }
-    // SQL-safe table name (identifier) — fall back to "data".
-    const safeTable = /^[a-zA-Z_][a-zA-Z0-9_]{0,62}$/.test(tableName) ? tableName : "data";
+
+    // SQL-safe table names, de-duplicated. Falls back to data / data2 / … so a
+    // bad or repeated name can never collide or inject.
+    const used = new Set<string>();
+    const prepared = datasets.map((d, i) => {
+      const requested = typeof d.name === "string" ? d.name : "";
+      let safe = /^[a-zA-Z_][a-zA-Z0-9_]{0,62}$/.test(requested)
+        ? requested
+        : i === 0
+          ? "data"
+          : `data${i + 1}`;
+      let n = 2;
+      while (used.has(safe)) safe = `${safe}_${n++}`;
+      used.add(safe);
+      return { safe, requested, rows: Array.isArray(d.rows) ? d.rows : [] };
+    });
 
     const fileId = randomUUID();
     const jsonPath = join(this.cfg.dir, `${fileId}.rows.json`);
     const dbPath = join(this.cfg.dir, `${fileId}.duckdb`);
+    // One temp file per dataset; all are cleaned up on both paths.
+    const tempPaths: string[] = [];
 
     await mkdir(this.cfg.dir, { recursive: true });
     try {
-      await writeFile(jsonPath, JSON.stringify(rows), "utf8");
-
       let tables: FileTableManifest[];
       const inst = await DuckDBInstance.create(dbPath);
       try {
         const conn = await inst.connect();
-        await conn.run(
-          `CREATE TABLE ${safeTable} AS SELECT * FROM read_json_auto(${sqlString(jsonPath)})`,
-        );
-        const table = await this.describeTable(conn, safeTable);
+        tables = [];
+        for (const [i, ds] of prepared.entries()) {
+          if (ds.rows.length === 0) continue; // skip empties rather than fail the whole artifact
+          const tmp =
+            i === 0 ? jsonPath : join(this.cfg.dir, `${fileId}.rows.${i}.json`);
+          tempPaths.push(tmp);
+          await writeFile(tmp, JSON.stringify(ds.rows), "utf8");
+          await conn.run(
+            `CREATE TABLE ${ds.safe} AS SELECT * FROM read_json_auto(${sqlString(tmp)})`,
+          );
+          const table = await this.describeTable(conn, ds.safe);
+          // Carry the caller's label when it differs from the SQL-safe name,
+          // mirroring how xlsx keeps the original worksheet title.
+          if (ds.requested && ds.requested !== ds.safe) {
+            table.sheetName = ds.requested;
+          }
+          tables.push(table);
+        }
         conn.disconnectSync();
-        tables = [table];
       } finally {
         inst.closeSync();
       }
 
-      // Drop the temp source — the DuckDB is the source of truth.
-      await rm(jsonPath, { force: true }).catch(() => {});
+      if (tables.length === 0) {
+        throw new FileStoreError(400, "Artifact has no rows.");
+      }
 
+      // Drop the temp sources — the DuckDB is the source of truth.
+      await Promise.all(tempPaths.map((p) => rm(p, { force: true }).catch(() => {})));
+
+      const safeTable = tables[0].name;
       const manifest: FileManifest = {
         fileId,
         filename: `${safeTable}.artifact`,
@@ -716,6 +786,9 @@ export class FileStore {
       await writeFile(this.recordPath(fileId), JSON.stringify(record), "utf8");
       return manifest;
     } catch (err) {
+      // Clean up every temp source, not just the first — a failure partway
+      // through a multi-dataset write would otherwise strand the rest on disk.
+      await Promise.all(tempPaths.map((p) => rm(p, { force: true }).catch(() => {})));
       await rm(jsonPath, { force: true }).catch(() => {});
       await this.removeFiles(fileId, { uploadPath: jsonPath, dbPath } as FileRecord).catch(() => {});
       if (err instanceof FileStoreError) throw err;
