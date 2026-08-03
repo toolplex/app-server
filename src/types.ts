@@ -193,6 +193,20 @@ export interface ChartSection {
    * size alone. Default: false.
    */
   value_labels?: boolean;
+  /**
+   * Short unit appended to value-axis ticks — "%", "pp", "kg", "hrs".
+   *
+   * Without it an axis of percentages renders as "40", which states a
+   * different quantity than the data means. Deliberately a suffix and not a
+   * `percent` format: series arrive pre-scaled (19.9 = 19.9%) as often as
+   * they arrive as fractions (0.199), and nothing distinguishes them, so
+   * anything that decides whether to multiply by 100 will eventually be
+   * wrong by a factor of ten. A suffix only labels what is already there.
+   *
+   * Requires toolplex-desktop 1.4.10+; older clients ignore it and render
+   * bare numbers, which is the current behaviour.
+   */
+  y_unit?: string;
   /** Minimum toolplex-desktop version required to render this section. See Section version gate docs. */
   min_desktop_version?: string;
 }
@@ -1053,9 +1067,36 @@ export interface Selection {
  *   { label: "Revenue", value: 12500, format: "currency" }
  */
 export interface CardData {
+  /**
+   * What the metric IS. Keep it short — a few words.
+   *
+   * Qualifiers about WHICH slice or period the figure covers belong in
+   * `sublabel`, not here. A label like "Current model error — per store
+   * (May 2026, retrospective)" wraps onto two lines, which pushes the value
+   * down and makes an even row of cards ragged.
+   */
   label: string;
+  /**
+   * The figure itself.
+   *
+   * Pass a NUMBER with a numeric `format` wherever the value is numeric.
+   * A pre-formatted string (e.g. "19.9% (bias -9.1%)") is classified as
+   * text by the renderer and typeset at body size — so a headline metric
+   * silently renders at the same weight as the caption beneath it. Let the
+   * format do the formatting, and put secondary figures in `delta`.
+   */
   value: number | string;
   format?: ColumnFormat;
+  /**
+   * Which slice / period this figure covers — "May 2026 (retrospective)",
+   * "per store", "last 7 days". Rendered under the label in muted type,
+   * so the label stays a short name and the qualifier still travels with
+   * the number instead of being crammed into either.
+   *
+   * Requires toolplex-desktop 1.4.10+. Older clients ignore it, so keep
+   * the label independently meaningful.
+   */
+  sublabel?: string;
   /**
    * Optional human-friendly explanation of the metric. Surfaced as an
    * info-icon tooltip on the card — useful for non-obvious metrics
