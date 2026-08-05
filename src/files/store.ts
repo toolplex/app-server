@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { copyFile, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, extname, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
 
@@ -205,6 +205,19 @@ export class FileStore {
     }
     let removed = 0;
     for (const entry of entries) {
+      // Orphaned temp files from writeRecord — only possible if the process
+      // died between the write and the rename, since the write path removes
+      // its own temp on failure. Swept on age so a live write in progress is
+      // never pulled out from under itself. Handled here because these do not
+      // end in .json and would otherwise accumulate forever.
+      if (entry.endsWith(".tmp")) {
+        const tmpPath = join(this.cfg.dir, entry);
+        const age = await stat(tmpPath)
+          .then((s) => s.mtimeMs)
+          .catch(() => Date.now());
+        if (age < cutoff) await rm(tmpPath, { force: true }).catch(() => {});
+        continue;
+      }
       if (!entry.endsWith(".json")) continue;
       const fileId = entry.slice(0, -5);
       const record = await this.readRecord(fileId).catch(() => null);
@@ -346,7 +359,7 @@ export class FileStore {
         // Pinned (durable artifact from a resolved report) → never TTL-swept.
         ...(opts.pinned ? { pinned: true } : {}),
       };
-      await writeFile(this.recordPath(fileId), JSON.stringify(record), "utf8");
+      await this.writeRecord(fileId, record);
 
       return manifest;
     } finally {
@@ -482,7 +495,7 @@ export class FileStore {
         ...(pinned ? { pinned: true } : {}),
       };
       try {
-        await writeFile(this.recordPath(fileId), JSON.stringify(record), "utf8");
+        await this.writeRecord(fileId, record);
       } catch (err) {
         // Sidecar (JSON record) write failed AFTER the upload file already
         // landed on disk. Without the sidecar the TTL sweep can't find these
@@ -783,7 +796,7 @@ export class FileStore {
         createdAtMs: Date.now(),
         pinned: true,
       };
-      await writeFile(this.recordPath(fileId), JSON.stringify(record), "utf8");
+      await this.writeRecord(fileId, record);
       return manifest;
     } catch (err) {
       // Clean up every temp source, not just the first — a failure partway
@@ -889,7 +902,7 @@ export class FileStore {
         createdAtMs: Date.now(),
         pinned: true,
       };
-      await writeFile(this.recordPath(fileId), JSON.stringify(record), "utf8");
+      await this.writeRecord(fileId, record);
       return manifest;
     } catch (err) {
       await this.removeFiles(fileId, { uploadPath: xlsxPath, dbPath } as FileRecord).catch(() => {});
@@ -1431,6 +1444,34 @@ export class FileStore {
     return JSON.parse(raw) as FileRecord;
   }
 
+  /**
+   * Write a file record ATOMICALLY.
+   *
+   * writeFile truncates and then writes, so a concurrent reader can observe an
+   * empty or partial file and fail to parse it. Writing to a temp file and
+   * renaming makes the swap atomic on POSIX — a reader sees either the old
+   * record or the new one, never a fragment.
+   *
+   * Every record write goes through here. The pinned-record read path no longer
+   * writes at all, which removes the collision for artifacts; this protects the
+   * attachment paths, which still need the refresh-on-use bump, and the ingest
+   * paths, which write records while other requests may be reading them.
+   */
+  private async writeRecord(fileId: string, record: FileRecord): Promise<void> {
+    const target = this.recordPath(fileId);
+    // Same directory, so the rename is a metadata operation on one filesystem
+    // rather than a copy across devices. Suffixed with the pid so two processes
+    // sharing a store directory can't clobber each other's temp file.
+    const tmp = `${target}.${process.pid}.tmp`;
+    try {
+      await writeFile(tmp, JSON.stringify(record), "utf8");
+      await rename(tmp, target);
+    } catch (err) {
+      await rm(tmp, { force: true }).catch(() => {});
+      throw err;
+    }
+  }
+
   private async getOwnedRecord(
     fileId: string,
     requester: Requester,
@@ -1440,7 +1481,18 @@ export class FileStore {
       record = await this.readRecord(fileId);
     } catch (err) {
       if (err instanceof FileStoreError) throw err;
-      throw new FileStoreError(404, "File not found. It may have expired.");
+      // ENOENT is the only "not found". Anything else — a partial read, a
+      // permissions problem, malformed JSON — is a server fault, and reporting
+      // it as 404 is how a transient IO error reached users as "this artifact
+      // was deleted". Callers cannot tell those apart from a status alone.
+      const code = (err as NodeJS.ErrnoException | undefined)?.code;
+      if (code === "ENOENT") {
+        throw new FileStoreError(404, "File not found. It may have expired.");
+      }
+      throw new FileStoreError(
+        500,
+        `Could not read the file record: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
     if (!this.ownsRecord(record, requester)) {
       // Don't leak existence to a non-owner.
@@ -1449,8 +1501,18 @@ export class FileStore {
     // Refresh-on-use: bump the TTL clock so a file that's still being queried in
     // an active conversation doesn't get swept out from under it. Best-effort —
     // never fail a read because the touch couldn't be persisted.
-    record.createdAtMs = Date.now();
-    writeFile(this.recordPath(fileId), JSON.stringify(record), "utf8").catch(() => {});
+    //
+    // Skipped for PINNED records, which is every durable artifact snapshot. The
+    // sweep never consults createdAtMs for those (see cleanup: `!record.pinned
+    // && ...`), so the write bought nothing — and it made every read of an
+    // artifact a concurrent writer of that artifact's own record. A composite
+    // artifact fetches one dataset per section at once, so opening one had
+    // several readers racing several writers on the same file; the loser parsed
+    // a half-written record and, before the fix above, reported it as 404.
+    if (!record.pinned) {
+      record.createdAtMs = Date.now();
+      void this.writeRecord(fileId, record).catch(() => {});
+    }
     return record;
   }
 
