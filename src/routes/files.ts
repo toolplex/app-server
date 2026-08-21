@@ -22,12 +22,19 @@ export function registerFileRoutes(
 ): void {
   // POST /files — multipart upload. Field name is flexible: the first file
   // part wins. Returns the manifest the desktop injects into chat context.
-  fastify.post("/files", async (request, reply) => {
+  //
+  // Uploads are PINNED (durable) by default since 0.8.0: user files are
+  // never TTL-swept — they live until explicitly deleted. A caller that
+  // genuinely wants scratch semantics opts out with ?pinned=false.
+  fastify.post<{ Querystring: { pinned?: string } }>("/files", async (request, reply) => {
     const file = await readFirstFile(request);
     if (!file) {
       return reply.code(400).send({ error: "No file found in the upload." });
     }
-    const manifest = await store.ingest(file.filename, file.buffer, requesterOf(request));
+    const pinned = request.query?.pinned !== "false";
+    const manifest = await store.ingest(file.filename, file.buffer, requesterOf(request), {
+      pinned,
+    });
     return reply.send({ manifest });
   });
 
@@ -43,7 +50,7 @@ export function registerFileRoutes(
   // real-world PDFs (5MB+) would be rejected before reaching the handler
   // with an unhelpful "Request body is too large".
   fastify.post<{
-    Body: { filename?: string; mimeType?: string; dataBase64?: string };
+    Body: { filename?: string; mimeType?: string; dataBase64?: string; pinned?: boolean };
   }>("/files/raw", { bodyLimit: 150 * 1024 * 1024 }, async (request, reply) => {
     const body = request.body || {};
     if (typeof body.filename !== "string" || body.filename.length === 0) {
@@ -66,8 +73,10 @@ export function registerFileRoutes(
       return reply.code(400).send({ error: "Invalid base64 payload." });
     }
     const buffer = Buffer.from(compact, "base64");
+    // Durable by default (see POST /files above); body.pinned === false opts out.
     const manifest = await store.ingest(body.filename, buffer, requesterOf(request), {
       rawMimeType: body.mimeType,
+      pinned: body.pinned !== false,
     });
     return reply.send({ manifest });
   });

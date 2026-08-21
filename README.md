@@ -206,8 +206,8 @@ await server.register(registerAppPages, {
   actions: {},
   files: {
     enabled: true,
-    // dir defaults to <os.tmpdir>/toolplex-app-files
-    ttlMinutes: 1440,       // abandoned uploads are swept after this (24h)
+    // dir defaults to ~/.toolplex-app-files (never the OS temp dir)
+    ttlMinutes: 10080,      // sweeps only files uploaded with pinned=false (uploads are durable by default since 0.8.0)
     maxUploadBytes: 100 * 1024 * 1024,
     maxQueryRows: 1000,     // hard cap per query
     maxResultBytes: 512 * 1024,

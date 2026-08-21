@@ -32,9 +32,10 @@ export interface FilesConfig {
    */
   dir?: string;
   /**
-   * Auto-delete an uploaded file (and its DuckDB db) this many minutes after
-   * upload. The desktop treats files as session-scoped; this is the
-   * backstop sweep for abandoned uploads. Default: 1440 (24 hours).
+   * Auto-delete an UNPINNED file (and its DuckDB db) this many minutes after
+   * upload. Since 0.8.0 uploads are pinned (durable) by default, so this only
+   * applies to callers that opt out with pinned=false and to unpinned files
+   * created by older versions. Default: 10080 (7 days).
    */
   ttlMinutes?: number;
   /** Reject uploads larger than this. Default: 100 MB. */
@@ -58,9 +59,10 @@ export interface FilesConfig {
    */
   maxConcurrentIngests?: number;
   /**
-   * Cap on the total bytes held in the drop dir. A new upload that would
-   * exceed it triggers an eager TTL sweep; if still over, it's rejected with
-   * 507. Bounds disk usage between sweeps. Default: 2 GB.
+   * @deprecated No-op since 0.8.0. The total-bytes cap was removed: user
+   * files are durable by default and disk headroom is an operational
+   * concern (monitor/alert on the host), not an upload-time rejection.
+   * Accepted so existing configs keep compiling; ignored.
    */
   maxTotalBytes?: number;
   /**
@@ -90,7 +92,6 @@ export interface ResolvedFilesConfig {
   queryTimeoutMs: number;
   manifestSampleRows: number;
   maxConcurrentIngests: number;
-  maxTotalBytes: number;
   maxIngestRows: number;
   reportDirs: string[];
 }

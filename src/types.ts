@@ -505,7 +505,25 @@ export type RichFormat =
   | ProgressFormat
   | CurrencyFormat
   | SparklineFormat
-  | ChipFormat;
+  | ChipFormat
+  | FileFormat;
+
+/** A stored-file cell. The column's value is a ToolPlex file id (the
+ *  `fileId` from this app-server's file store — e.g. a chat attachment or a
+ *  file a page action deposited). The desktop renders a download control
+ *  that fetches the bytes through ToolPlex's authenticated proxy; the file
+ *  is only reachable by members of the org. Use this instead of a bare URL
+ *  in a `link`/`image` column whenever the file lives in the file store —
+ *  bare URLs are unauthenticated and go stale; file ids are durable.
+ *  Requires desktop >= 1.6.0 (older clients render the raw id as text —
+ *  gate the section with `min_desktop_version` if that matters). */
+export interface FileFormat {
+  type: "file";
+  /** Button label. Default: "Download". */
+  label?: string;
+  /** Filename for the browser download. Default: server-provided name. */
+  filename?: string;
+}
 
 /** Localised currency. Use this object form when the simple "currency"
  *  string isn't enough — for non-USD currencies (PHP, EUR, etc.) or

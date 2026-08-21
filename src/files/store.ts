@@ -61,10 +61,10 @@ export interface Requester {
 }
 
 const DEFAULTS = {
-  // 7 days. Attachments are ephemeral, but a 24h TTL expired files mid-thread
-  // for multi-day engagements. Combined with refresh-on-use (querying a file
-  // bumps its clock), an actively-used file effectively never expires while the
-  // conversation is alive; abandoned files still get swept within a week.
+  // 7 days — but note that since 0.8.0 the upload routes pin by default, so
+  // the TTL only applies to callers that explicitly opt out (?pinned=false)
+  // and to unpinned files created by pre-0.8.0 versions. User content is
+  // durable: it lives until explicitly deleted.
   ttlMinutes: 10080,
   maxUploadBytes: 100 * 1024 * 1024,
   maxQueryRows: 1000,
@@ -72,7 +72,6 @@ const DEFAULTS = {
   queryTimeoutMs: 15_000,
   manifestSampleRows: 5,
   maxConcurrentIngests: 4,
-  maxTotalBytes: 2 * 1024 * 1024 * 1024, // 2 GB
   maxIngestRows: 2_000_000,
 };
 
@@ -112,7 +111,6 @@ export class FileStore {
       queryTimeoutMs: config.queryTimeoutMs ?? DEFAULTS.queryTimeoutMs,
       manifestSampleRows: config.manifestSampleRows ?? DEFAULTS.manifestSampleRows,
       maxConcurrentIngests: config.maxConcurrentIngests ?? DEFAULTS.maxConcurrentIngests,
-      maxTotalBytes: config.maxTotalBytes ?? DEFAULTS.maxTotalBytes,
       maxIngestRows: config.maxIngestRows ?? DEFAULTS.maxIngestRows,
       // Canonicalize allowlist roots up front. Symlinked roots are re-resolved
       // in init() (realpath needs the path to exist).
@@ -278,18 +276,6 @@ export class FileStore {
     }
     this.activeIngests++;
     try {
-      // Disk cap: if this upload would push the drop dir over the limit, run an
-      // eager sweep of expired files; if still over, reject.
-      if ((await this.dirSizeBytes()) + buffer.length > this.cfg.maxTotalBytes) {
-        await this.sweepExpired(() => {});
-        if ((await this.dirSizeBytes()) + buffer.length > this.cfg.maxTotalBytes) {
-          throw new FileStoreError(
-            507,
-            "File storage is temporarily full. Please try again shortly.",
-          );
-        }
-      }
-
       const fileId = randomUUID();
       const uploadPath = join(this.cfg.dir, `${fileId}${extname(filename) || `.${kind}`}`);
       const dbPath = join(this.cfg.dir, `${fileId}.duckdb`);
@@ -407,16 +393,6 @@ export class FileStore {
     }
     this.activeIngests++;
     try {
-      if ((await this.dirSizeBytes()) + buffer.length > this.cfg.maxTotalBytes) {
-        await this.sweepExpired(() => {});
-        if ((await this.dirSizeBytes()) + buffer.length > this.cfg.maxTotalBytes) {
-          throw new FileStoreError(
-            507,
-            "File storage is temporarily full. Please try again shortly.",
-          );
-        }
-      }
-
       const fileId = randomUUID();
       // Preserve the original extension so the on-disk file is directly
       // openable if an operator inspects the drop dir. Fall back to `.bin`
@@ -974,25 +950,6 @@ export class FileStore {
       }
     }
     return out;
-  }
-
-  /** Total bytes currently held in the drop dir (best-effort). */
-  private async dirSizeBytes(): Promise<number> {
-    let total = 0;
-    let entries: string[];
-    try {
-      entries = await readdir(this.cfg.dir);
-    } catch {
-      return 0;
-    }
-    for (const entry of entries) {
-      try {
-        total += (await stat(join(this.cfg.dir, entry))).size;
-      } catch {
-        /* file vanished mid-scan */
-      }
-    }
-    return total;
   }
 
   /** CSV / TSV → a single table named `data`, types inferred by DuckDB. */
