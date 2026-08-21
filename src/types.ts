@@ -515,7 +515,7 @@ export type RichFormat =
  *  is only reachable by members of the org. Use this instead of a bare URL
  *  in a `link`/`image` column whenever the file lives in the file store —
  *  bare URLs are unauthenticated and go stale; file ids are durable.
- *  Requires desktop >= 1.6.0 (older clients render the raw id as text —
+ *  Requires desktop >= 1.5.3 (older clients render the raw id as text —
  *  gate the section with `min_desktop_version` if that matters). */
 export interface FileFormat {
   type: "file";
