@@ -19,6 +19,7 @@ export type {
   CardRowSection,
   CardColumnSection,
   TableSection,
+  TableFormatDefaults,
   TextSection,
   Column,
   Filter,

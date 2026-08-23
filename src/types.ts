@@ -284,8 +284,41 @@ export interface TableSection {
    * data inline rather than wiring a fetch handler.
    */
   inline_rows?: Record<string, unknown>[];
+  /**
+   * Presentation defaults for the sheet. Each is a starting point, not a
+   * lock: the reader's Format menu overrides any of them for their session,
+   * because whether a column of long descriptions should wrap depends on the
+   * reader's window as much as on the data.
+   *
+   * Set these where the data has an obvious shape — `wrap` on a sheet whose
+   * value is in long free text, `rowNumbers: false` on a short summary where
+   * the gutter is noise. Omit them and the reader gets the defaults
+   * (truncate, comfortable, numbered, striped).
+   */
+  format?: TableFormatDefaults;
   /** Minimum toolplex-desktop version required to render this section. See Section version gate docs. */
   min_desktop_version?: string;
+}
+
+/**
+ * Sheet presentation defaults. Additive and fully optional — an older
+ * desktop ignores the field entirely, so this needs no version gate.
+ */
+export interface TableFormatDefaults {
+  /** Long cell text: clip with an ellipsis, or wrap onto more lines. Default "truncate". */
+  wrap?: "truncate" | "wrap";
+  /** Row height. Wrapped text usually wants "comfortable". Default "comfortable". */
+  density?: "compact" | "comfortable";
+  /** The leading 1..n gutter. Noise on a short sheet, orientation on a long one. Default true. */
+  rowNumbers?: boolean;
+  /** Alternating row tint. Default true. */
+  striping?: boolean;
+  /**
+   * Body text size. "medium" is the design's default; "small" fits a wide
+   * sheet on one screen, "large" is for a figure someone reads across a room
+   * or from a shared display. Default "medium".
+   */
+  textSize?: "small" | "medium" | "large";
 }
 
 // ---------------------------------------------------------------------------
