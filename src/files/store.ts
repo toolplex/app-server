@@ -555,12 +555,11 @@ export class FileStore {
     requester: Requester,
   ): Promise<{ manifest: FileManifest; uploadPath: string }> {
     const record = await this.getOwnedRecord(fileId, requester);
-    if (record.manifest.kind !== "raw" && record.manifest.kind !== "text") {
-      throw new FileStoreError(
-        400,
-        `File "${fileId}" is a tabular file — use /query, not /raw.`,
-      );
-    }
+    // All kinds serve their ORIGINAL bytes: raw/text for read_attachment,
+    // and tabular (csv/tsv/xlsx) so durable workbooks are downloadable from
+    // chat file links, attachment tiles, and page file cells. The old
+    // tabular rejection ("use /query, not /raw") predates durability —
+    // querying and downloading the original are both legitimate now.
     return { manifest: record.manifest, uploadPath: record.uploadPath };
   }
 

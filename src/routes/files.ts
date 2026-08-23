@@ -109,16 +109,13 @@ export function registerFileRoutes(
     },
   );
 
-  // GET /files/:id/raw — stream the original bytes of a non-tabular file
-  // (kind: "raw" OR "text" — text-kind files also keep their original bytes
-  // for callers that need the image, e.g. layout questions on a PDF that was
-  // also text-extracted). Used by the cloud-agent's read_attachment tool to
-  // re-inject bytes into a later LLM turn as multimodal content.
-  //
-  // Rejects with 400 if the fileId points at a tabular DuckDB snapshot —
-  // those must go through /query instead. `.replace(/[\r\n"]/g, "")` on the
-  // Content-Disposition filename guards against header injection via crafted
-  // uploaded filenames (defense-in-depth; the call chain is auth-gated).
+  // GET /files/:id/raw — stream a file's ORIGINAL bytes, any kind. Raw/text
+  // serves the cloud-agent's read_attachment (re-inject bytes into a later
+  // LLM turn); tabular serves the original workbook/CSV for downloads from
+  // chat file links, attachment tiles, and page file cells (queries still go
+  // through /query). `.replace(/[\r\n"]/g, "")` on the Content-Disposition
+  // filename guards against header injection via crafted uploaded filenames
+  // (defense-in-depth; the call chain is auth-gated).
   fastify.get<{ Params: { id: string } }>(
     "/files/:id/raw",
     async (request, reply) => {
