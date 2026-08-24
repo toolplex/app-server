@@ -28,6 +28,16 @@ export interface PageDefinition {
    * non-empty value wins — set it on one page per section.
    */
   section_description?: string;
+  /**
+   * Designer-enforced position of this page in the desktop's default root
+   * view (ascending; 1 = first). Pages that declare it are pinned above the
+   * usage-ranked pool in exactly this sequence — use it when pages form a
+   * workflow whose order carries meaning (intake → match → reconcile).
+   * Pages without it keep the default ranked behavior, and users' explicit
+   * sort choices (name/views/updated) still override everything.
+   * Requires desktop >= 1.5.4; older clients ignore it harmlessly.
+   */
+  nav_order?: number;
   filters?: Filter[];
   actions?: Action[];
   suggestions?: string[];
