@@ -88,7 +88,8 @@ async function main(): Promise<void> {
     check("freeze top row", (view as { ySplit?: number } | undefined)?.ySplit === 1);
 
     const detail = built.getWorksheet("Detail")!;
-    check("detail inferred header", detail.getCell("A1").value === "note");
+    // Inferred columns humanize snake_case keys into readable headers.
+    check("detail inferred header", detail.getCell("A1").value === "Note");
     check("detail inferred data", detail.getCell("B2").value === 3);
 
     // -----------------------------------------------------------------------
@@ -125,7 +126,7 @@ async function main(): Promise<void> {
     // add_sheet.
     const notes = edited.getWorksheet("Notes")!;
     check("added sheet exists", !!notes);
-    check("added sheet header", notes.getCell("A1").value === "note");
+    check("added sheet header", notes.getCell("A1").value === "Note");
     check("added sheet data", notes.getCell("A2").value === "hello");
 
     // -----------------------------------------------------------------------

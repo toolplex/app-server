@@ -196,10 +196,25 @@ function writeSheet(
     ws.addRow(cols.map((c) => toCellValue(r[c.key])));
   }
 
+  // Width: authored wins; otherwise size to content (header + sampled cell
+  // lengths) so the sheet opens readable instead of every column clipped at
+  // Excel's 8.43-character default.
+  const widthSample = rows.slice(0, INFER_SAMPLE_ROWS);
   cols.forEach((c, i) => {
     const col = ws.getColumn(i + 1);
-    if (c.width != null) col.width = c.width;
     if (c.numFmt) col.numFmt = c.numFmt;
+    if (c.width != null) {
+      col.width = c.width;
+      return;
+    }
+    let maxLen = String(c.header ?? c.key).length;
+    for (const r of widthSample) {
+      const v = r[c.key];
+      if (v === null || v === undefined) continue;
+      const s = v instanceof Date ? v.toISOString().slice(0, 10) : String(v);
+      if (s.length > maxLen) maxLen = s.length;
+    }
+    col.width = Math.min(60, Math.max(9, maxLen + 2));
   });
 }
 
@@ -250,9 +265,61 @@ function applyFreeze(ws: ExcelJS.Worksheet, freeze: string | undefined): void {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/** Initialisms that read wrong half-capitalized ("Shipment Id"). */
+const HEADER_INITIALISMS = new Set(["id", "sku", "qty", "vat", "po", "dr", "url", "vpo", "csv", "sql"]);
+
+/**
+ * Snake/kebab column key → readable header ("shipment_id" → "Shipment ID").
+ * Keys that already carry their own casing or punctuation are left alone —
+ * the author formatted those deliberately.
+ */
+function humanizeKey(key: string): string {
+  if (!/^[a-z0-9_-]+$/.test(key)) return key;
+  return key
+    .split(/[_-]+/)
+    .filter(Boolean)
+    .map((w) => (HEADER_INITIALISMS.has(w) ? w.toUpperCase() : w.charAt(0).toUpperCase() + w.slice(1)))
+    .join(" ");
+}
+
+const INFER_SAMPLE_ROWS = 100;
+
+/**
+ * Columns for a sheet with no authored spec (agent blank-builds without
+ * `columns`, and the on-the-fly artifact export): readable headers, and a
+ * thousands-separator format for numeric columns. The separator only kicks
+ * in when the column actually holds large numbers — "2,026" on a year
+ * column is worse than no format at all.
+ */
 function inferColumns(rows: Record<string, unknown>[]): XlsxColumnSpec[] {
   if (rows.length === 0) return [];
-  return Object.keys(rows[0]).map((k) => ({ key: k }));
+  return Object.keys(rows[0]).map((k) => {
+    let numeric = true;
+    let integral = true;
+    let large = false;
+    let seen = 0;
+    for (const r of rows.slice(0, INFER_SAMPLE_ROWS)) {
+      const v = r[k];
+      if (v === null || v === undefined) continue;
+      seen++;
+      if (typeof v !== "number" && typeof v !== "bigint") {
+        numeric = false;
+        break;
+      }
+      const n = Number(v);
+      if (!Number.isInteger(n)) integral = false;
+      if (Math.abs(n) >= 10_000) large = true;
+    }
+    const numFmt =
+      numeric && seen > 0
+        ? integral
+          ? large
+            ? "#,##0"
+            : undefined
+          : "#,##0.00"
+        : undefined;
+    return { key: k, header: humanizeKey(k), ...(numFmt ? { numFmt } : {}) };
+  });
 }
 
 /** Coerce an arbitrary value to a valid exceljs cell value. */

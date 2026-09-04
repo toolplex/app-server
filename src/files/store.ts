@@ -1272,7 +1272,16 @@ export class FileStore {
     const base = (record.manifest.filename || "export").replace(/\.[^.]+$/, "") || "export";
 
     if (opts.format === "xlsx") {
-      const wb = buildWorkbook([{ name: table.sheetName || table.name, rows }]);
+      // Styled defaults for the rendition: header row shaded + frozen, columns
+      // sized/formatted by inference (see inferColumns) — the export opens
+      // readable in Excel/Numbers instead of raw keys in 8.43-char columns.
+      const wb = buildWorkbook([
+        {
+          name: table.sheetName || table.name,
+          rows,
+          style: { header: { bold: true, fill: "#F2F2F2" }, freeze: "A2" },
+        },
+      ]);
       const buffer = Buffer.from(await wb.xlsx.writeBuffer());
       return {
         buffer,
