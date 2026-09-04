@@ -18,6 +18,7 @@ import { validateReadOnlySql } from "./sqlGuard.js";
 import {
   applyOps,
   buildWorkbook,
+  trimTrailingEmptyRows,
   type DocSource,
   type ResolvedOp,
   type ResolvedSheet,
@@ -1268,7 +1269,13 @@ export class FileStore {
   ): Promise<{ buffer: Buffer; filename: string; contentType: string }> {
     const record = await this.getOwnedRecord(fileId, requester);
     const table = selectTable(record.manifest, opts.table);
-    const rows = await this.readTableRows(record.dbPath, table.name, EXPORT_MAX_ROWS);
+    // Trailing all-empty rows ride along in some snapshots (trailing blank
+    // lines in an ingested sheet, empty objects in an agent's rows) — in a
+    // downloaded file they read as a formatting bug, so the rendition trims
+    // them. Trailing only: an interior blank row stays, faithfully.
+    const rows = trimTrailingEmptyRows(
+      await this.readTableRows(record.dbPath, table.name, EXPORT_MAX_ROWS),
+    );
     const base = (record.manifest.filename || "export").replace(/\.[^.]+$/, "") || "export";
 
     if (opts.format === "xlsx") {

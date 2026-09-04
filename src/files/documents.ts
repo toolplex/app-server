@@ -265,6 +265,22 @@ function applyFreeze(ws: ExcelJS.Worksheet, freeze: string | undefined): void {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/** True when every value in the row is null/undefined or blank text. */
+function isEmptyRow(row: Record<string, unknown>): boolean {
+  return Object.values(row).every(
+    (v) => v === null || v === undefined || (typeof v === "string" && v.trim() === ""),
+  );
+}
+
+/** Drop trailing all-empty rows; interior blanks are kept faithfully. */
+export function trimTrailingEmptyRows(
+  rows: Record<string, unknown>[],
+): Record<string, unknown>[] {
+  let end = rows.length;
+  while (end > 0 && isEmptyRow(rows[end - 1])) end--;
+  return end === rows.length ? rows : rows.slice(0, end);
+}
+
 /** Initialisms that read wrong half-capitalized ("Shipment Id"). */
 const HEADER_INITIALISMS = new Set(["id", "sku", "qty", "vat", "po", "dr", "url", "vpo", "csv", "sql"]);
 
