@@ -21,6 +21,17 @@ export function readUserHeaders(request: FastifyRequest): UserIdentity | undefin
   return orgId ? { id, email, orgId } : { id, email };
 }
 
+/**
+ * The org attestation alone. Org is the ISOLATION boundary; user id/email
+ * are attribution — and org-only callers exist (toolplex-api's artifact
+ * retention sweep sends no user identity). Reading org only through
+ * readUserHeaders dropped it for those callers, leaving their requests
+ * un-scoped and quietly dependent on the ownership check's fail-open rows.
+ */
+export function readOrgHeader(request: FastifyRequest): string | undefined {
+  return headerString(request, "x-toolplex-org-id");
+}
+
 function headerString(request: FastifyRequest, name: string): string | undefined {
   const raw = request.headers[name];
   if (raw == null) return undefined;

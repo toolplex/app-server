@@ -3,7 +3,7 @@ import { createReadStream } from "node:fs";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { AppServerConfig, UploadedFile } from "../types.js";
-import { readUserHeaders } from "../user.js";
+import { readUserHeaders, readOrgHeader } from "../user.js";
 import { FileStore, FileStoreError, type Requester } from "../files/store.js";
 import type { XlsxDocSpec } from "../files/documents.js";
 
@@ -403,7 +403,10 @@ export function registerFileRoutes(
 
 function requesterOf(request: FastifyRequest): Requester {
   const user = readUserHeaders(request);
-  return { userId: user?.id, orgId: user?.orgId };
+  // Org read independently of user identity (see readOrgHeader): step 1 of
+  // the fail-closed sequence — once every caller verifiably carries org,
+  // ownsRecord can refuse org-less requests instead of allowing them.
+  return { userId: user?.id, orgId: user?.orgId ?? readOrgHeader(request) };
 }
 
 /** Strip CR/LF/quotes so a filename is safe inside a Content-Disposition header. */
