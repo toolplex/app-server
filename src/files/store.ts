@@ -962,23 +962,16 @@ export class FileStore {
     const inst = await DuckDBInstance.create(dbPath);
     try {
       const conn = await inst.connect();
-      const path = sqlString(uploadPath);
-      const delim = kind === "tsv" ? ", delim='\\t'" : "";
-      try {
-        await conn.run(
-          `CREATE TABLE data AS SELECT * FROM read_csv_auto(${path}, sample_size=-1${delim})`,
-        );
-      } catch {
-        // Messy/irregular file — fall back to all-text so ingestion still
-        // succeeds and the agent can at least inspect the raw values.
-        await conn.run(`DROP TABLE IF EXISTS data`);
-        await conn.run(
-          `CREATE TABLE data AS SELECT * FROM read_csv_auto(${path}, all_varchar=true, ignore_errors=true${delim})`,
-        );
-        notes.push(
-          "Column types could not be inferred cleanly; all columns are treated as text.",
-        );
-      }
+      const dataRows = Math.max(0, (await countLines(uploadPath)) - 1);
+      await loadCsvTable(conn, "data", uploadPath, {
+        extra: kind === "tsv" ? ", delim='\\t'" : "",
+        // A comma file the sniffer can only read as one column (stray quote,
+        // ragged rows) is a silent failure of the first tier, not a success.
+        expectedDelim: kind === "tsv" ? "\t" : ",",
+        label: "File",
+        dataRows,
+        notes,
+      });
       const table = await this.describeTable(conn, "data");
       conn.disconnectSync();
       return [table];
@@ -1013,24 +1006,29 @@ export class FileStore {
         const csvPath = join(this.cfg.dir, `${fileId}__${tableName}.csv`);
         tempCsvs.push(csvPath);
 
-        // ExcelJS writes a single worksheet to CSV with correct quoting; let
-        // DuckDB do the type inference uniformly with the delimited path.
-        await wb.csv.writeFile(csvPath, { sheetName: ws.name });
-
-        const path = sqlString(csvPath);
-        try {
-          await conn.run(
-            `CREATE TABLE ${quoteIdent(tableName)} AS SELECT * FROM read_csv_auto(${path}, sample_size=-1)`,
-          );
-        } catch {
-          await conn.run(`DROP TABLE IF EXISTS ${quoteIdent(tableName)}`);
-          await conn.run(
-            `CREATE TABLE ${quoteIdent(tableName)} AS SELECT * FROM read_csv_auto(${path}, all_varchar=true, ignore_errors=true)`,
-          );
+        // Our own CSV, from each cell's DISPLAY text. ExcelJS's csv writer
+        // JSON-serialises rich-text cells (font runs and all) and copies a
+        // merged title into every merged column; both used to blow the row
+        // apart and, via the error-skipping fallback, throw away every other
+        // row of the sheet. DuckDB still does type inference uniformly with
+        // the delimited path.
+        const written = await writeSheetCsv(ws, csvPath);
+        if (written.dataRows < 0) {
+          notes.push(`Skipped empty sheet "${ws.name}".`);
+          continue;
+        }
+        if (written.skippedTitleRows > 0) {
           notes.push(
-            `Sheet "${ws.name}": types could not be inferred; columns treated as text.`,
+            `Sheet "${ws.name}": skipped ${written.skippedTitleRows} title row${written.skippedTitleRows === 1 ? "" : "s"} above the header.`,
           );
         }
+        await loadCsvTable(conn, tableName, csvPath, {
+          extra: ", header=true",
+          expectedDelim: ",",
+          label: `Sheet "${ws.name}"`,
+          dataRows: written.dataRows,
+          notes,
+        });
         const table = await this.describeTable(conn, tableName, ws.name);
         if (table.rowCount === 0 && table.columns.length === 0) {
           await conn.run(`DROP TABLE IF EXISTS ${quoteIdent(tableName)}`);
@@ -1540,6 +1538,170 @@ export class FileStore {
 // ---------------------------------------------------------------------------
 
 /** Pick a snapshot table by name/sheetName, defaulting to the first. */
+/**
+ * Load a CSV into DuckDB in three tiers: inferred types; then all-text with
+ * short rows padded (irregular width, stray quotes); then, only if the file
+ * is still unparseable, error-skipping — and in that case the manifest says
+ * how many rows were lost, so the agent reports it instead of guessing.
+ */
+async function loadCsvTable(
+  conn: Awaited<ReturnType<DuckDBInstance["connect"]>>,
+  tableName: string,
+  csvPath: string,
+  opts: { extra: string; expectedDelim?: string; label: string; dataRows: number; notes: string[] },
+): Promise<void> {
+  const t = quoteIdent(tableName);
+  const path = sqlString(csvPath);
+  const columnCount = async () =>
+    Number((await conn.runAndReadAll(`SELECT count(*) AS c FROM (DESCRIBE ${t})`)).getRowObjects()[0]?.c ?? 0);
+  // Only consulted when the sniffer collapses the file to one column.
+  const headerHasDelim = async () => {
+    if (!opts.expectedDelim) return false;
+    const { createReadStream } = await import("node:fs");
+    const head: string = await new Promise((resolve, reject) => {
+      const rs = createReadStream(csvPath, { encoding: "utf8", start: 0, end: 8191 });
+      let buf = "";
+      rs.on("data", (c: string | Buffer) => { buf += String(c); });
+      rs.on("end", () => resolve(buf));
+      rs.on("error", reject);
+    });
+    return head.split(/\r?\n/, 1)[0].includes(opts.expectedDelim);
+  };
+  const rowCount = async (name: string) =>
+    Number((await conn.runAndReadAll(`SELECT count(*) AS c FROM ${quoteIdent(name)}`)).getRowObjects()[0]?.c ?? 0);
+  const forcedDelim =
+    opts.expectedDelim && !opts.extra.includes("delim=") ? `, delim=${sqlString(opts.expectedDelim)}` : "";
+  const tier2 = (name: string) =>
+    conn.run(
+      `CREATE TABLE ${quoteIdent(name)} AS SELECT * FROM read_csv_auto(${path}, all_varchar=true, null_padding=true, strict_mode=false${opts.extra}${forcedDelim})`,
+    );
+  try {
+    await conn.run(`CREATE TABLE ${t} AS SELECT * FROM read_csv_auto(${path}, sample_size=-1${opts.extra})`);
+    // The sniffer can "succeed" on garbage: a stray quote swallows the rest
+    // of the file into one field, or a comma file reads as a single column.
+    // When the row count falls short of what the file holds, compare with
+    // the tolerant parse and keep whichever kept more rows.
+    const kept = await rowCount(tableName);
+    const suspicious = kept < opts.dataRows || ((await columnCount()) === 1 && (await headerHasDelim()));
+    if (!suspicious) return;
+    const alt = `${tableName}__tolerant`;
+    try {
+      await tier2(alt);
+      if ((await rowCount(alt)) > kept) {
+        await conn.run(`DROP TABLE ${t}`);
+        await conn.run(`ALTER TABLE ${quoteIdent(alt)} RENAME TO ${t}`);
+        opts.notes.push(`${opts.label}: irregular rows; columns treated as text so no rows were lost.`);
+      } else {
+        await conn.run(`DROP TABLE ${quoteIdent(alt)}`);
+      }
+      return;
+    } catch {
+      await conn.run(`DROP TABLE IF EXISTS ${quoteIdent(alt)}`);
+      return; // keep the inferred table
+    }
+  } catch {
+    await conn.run(`DROP TABLE IF EXISTS ${t}`);
+  }
+  try {
+    await tier2(tableName);
+    opts.notes.push(`${opts.label}: types could not be inferred; columns treated as text.`);
+    return;
+  } catch {
+    await conn.run(`DROP TABLE IF EXISTS ${t}`);
+  }
+  await conn.run(
+    `CREATE TABLE ${t} AS SELECT * FROM read_csv_auto(${path}, all_varchar=true, ignore_errors=true${opts.extra}${forcedDelim})`,
+  );
+  const kept = Number(
+    (await conn.runAndReadAll(`SELECT count(*) AS c FROM ${t}`)).getRowObjects()[0]?.c ?? 0,
+  );
+  const lost = Math.max(0, opts.dataRows - kept);
+  opts.notes.push(
+    lost > 0
+      ? `${opts.label}: ${lost} of ${opts.dataRows} rows could not be parsed and were dropped; columns treated as text.`
+      : `${opts.label}: types could not be inferred; columns treated as text.`,
+  );
+}
+
+/** Newline count of a text file, streamed (files can be up to the upload cap). */
+async function countLines(path: string): Promise<number> {
+  const { createReadStream } = await import("node:fs");
+  return new Promise((resolve, reject) => {
+    let n = 0;
+    let sawAny = false;
+    let endedWithNewline = false;
+    createReadStream(path)
+      .on("data", (chunk: Buffer | string) => {
+        const b = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+        sawAny = sawAny || b.length > 0;
+        for (let i = 0; i < b.length; i++) if (b[i] === 10) n++;
+        if (b.length > 0) endedWithNewline = b[b.length - 1] === 10;
+      })
+      .on("end", () => resolve(sawAny && !endedWithNewline ? n + 1 : n))
+      .on("error", reject);
+  });
+}
+
+/** What Excel shows in the cell: rich text flattened, formula results, ISO dates, "" for empty. */
+function cellDisplayText(cell: ExcelJS.Cell): string {
+  const v = cell.value as unknown;
+  if (v === null || v === undefined) return "";
+  if (v instanceof Date) return v.toISOString();
+  if (typeof v === "object") {
+    const o = v as { result?: unknown; richText?: unknown; text?: unknown; error?: unknown };
+    if (o.result instanceof Date) return o.result.toISOString();
+    if (o.result !== undefined && o.result !== null && typeof o.result !== "object") return String(o.result);
+  }
+  try {
+    return cell.text ?? "";
+  } catch {
+    return typeof v === "object" ? "" : String(v);
+  }
+}
+
+function csvField(s: string): string {
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+/**
+ * Write one worksheet as CSV from display text. Leading rows carrying at most
+ * one distinct value (a merged title, a blank spacer) are skipped until the
+ * first row with two or more distinct cells — that row is the header. Trailing
+ * all-empty columns are trimmed. Returns dataRows = -1 for a sheet with no
+ * usable rows at all.
+ */
+async function writeSheetCsv(
+  ws: ExcelJS.Worksheet,
+  csvPath: string,
+): Promise<{ dataRows: number; skippedTitleRows: number }> {
+  const colCount = Math.max(ws.columnCount, ws.actualColumnCount);
+  const rows: string[][] = [];
+  for (let r = 1; r <= ws.rowCount; r++) {
+    const row = ws.getRow(r);
+    const vals: string[] = [];
+    for (let c = 1; c <= colCount; c++) vals.push(stripNulls(cellDisplayText(row.getCell(c))));
+    rows.push(vals);
+  }
+  // Drop trailing all-empty rows and columns.
+  while (rows.length > 0 && rows[rows.length - 1].every((v) => v === "")) rows.pop();
+  let width = colCount;
+  while (width > 0 && rows.every((vals) => vals[width - 1] === "")) width--;
+  if (rows.length === 0 || width === 0) return { dataRows: -1, skippedTitleRows: 0 };
+
+  const distinct = (vals: string[]) => new Set(vals.slice(0, width).filter((v) => v !== "")).size;
+  const firstWide = rows.findIndex((vals) => distinct(vals) >= 2);
+  // A one-column sheet has no "wide" row; keep everything from the first non-empty row.
+  const headerIndex = firstWide >= 0 ? firstWide : rows.findIndex((vals) => distinct(vals) >= 1);
+  const skippedTitleRows = firstWide >= 0 ? rows.slice(0, headerIndex).filter((vals) => distinct(vals) === 1).length : 0;
+
+  const out = rows
+    .slice(headerIndex)
+    .map((vals) => vals.slice(0, width).map(csvField).join(","))
+    .join("\n") + "\n";
+  await writeFile(csvPath, out, "utf8");
+  return { dataRows: rows.length - headerIndex - 1, skippedTitleRows };
+}
+
 function selectTable(manifest: FileManifest, name?: string): FileTableManifest {
   if (!name) {
     const t = manifest.tables[0];
