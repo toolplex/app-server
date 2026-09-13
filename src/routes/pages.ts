@@ -32,9 +32,12 @@ export function registerPageRoutes(
   const FRESHNESS_TTL_MS = 60_000;
   let freshnessCache: { at: number; data: Record<string, string> } | null = null;
 
-  fastify.get("/pages/freshness", async (request, reply) => {
+  fastify.get<{ Querystring: { fresh?: string } }>("/pages/freshness", async (request, reply) => {
     const now = Date.now();
-    if (freshnessCache && now - freshnessCache.at < FRESHNESS_TTL_MS) {
+    // ?fresh=1 bypasses the cache: the alert poller needs the real value so
+    // poll-only alerting is ~1–2 min end to end, not cache TTL + poll tick.
+    const bypass = request.query?.fresh === "1";
+    if (!bypass && freshnessCache && now - freshnessCache.at < FRESHNESS_TTL_MS) {
       return reply.send(freshnessCache.data);
     }
 

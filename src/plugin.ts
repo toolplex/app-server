@@ -9,6 +9,7 @@ import { registerActionRoutes } from "./routes/actions.js";
 import { registerContextRoutes } from "./routes/context.js";
 import { registerDownloadRoutes } from "./routes/download.js";
 import { registerFileRoutes } from "./routes/files.js";
+import { registerSnapshotRoutes } from "./routes/snapshots.js";
 import { FileStore } from "./files/store.js";
 
 async function appServerPlugin(
@@ -57,6 +58,8 @@ async function appServerPlugin(
     await store.init();
     await fastify.register(async (filesScope) => {
       registerFileRoutes(filesScope, config, store);
+      // Page snapshots for ToolPlex alerts (whole page → one pinned file).
+      registerSnapshotRoutes(filesScope, config, store);
     });
     store.startCleanup((msg) => fastify.log.info(msg));
     fastify.addHook("onClose", async () => {

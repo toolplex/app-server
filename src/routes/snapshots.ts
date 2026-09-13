@@ -1,0 +1,121 @@
+/**
+ * Page snapshots — materialize every sheet of a page into ONE pinned,
+ * multi-table DuckDB file, server-side, so ToolPlex's alert evaluator can run
+ * read-only SQL over "the page as it was at this refresh" (and diff it against
+ * the previous one) without paging rows across the network.
+ *
+ * POST /snapshots  { pageId, filters?, resources?, maxRows? }
+ *   → { manifest, columns: { [table]: string[] }, lastSync, rowCounts }
+ *
+ * Tables: one per resource the page's sections read (`source`), named after
+ * the resource, plus `__meta` (page_id, taken_at, last_sync). Rows are the
+ * handler's full result under the given filters, gathered with the same
+ * cursor/page loop the /download route uses.
+ */
+
+import type { FastifyInstance, FastifyRequest } from "fastify";
+import type { AppServerConfig, FetchRequest, ResourceDefinition } from "../types.js";
+import { readUserHeaders, readOrgHeader } from "../user.js";
+import { FileStore, FileStoreError, type Requester } from "../files/store.js";
+import { validateFetchResponse } from "../validation.js";
+
+const CHUNK = 100_000;
+const DEFAULT_MAX_ROWS = 250_000;
+const HARD_MAX_ROWS = 2_000_000;
+
+/** Every `source` a page's sections read, in order, deduplicated (groups recurse). */
+export function pageResources(config: AppServerConfig, pageId: string): string[] {
+  const page = config.pages[pageId];
+  if (!page) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const walk = (entries: unknown[]) => {
+    for (const e of entries) {
+      const list = Array.isArray(e) ? e : [e];
+      for (const s of list as Array<{ type?: string; source?: unknown; sections?: unknown[] }>) {
+        if (!s || typeof s !== "object") continue;
+        if (s.type === "group" && Array.isArray(s.sections)) { walk(s.sections); continue; }
+        if (typeof s.source === "string" && s.source && !seen.has(s.source)) { seen.add(s.source); out.push(s.source); }
+      }
+    }
+  };
+  walk(page.sections as unknown[]);
+  return out;
+}
+
+/** All rows of a resource under filters — cursor loop when the handler supports it, page loop otherwise. */
+export async function collectAllRows(
+  definition: ResourceDefinition,
+  resource: string,
+  base: Pick<FetchRequest, "filters" | "columnFilters" | "sort" | "user">,
+  maxRows: number,
+): Promise<Record<string, unknown>[]> {
+  const rows: Record<string, unknown>[] = [];
+  const first = await definition.fetch({ page: 1, pageSize: CHUNK, ...base });
+  validateFetchResponse(resource, first);
+  for (const r of first.rows) { if (rows.length >= maxRows) break; rows.push(r); }
+  if (first.nextCursor !== undefined && first.nextCursor !== null) {
+    let cursor: string | null = first.nextCursor;
+    while (cursor !== null && rows.length < maxRows) {
+      const res = await definition.fetch({ page: 1, pageSize: CHUNK, ...base, cursor, skipTotal: true });
+      for (const r of res.rows) { if (rows.length >= maxRows) break; rows.push(r); }
+      cursor = res.nextCursor ?? null;
+    }
+  } else {
+    const total = Math.min(first.total ?? first.rows.length, maxRows);
+    const pages = Math.ceil(total / CHUNK);
+    for (let page = 2; page <= pages && rows.length < maxRows; page++) {
+      const res = await definition.fetch({ page, pageSize: CHUNK, ...base, skipTotal: true });
+      for (const r of res.rows) { if (rows.length >= maxRows) break; rows.push(r); }
+    }
+  }
+  return rows;
+}
+
+export function registerSnapshotRoutes(fastify: FastifyInstance, config: AppServerConfig, store: FileStore): void {
+  fastify.post<{
+    Body: { pageId?: string; filters?: Record<string, string>; resources?: string[]; maxRows?: number };
+  }>("/snapshots", async (request, reply) => {
+    const body = request.body ?? {};
+    const pageId = typeof body.pageId === "string" ? body.pageId : "";
+    const page = config.pages[pageId];
+    if (!page) return reply.code(404).send({ error: `Page "${pageId}" not found.` });
+    const user = readUserHeaders(request);
+    const requester: Requester = { userId: user?.id, orgId: user?.orgId ?? readOrgHeader(request) };
+    const wanted = Array.isArray(body.resources) && body.resources.length > 0 ? body.resources : pageResources(config, pageId);
+    const resources = wanted.filter((r) => config.resources[r]);
+    if (resources.length === 0) return reply.code(400).send({ error: "This page reads no resources." });
+    const maxRows = Math.min(HARD_MAX_ROWS, Math.max(1, Number(body.maxRows) || DEFAULT_MAX_ROWS));
+    const filters = body.filters && typeof body.filters === "object" ? body.filters : undefined;
+
+    const datasets: { name: string; rows: Record<string, unknown>[] }[] = [];
+    const columns: Record<string, string[]> = {};
+    const rowCounts: Record<string, number> = {};
+    let budget = maxRows;
+    for (const resource of resources) {
+      const rows = await collectAllRows(config.resources[resource], resource, { filters, user }, budget);
+      budget -= rows.length;
+      if (rows.length > 0) {
+        datasets.push({ name: resource, rows });
+        columns[resource] = Object.keys(rows[0]).sort();
+      } else {
+        columns[resource] = [];
+      }
+      rowCounts[resource] = rows.length;
+      if (budget <= 0) break;
+    }
+    // lastSync from the page's own context handler, same as /pages/freshness.
+    let lastSync: string | null = null;
+    try {
+      const ctx = page.context ? await page.context({ sections: [], user }) : null;
+      lastSync = ctx?.lastSync ?? null;
+    } catch { /* decorative here; the caller already knows the sync it polled */ }
+    const takenAt = new Date().toISOString();
+    datasets.push({ name: "__meta", rows: [{ page_id: pageId, taken_at: takenAt, last_sync: lastSync }] });
+
+    const manifest = await store.materializeDatasets(datasets, requester);
+    return reply.send({ manifest, columns, rowCounts, lastSync, takenAt, truncated: budget <= 0 });
+  });
+}
+
+export { FileStoreError };
