@@ -11,6 +11,28 @@ import { registerDownloadRoutes } from "./routes/download.js";
 import { registerFileRoutes } from "./routes/files.js";
 import { registerSnapshotRoutes } from "./routes/snapshots.js";
 import { FileStore } from "./files/store.js";
+import { createRequire } from "node:module";
+
+const PKG_VERSION: string = (() => {
+  try {
+    return String(createRequire(import.meta.url)("../package.json").version ?? "");
+  } catch {
+    return "";
+  }
+})();
+
+/**
+ * What this server can do, for ToolPlex to gate features on. A server that
+ * predates a capability simply 404s this route, which reads as "none".
+ */
+const CAPABILITIES = {
+  /** POST /snapshots — page-wide pinned DuckDB files for alerts. */
+  snapshots: true,
+  /** Alerts (ToolPlex feature) can run against this server's pages. */
+  alerts: true,
+  /** GET /pages/freshness?fresh=1 bypasses the freshness cache. */
+  freshFreshness: true,
+} as const;
 
 async function appServerPlugin(
   fastify: FastifyInstance,
@@ -48,6 +70,7 @@ async function appServerPlugin(
   registerActionRoutes(fastify, config);
   registerContextRoutes(fastify, config);
   registerDownloadRoutes(fastify, config);
+  fastify.get("/capabilities", async () => ({ version: PKG_VERSION, capabilities: CAPABILITIES }));
 
   // Smart file-attachment feature — ingest CSV/XLSX into an isolated,
   // read-only DuckDB db and expose manifest + read-only SQL. Encapsulated in
