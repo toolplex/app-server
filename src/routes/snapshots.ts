@@ -20,7 +20,7 @@ import { FileStore, FileStoreError, type Requester } from "../files/store.js";
 import { validateFetchResponse } from "../validation.js";
 
 const CHUNK = 100_000;
-const DEFAULT_MAX_ROWS = 250_000;
+/** The only row limit is the store's own ceiling; a page that exceeds it is a page design problem the reading can explain. */
 const HARD_MAX_ROWS = 2_000_000;
 
 /** Every `source` a page's sections read, in order, deduplicated (groups recurse). */
@@ -94,6 +94,25 @@ export async function collectAllRows(
 }
 
 export function registerSnapshotRoutes(fastify: FastifyInstance, config: AppServerConfig, store: FileStore): void {
+  /**
+   * POST /snapshots/query — one read-only SQL statement across a page's album.
+   * ToolPlex resolves which files make up the album (newest first) and gates
+   * the page; this route only opens the files it is handed, read-only.
+   */
+  fastify.post<{ Body: { files?: Array<{ fileId?: string; takenAt?: string; sourceSync?: string | null }>; sql?: string } }>("/snapshots/query", async (request, reply) => {
+    const body = request.body ?? {};
+    const sql = body.sql;
+    if (typeof sql !== "string") return reply.code(400).send({ error: "Body must include a 'sql' string." });
+    const files = (Array.isArray(body.files) ? body.files : [])
+      .filter((f) => f && typeof f.fileId === "string" && typeof f.takenAt === "string")
+      .map((f) => ({ fileId: f.fileId as string, takenAt: f.takenAt as string, sourceSync: typeof f.sourceSync === "string" ? f.sourceSync : null }));
+    if (files.length === 0) return reply.code(400).send({ error: "Body must include 'files'." });
+    const user = readUserHeaders(request);
+    const requester: Requester = { userId: user?.id, orgId: user?.orgId ?? readOrgHeader(request) };
+    const result = await store.queryMany(files, sql, requester);
+    return reply.send(result);
+  });
+
   fastify.post<{
     Body: { pageId?: string; filters?: Record<string, string>; resources?: string[]; maxRows?: number };
   }>("/snapshots", async (request, reply) => {
@@ -106,7 +125,7 @@ export function registerSnapshotRoutes(fastify: FastifyInstance, config: AppServ
     const wanted = Array.isArray(body.resources) && body.resources.length > 0 ? body.resources : pageResources(config, pageId);
     const resources = wanted.filter((r) => config.resources[r]);
     if (resources.length === 0) return reply.code(400).send({ error: "This page reads no resources." });
-    const maxRows = Math.min(HARD_MAX_ROWS, Math.max(1, Number(body.maxRows) || DEFAULT_MAX_ROWS));
+    const maxRows = Math.min(HARD_MAX_ROWS, Math.max(1, Number(body.maxRows) || HARD_MAX_ROWS));
     const filters = body.filters && typeof body.filters === "object" ? body.filters : undefined;
 
     // The sync is read BEFORE the rows. If the page refreshes while rows are

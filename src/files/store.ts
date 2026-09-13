@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { copyFile, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, readdir, realpath, rename, rm, stat, statfs, writeFile, appendFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, extname, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
 
@@ -71,6 +71,8 @@ const DEFAULTS = {
   maxQueryRows: 1000,
   maxResultBytes: 512 * 1024,
   queryTimeoutMs: 15_000,
+  /** Refuse to materialize a new snapshot when the volume has less free space than this. */
+  minFreeBytes: 2 * 1024 * 1024 * 1024,
   manifestSampleRows: 5,
   maxConcurrentIngests: 4,
   maxIngestRows: 2_000_000,
@@ -110,6 +112,7 @@ export class FileStore {
       maxQueryRows: config.maxQueryRows ?? DEFAULTS.maxQueryRows,
       maxResultBytes: config.maxResultBytes ?? DEFAULTS.maxResultBytes,
       queryTimeoutMs: config.queryTimeoutMs ?? DEFAULTS.queryTimeoutMs,
+      minFreeBytes: config.minFreeBytes ?? DEFAULTS.minFreeBytes,
       manifestSampleRows: config.manifestSampleRows ?? DEFAULTS.manifestSampleRows,
       maxConcurrentIngests: config.maxConcurrentIngests ?? DEFAULTS.maxConcurrentIngests,
       maxIngestRows: config.maxIngestRows ?? DEFAULTS.maxIngestRows,
@@ -721,6 +724,16 @@ export class FileStore {
     const tempPaths: string[] = [];
 
     await mkdir(this.cfg.dir, { recursive: true });
+    // A snapshot must never be what fills the disk. Below the floor, refuse
+    // with the reason; the caller (the alert evaluator) parks the alert and
+    // the org's storage alerting says the same thing from the other side.
+    const storage = await this.storage();
+    if (storage.freeBytes !== null && storage.freeBytes < this.cfg.minFreeBytes) {
+      throw new FileStoreError(
+        507,
+        `The app server has ${(storage.freeBytes / 1e9).toFixed(1)} GB free, under its ${(this.cfg.minFreeBytes / 1e9).toFixed(1)} GB floor. Free space or raise the floor before new snapshots can be taken.`,
+      );
+    }
     try {
       let tables: FileTableManifest[];
       const inst = await DuckDBInstance.create(dbPath);
@@ -743,9 +756,15 @@ export class FileStore {
           const tmp =
             i === 0 ? jsonPath : join(this.cfg.dir, `${fileId}.rows.${i}.json`);
           tempPaths.push(tmp);
-          await writeFile(tmp, JSON.stringify(ds.rows), "utf8");
+          // Newline-delimited JSON written in chunks: memory stays flat at the
+          // chunk size whatever the row count (the ceiling is maxIngestRows).
+          await writeFile(tmp, "", "utf8");
+          const CHUNK = 20_000;
+          for (let i = 0; i < ds.rows.length; i += CHUNK) {
+            await appendFile(tmp, ds.rows.slice(i, i + CHUNK).map((r) => JSON.stringify(r)).join("\n") + "\n", "utf8");
+          }
           await conn.run(
-            `CREATE TABLE ${ds.safe} AS SELECT * FROM read_json_auto(${sqlString(tmp)})`,
+            `CREATE TABLE ${ds.safe} AS SELECT * FROM read_json_auto(${sqlString(tmp)}, format='newline_delimited', maximum_object_size=16777216)`,
           );
           const table = await this.describeTable(conn, ds.safe);
           // Carry the caller's label when it differs from the SQL-safe name,
@@ -1064,6 +1083,106 @@ export class FileStore {
   // -------------------------------------------------------------------------
   // Query
   // -------------------------------------------------------------------------
+
+  /**
+   * Disk accounting for the store's volume: what the store holds, what of it
+   * is pinned (snapshots and artifacts), and what the volume has free.
+   * freeBytes is null where the platform cannot report it.
+   */
+  async storage(): Promise<{ fileBytes: number; pinnedBytes: number; freeBytes: number | null; minFreeBytes: number }> {
+    let fileBytes = 0;
+    let pinnedBytes = 0;
+    try {
+      const entries = await readdir(this.cfg.dir);
+      const pinnedIds = new Set<string>();
+      for (const e of entries) {
+        if (!e.endsWith(".json")) continue;
+        const rec = await this.readRecord(e.slice(0, -5)).catch(() => null);
+        if (rec?.pinned) pinnedIds.add(e.slice(0, -5));
+      }
+      for (const e of entries) {
+        const st = await stat(join(this.cfg.dir, e)).catch(() => null);
+        if (!st?.isFile()) continue;
+        fileBytes += st.size;
+        if (pinnedIds.has(e.split(".")[0])) pinnedBytes += st.size;
+      }
+    } catch {
+      /* empty store */
+    }
+    let freeBytes: number | null = null;
+    try {
+      const fs = await statfs(this.cfg.dir);
+      freeBytes = Number(fs.bavail) * Number(fs.bsize);
+    } catch {
+      /* unsupported platform */
+    }
+    return { fileBytes, pinnedBytes, freeBytes, minFreeBytes: this.cfg.minFreeBytes };
+  }
+
+  /**
+   * One read-only SQL statement across several of this org's files at once —
+   * the page album. The first file's tables are exposed at top level (the
+   * newest photo); every file contributes to `history.<table>`, a UNION of
+   * that table across the files with `taken_at` and `source_sync` columns.
+   * Same sandbox, caps and timeout as `query`.
+   */
+  async queryMany(
+    files: Array<{ fileId: string; takenAt: string; sourceSync: string | null }>,
+    sql: string,
+    requester: Requester,
+  ): Promise<FileQueryResult> {
+    if (files.length === 0) throw new FileStoreError(400, "No files to query.");
+    if (files.length > 200) throw new FileStoreError(400, "Too many files in one query (max 200).");
+    const guard = validateReadOnlySql(sql);
+    if (!guard.ok) throw new FileStoreError(400, guard.error!);
+    const records = [];
+    for (const f of files) records.push({ ...f, record: await this.getOwnedRecord(f.fileId, requester) });
+
+    const inst = await DuckDBInstance.create(":memory:", { enable_external_access: "false", lock_configuration: "false" });
+    try {
+      const conn = await inst.connect();
+      try {
+        // Attach read-only, then lock configuration so the statement cannot attach anything else.
+        for (const [i, r] of records.entries()) {
+          await conn.run(`ATTACH ${sqlString(r.record.dbPath)} AS s${i} (READ_ONLY)`);
+        }
+        await conn.run(`SET lock_configuration = true`);
+        // Top level = newest photo's tables.
+        const newestTables = records[0].record.manifest.tables.map((t) => t.name);
+        for (const t of newestTables) await conn.run(`CREATE VIEW "${t}" AS SELECT * FROM s0."${t}"`);
+        // history.<table> = every photo that has the table, tagged.
+        await conn.run(`CREATE SCHEMA history`);
+        const allTables = new Set(records.flatMap((r) => r.record.manifest.tables.map((t) => t.name)));
+        for (const t of allTables) {
+          if (t === "__meta") continue;
+          const parts = records
+            .map((r, i) => ({ r, i }))
+            .filter(({ r }) => r.record.manifest.tables.some((x) => x.name === t))
+            .map(({ r, i }) => `SELECT ${sqlString(r.takenAt)}::TIMESTAMPTZ AS taken_at, ${r.sourceSync === null ? "NULL::VARCHAR" : sqlString(r.sourceSync)} AS source_sync, * FROM s${i}."${t}"`);
+          await conn.run(`CREATE VIEW history."${t}" AS ${parts.join(" UNION ALL BY NAME ")}`);
+        }
+        const reader = await withTimeout(conn.runAndReadUntil(sql, this.cfg.maxQueryRows + 1), this.cfg.queryTimeoutMs * 2, () => inst.closeSync());
+        const columns: FileColumn[] = reader.columnNames().map((name, i) => ({ name, type: String(reader.columnTypes()[i]) }));
+        const all = reader.getRowObjects();
+        let truncated = all.length > this.cfg.maxQueryRows;
+        let rows = all.slice(0, this.cfg.maxQueryRows).map((r) => normalizeRow(r));
+        if (byteLen(rows) > this.cfg.maxResultBytes) {
+          truncated = true;
+          while (rows.length > 0 && byteLen(rows) > this.cfg.maxResultBytes) rows = rows.slice(0, Math.max(1, Math.floor(rows.length * 0.8)) - 1);
+        }
+        return { columns, rows, rowCount: rows.length, truncated };
+      } catch (err) {
+        if (err instanceof FileStoreError) throw err;
+        const msg = err instanceof Error ? err.message.split("\n")[0] : String(err);
+        throw new FileStoreError(400, `Query failed: ${msg}`);
+      } finally {
+        try { inst.closeSync(); } catch { /* closed by timeout */ }
+      }
+    } catch (err) {
+      if (err instanceof FileStoreError) throw err;
+      throw new FileStoreError(500, err instanceof Error ? err.message : String(err));
+    }
+  }
 
   async query(
     fileId: string,

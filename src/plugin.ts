@@ -32,6 +32,10 @@ const CAPABILITIES = {
   alerts: true,
   /** GET /pages/freshness?fresh=1 bypasses the freshness cache. */
   freshFreshness: true,
+  /** POST /snapshots/query — SQL across a page's album (history.<table>). */
+  history: true,
+  /** storage numbers are reported alongside capabilities. */
+  storage: true,
 } as const;
 
 async function appServerPlugin(
@@ -70,15 +74,26 @@ async function appServerPlugin(
   registerActionRoutes(fastify, config);
   registerContextRoutes(fastify, config);
   registerDownloadRoutes(fastify, config);
-  fastify.get("/capabilities", async () => ({ version: PKG_VERSION, capabilities: CAPABILITIES }));
 
   // Smart file-attachment feature — ingest CSV/XLSX into an isolated,
   // read-only DuckDB db and expose manifest + read-only SQL. Encapsulated in
   // its own scope so its FileStoreError → HTTP-status error handler doesn't
   // shadow the plugin-level one for the other route groups.
+  const filesEnabled = !!config.files?.enabled;
+  // Alerts, snapshots and history all live in the file store: without it this
+  // server reports none of them, and ToolPlex hides the alerts UI.
+  const capabilities = filesEnabled ? CAPABILITIES : { ...CAPABILITIES, snapshots: false, alerts: false, history: false, storage: false };
+  let storeForStats: FileStore | null = null;
+  fastify.get("/capabilities", async () => ({
+    version: PKG_VERSION,
+    capabilities,
+    ...(storeForStats ? { storage: await storeForStats.storage() } : {}),
+  }));
+
   if (config.files?.enabled) {
     const store = new FileStore(config.files);
     await store.init();
+    storeForStats = store;
     await fastify.register(async (filesScope) => {
       registerFileRoutes(filesScope, config, store);
       // Page snapshots for ToolPlex alerts (whole page → one pinned file).

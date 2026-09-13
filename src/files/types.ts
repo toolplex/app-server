@@ -42,6 +42,8 @@ export interface FilesConfig {
   maxUploadBytes?: number;
   /** Hard cap on rows returned by a single query. Default: 1000. */
   maxQueryRows?: number;
+  /** Refuse new snapshots when the volume has less free space than this (default 2 GB). */
+  minFreeBytes?: number;
   /**
    * Hard cap on the serialized byte size of a query result. Rows are dropped
    * (and `truncated` set) until the payload fits. Default: 512 KB.
@@ -88,6 +90,7 @@ export interface ResolvedFilesConfig {
   ttlMinutes: number;
   maxUploadBytes: number;
   maxQueryRows: number;
+  minFreeBytes: number;
   maxResultBytes: number;
   queryTimeoutMs: number;
   manifestSampleRows: number;
