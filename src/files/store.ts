@@ -1138,14 +1138,17 @@ export class FileStore {
     const records = [];
     for (const f of files) records.push({ ...f, record: await this.getOwnedRecord(f.fileId, requester) });
 
-    const inst = await DuckDBInstance.create(":memory:", { enable_external_access: "false", lock_configuration: "false" });
+    // ATTACH is a file operation, so external access must be on while the
+    // album's files are attached — and off, then locked, before any SQL the
+    // caller wrote can run. Same end state as `query`, reached in two steps.
+    const inst = await DuckDBInstance.create(":memory:");
     try {
       const conn = await inst.connect();
       try {
-        // Attach read-only, then lock configuration so the statement cannot attach anything else.
         for (const [i, r] of records.entries()) {
           await conn.run(`ATTACH ${sqlString(r.record.dbPath)} AS s${i} (READ_ONLY)`);
         }
+        await conn.run(`SET enable_external_access = false`);
         await conn.run(`SET lock_configuration = true`);
         // Top level = newest photo's tables.
         const newestTables = records[0].record.manifest.tables.map((t) => t.name);
