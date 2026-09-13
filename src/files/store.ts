@@ -673,7 +673,7 @@ export class FileStore {
    * about sections will render. Callers should put the primary one first.
    */
   async materializeDatasets(
-    datasets: { name: string; rows: Record<string, unknown>[] }[],
+    datasets: { name: string; rows: Record<string, unknown>[]; columns?: string[] }[],
     requester: Requester,
   ): Promise<FileManifest> {
     if (!Array.isArray(datasets) || datasets.length === 0) {
@@ -684,7 +684,9 @@ export class FileStore {
       (n, d) => n + (Array.isArray(d.rows) ? d.rows.length : 0),
       0,
     );
-    if (totalRows === 0) {
+    // Zero rows is allowed when at least one dataset declares its columns: a
+    // page snapshot of empty sheets is a real (empty) snapshot.
+    if (totalRows === 0 && !datasets.some((d) => Array.isArray(d.columns) && d.columns.length > 0)) {
       throw new FileStoreError(400, "Artifact has no rows.");
     }
     // Cap on the TOTAL across datasets — the limit protects the box, and it
@@ -709,7 +711,7 @@ export class FileStore {
       let n = 2;
       while (used.has(safe)) safe = `${safe}_${n++}`;
       used.add(safe);
-      return { safe, requested, rows: Array.isArray(d.rows) ? d.rows : [] };
+      return { safe, requested, rows: Array.isArray(d.rows) ? d.rows : [], columns: Array.isArray(d.columns) ? d.columns : [] };
     });
 
     const fileId = randomUUID();
@@ -726,7 +728,18 @@ export class FileStore {
         const conn = await inst.connect();
         tables = [];
         for (const [i, ds] of prepared.entries()) {
-          if (ds.rows.length === 0) continue; // skip empties rather than fail the whole artifact
+          if (ds.rows.length === 0) {
+            // No rows: create the table from its declared columns (all text,
+            // there is nothing to infer from) so queries against it run and
+            // return nothing. Without declared columns there is no table.
+            const cols = ds.columns.filter((c) => /^[A-Za-z_][A-Za-z0-9_]{0,62}$/.test(c));
+            if (cols.length === 0) continue;
+            await conn.run(`CREATE TABLE ${ds.safe} (${cols.map((c) => `"${c}" VARCHAR`).join(", ")})`);
+            const table = await this.describeTable(conn, ds.safe);
+            if (ds.requested && ds.requested !== ds.safe) table.sheetName = ds.requested;
+            tables.push(table);
+            continue;
+          }
           const tmp =
             i === 0 ? jsonPath : join(this.cfg.dir, `${fileId}.rows.${i}.json`);
           tempPaths.push(tmp);
@@ -750,6 +763,7 @@ export class FileStore {
       if (tables.length === 0) {
         throw new FileStoreError(400, "Artifact has no rows.");
       }
+      // Still honour "no datasets at all" but let all-empty-with-columns through.
 
       // Drop the temp sources — the DuckDB is the source of truth.
       await Promise.all(tempPaths.map((p) => rm(p, { force: true }).catch(() => {})));

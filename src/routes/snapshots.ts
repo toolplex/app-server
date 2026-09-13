@@ -43,6 +43,27 @@ export function pageResources(config: AppServerConfig, pageId: string): string[]
   return out;
 }
 
+/** Column keys the page's sections declare for a resource — the schema of an empty sheet. */
+export function declaredColumns(config: AppServerConfig, pageId: string, resource: string): string[] {
+  const page = config.pages[pageId];
+  if (!page) return [];
+  const out = new Set<string>();
+  const walk = (entries: unknown[]) => {
+    for (const e of entries) {
+      const list = Array.isArray(e) ? e : [e];
+      for (const s of list as Array<{ type?: string; source?: unknown; sections?: unknown[]; columns?: Array<{ key?: unknown }>; rowKey?: unknown }>) {
+        if (!s || typeof s !== "object") continue;
+        if (s.type === "group" && Array.isArray(s.sections)) { walk(s.sections); continue; }
+        if (s.source !== resource) continue;
+        if (typeof s.rowKey === "string") out.add(s.rowKey);
+        for (const c of s.columns ?? []) if (typeof c?.key === "string") out.add(c.key);
+      }
+    }
+  };
+  walk(page.sections as unknown[]);
+  return [...out].sort();
+}
+
 /** All rows of a resource under filters — cursor loop when the handler supports it, page loop otherwise. */
 export async function collectAllRows(
   definition: ResourceDefinition,
@@ -88,7 +109,19 @@ export function registerSnapshotRoutes(fastify: FastifyInstance, config: AppServ
     const maxRows = Math.min(HARD_MAX_ROWS, Math.max(1, Number(body.maxRows) || DEFAULT_MAX_ROWS));
     const filters = body.filters && typeof body.filters === "object" ? body.filters : undefined;
 
-    const datasets: { name: string; rows: Record<string, unknown>[] }[] = [];
+    // The sync is read BEFORE the rows. If the page refreshes while rows are
+    // being collected, the file holds (at least) the earlier sync's data and
+    // is labelled with it, so the newer sync is still evaluated next tick.
+    // Labelling with the later sync would skip it.
+    const readSync = async (): Promise<string | null> => {
+      try {
+        const ctx = page.context ? await page.context({ sections: [], user }) : null;
+        return ctx?.lastSync ?? null;
+      } catch { return null; }
+    };
+    const lastSync = await readSync();
+
+    const datasets: { name: string; rows: Record<string, unknown>[]; columns?: string[] }[] = [];
     const columns: Record<string, string[]> = {};
     const rowCounts: Record<string, number> = {};
     let budget = maxRows;
@@ -99,17 +132,17 @@ export function registerSnapshotRoutes(fastify: FastifyInstance, config: AppServ
         datasets.push({ name: resource, rows });
         columns[resource] = Object.keys(rows[0]).sort();
       } else {
-        columns[resource] = [];
+        // An empty sheet is still a sheet: the table must exist (with the
+        // columns the page declares for it) so a check that reads it sees
+        // zero rows rather than a missing table. Zero exceptions is the
+        // healthy state of an exceptions sheet, not an error.
+        const declared = declaredColumns(config, pageId, resource);
+        datasets.push({ name: resource, rows: [], columns: declared });
+        columns[resource] = declared;
       }
       rowCounts[resource] = rows.length;
       if (budget <= 0) break;
     }
-    // lastSync from the page's own context handler, same as /pages/freshness.
-    let lastSync: string | null = null;
-    try {
-      const ctx = page.context ? await page.context({ sections: [], user }) : null;
-      lastSync = ctx?.lastSync ?? null;
-    } catch { /* decorative here; the caller already knows the sync it polled */ }
     const takenAt = new Date().toISOString();
     datasets.push({ name: "__meta", rows: [{ page_id: pageId, taken_at: takenAt, last_sync: lastSync }] });
 
