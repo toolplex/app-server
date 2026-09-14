@@ -113,6 +113,34 @@ export function registerSnapshotRoutes(fastify: FastifyInstance, config: AppServ
     return reply.send(result);
   });
 
+  /**
+   * POST /snapshots/estimate — how big a photo would be, without taking it.
+   * One single-row fetch per resource, reading the `total` the handler
+   * reports (null when a handler can't count, e.g. a cursor-only source).
+   * ToolPlex asks before photographing a page an alert wants to watch, so a
+   * table of millions is refused with a reason instead of pulled in full.
+   */
+  fastify.post<{ Body: { pageId?: string; filters?: Record<string, string>; resources?: string[] } }>("/snapshots/estimate", async (request, reply) => {
+    const body = request.body ?? {};
+    const pageId = typeof body.pageId === "string" ? body.pageId : "";
+    const page = config.pages[pageId];
+    if (!page) return reply.code(404).send({ error: `Page "${pageId}" not found.` });
+    const user = readUserHeaders(request);
+    const wanted = Array.isArray(body.resources) && body.resources.length > 0 ? body.resources : pageResources(config, pageId);
+    const resources = wanted.filter((r) => config.resources[r]);
+    const filters = body.filters && typeof body.filters === "object" ? body.filters : undefined;
+    const totals: Record<string, number | null> = {};
+    for (const resource of resources) {
+      try {
+        const first = await config.resources[resource].fetch({ page: 1, pageSize: 1, filters, user });
+        totals[resource] = typeof first.total === "number" && Number.isFinite(first.total) ? first.total : null;
+      } catch {
+        totals[resource] = null;
+      }
+    }
+    return reply.send({ totals, hardMaxRows: HARD_MAX_ROWS });
+  });
+
   fastify.post<{
     Body: { pageId?: string; filters?: Record<string, string>; resources?: string[]; maxRows?: number; previousFileId?: string };
   }>("/snapshots", async (request, reply) => {
