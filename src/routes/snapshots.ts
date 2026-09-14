@@ -14,7 +14,8 @@
  */
 
 import type { FastifyInstance, FastifyRequest } from "fastify";
-import type { AppServerConfig, FetchRequest, ResourceDefinition } from "../types.js";
+import { appendFile, writeFile, rm } from "node:fs/promises";
+import type { AppServerConfig, ColumnFilter, FetchRequest, ResourceDefinition } from "../types.js";
 import { readUserHeaders, readOrgHeader } from "../user.js";
 import { FileStore, FileStoreError, type Requester } from "../files/store.js";
 import { validateFetchResponse } from "../validation.js";
@@ -64,7 +65,50 @@ export function declaredColumns(config: AppServerConfig, pageId: string, resourc
   return [...out].sort();
 }
 
-/** All rows of a resource under filters — cursor loop when the handler supports it, page loop otherwise. */
+/**
+ * Every row of a resource under filters, handed over a chunk at a time —
+ * cursor loop when the handler supports it, page loop otherwise. Nothing is
+ * kept here: the caller writes each chunk where it wants it, so a page of
+ * millions costs the memory of one chunk. Returns how many rows were passed.
+ */
+export async function streamAllRows(
+  definition: ResourceDefinition,
+  resource: string,
+  base: Pick<FetchRequest, "filters" | "columnFilters" | "sort" | "user">,
+  maxRows: number,
+  onChunk: (rows: Record<string, unknown>[]) => Promise<void>,
+): Promise<number> {
+  let count = 0;
+  const take = async (rows: Record<string, unknown>[]) => {
+    const room = maxRows - count;
+    if (room <= 0) return;
+    const part = rows.length > room ? rows.slice(0, room) : rows;
+    if (part.length === 0) return;
+    count += part.length;
+    await onChunk(part);
+  };
+  const first = await definition.fetch({ page: 1, pageSize: CHUNK, ...base });
+  validateFetchResponse(resource, first);
+  await take(first.rows);
+  if (first.nextCursor !== undefined && first.nextCursor !== null) {
+    let cursor: string | null = first.nextCursor;
+    while (cursor !== null && count < maxRows) {
+      const res = await definition.fetch({ page: 1, pageSize: CHUNK, ...base, cursor, skipTotal: true });
+      await take(res.rows);
+      cursor = res.nextCursor ?? null;
+    }
+  } else {
+    const total = Math.min(first.total ?? first.rows.length, maxRows);
+    const pages = Math.ceil(total / CHUNK);
+    for (let page = 2; page <= pages && count < maxRows; page++) {
+      const res = await definition.fetch({ page, pageSize: CHUNK, ...base, skipTotal: true });
+      await take(res.rows);
+    }
+  }
+  return count;
+}
+
+/** All rows of a resource under filters, in memory. Kept for callers that want an array; the photo route streams instead. */
 export async function collectAllRows(
   definition: ResourceDefinition,
   resource: string,
@@ -72,25 +116,35 @@ export async function collectAllRows(
   maxRows: number,
 ): Promise<Record<string, unknown>[]> {
   const rows: Record<string, unknown>[] = [];
-  const first = await definition.fetch({ page: 1, pageSize: CHUNK, ...base });
-  validateFetchResponse(resource, first);
-  for (const r of first.rows) { if (rows.length >= maxRows) break; rows.push(r); }
-  if (first.nextCursor !== undefined && first.nextCursor !== null) {
-    let cursor: string | null = first.nextCursor;
-    while (cursor !== null && rows.length < maxRows) {
-      const res = await definition.fetch({ page: 1, pageSize: CHUNK, ...base, cursor, skipTotal: true });
-      for (const r of res.rows) { if (rows.length >= maxRows) break; rows.push(r); }
-      cursor = res.nextCursor ?? null;
-    }
-  } else {
-    const total = Math.min(first.total ?? first.rows.length, maxRows);
-    const pages = Math.ceil(total / CHUNK);
-    for (let page = 2; page <= pages && rows.length < maxRows; page++) {
-      const res = await definition.fetch({ page, pageSize: CHUNK, ...base, skipTotal: true });
-      for (const r of res.rows) { if (rows.length >= maxRows) break; rows.push(r); }
-    }
-  }
+  await streamAllRows(definition, resource, base, maxRows, async (part) => { rows.push(...part); });
   return rows;
+}
+
+/** In-table column filters per resource from a request body, kept to the shape the handlers accept. */
+function readColumnFilters(raw: unknown): Record<string, ColumnFilter[]> {
+  const out: Record<string, ColumnFilter[]> = {};
+  if (!raw || typeof raw !== "object") return out;
+  for (const [resource, list] of Object.entries(raw as Record<string, unknown>)) {
+    if (!Array.isArray(list)) continue;
+    const clean = list.filter((f): f is ColumnFilter =>
+      !!f && typeof f === "object" && typeof (f as ColumnFilter).columnKey === "string"
+      && ["equals", "contains", "gt", "lt", "empty", "not_empty"].includes(String((f as ColumnFilter).operator))
+      && typeof (f as ColumnFilter).value === "string");
+    if (clean.length > 0) out[resource] = clean;
+  }
+  return out;
+}
+
+/** Column projection per resource from a request body: the columns a photo should keep. */
+function readProjection(raw: unknown): Record<string, Set<string>> {
+  const out: Record<string, Set<string>> = {};
+  if (!raw || typeof raw !== "object") return out;
+  for (const [resource, list] of Object.entries(raw as Record<string, unknown>)) {
+    if (!Array.isArray(list)) continue;
+    const cols = list.filter((c): c is string => typeof c === "string" && c.length > 0);
+    if (cols.length > 0) out[resource] = new Set(cols);
+  }
+  return out;
 }
 
 export function registerSnapshotRoutes(fastify: FastifyInstance, config: AppServerConfig, store: FileStore): void {
@@ -120,7 +174,7 @@ export function registerSnapshotRoutes(fastify: FastifyInstance, config: AppServ
    * ToolPlex asks before photographing a page an alert wants to watch, so a
    * table of millions is refused with a reason instead of pulled in full.
    */
-  fastify.post<{ Body: { pageId?: string; filters?: Record<string, string>; resources?: string[] } }>("/snapshots/estimate", async (request, reply) => {
+  fastify.post<{ Body: { pageId?: string; filters?: Record<string, string>; columnFilters?: Record<string, ColumnFilter[]>; resources?: string[] } }>("/snapshots/estimate", async (request, reply) => {
     const body = request.body ?? {};
     const pageId = typeof body.pageId === "string" ? body.pageId : "";
     const page = config.pages[pageId];
@@ -129,10 +183,11 @@ export function registerSnapshotRoutes(fastify: FastifyInstance, config: AppServ
     const wanted = Array.isArray(body.resources) && body.resources.length > 0 ? body.resources : pageResources(config, pageId);
     const resources = wanted.filter((r) => config.resources[r]);
     const filters = body.filters && typeof body.filters === "object" ? body.filters : undefined;
+    const columnFilters = readColumnFilters(body.columnFilters);
     const totals: Record<string, number | null> = {};
     for (const resource of resources) {
       try {
-        const first = await config.resources[resource].fetch({ page: 1, pageSize: 1, filters, user });
+        const first = await config.resources[resource].fetch({ page: 1, pageSize: 1, filters, columnFilters: columnFilters[resource], user });
         totals[resource] = typeof first.total === "number" && Number.isFinite(first.total) ? first.total : null;
       } catch {
         totals[resource] = null;
@@ -142,7 +197,12 @@ export function registerSnapshotRoutes(fastify: FastifyInstance, config: AppServ
   });
 
   fastify.post<{
-    Body: { pageId?: string; filters?: Record<string, string>; resources?: string[]; maxRows?: number; previousFileId?: string };
+    Body: {
+      pageId?: string; filters?: Record<string, string>; columnFilters?: Record<string, ColumnFilter[]>; resources?: string[];
+      /** Per resource, the columns to keep. Absent: every column. The row key columns must be among them; the caller knows which those are. */
+      columns?: Record<string, string[]>;
+      maxRows?: number; previousFileId?: string;
+    };
   }>("/snapshots", async (request, reply) => {
     const body = request.body ?? {};
     const pageId = typeof body.pageId === "string" ? body.pageId : "";
@@ -155,6 +215,8 @@ export function registerSnapshotRoutes(fastify: FastifyInstance, config: AppServ
     if (resources.length === 0) return reply.code(400).send({ error: "This page reads no resources." });
     const maxRows = Math.min(HARD_MAX_ROWS, Math.max(1, Number(body.maxRows) || HARD_MAX_ROWS));
     const filters = body.filters && typeof body.filters === "object" ? body.filters : undefined;
+    const columnFilters = readColumnFilters(body.columnFilters);
+    const projection = readProjection(body.columns);
 
     // The sync is read BEFORE the rows. If the page refreshes while rows are
     // being collected, the file holds (at least) the earlier sync's data and
@@ -185,33 +247,58 @@ export function registerSnapshotRoutes(fastify: FastifyInstance, config: AppServ
       } catch { /* no previous types */ }
     }
 
-    const datasets: { name: string; rows: Record<string, unknown>[]; columns?: string[]; columnTypes?: Record<string, string> }[] = [];
+    const datasets: Parameters<typeof store.materializeDatasets>[0] = [];
     const columns: Record<string, string[]> = {};
     const rowCounts: Record<string, number> = {};
+    const staged: string[] = [];
     let budget = maxRows;
+    try {
     for (const resource of resources) {
-      const rows = await collectAllRows(config.resources[resource], resource, { filters, user }, budget);
-      budget -= rows.length;
-      if (rows.length > 0) {
-        datasets.push({ name: resource, rows });
-        columns[resource] = Object.keys(rows[0]).sort();
+      // Each chunk goes straight to a staged file on the store's disk; the
+      // process never holds more than one chunk of any sheet.
+      const keep = projection[resource];
+      const project = keep
+        ? (r: Record<string, unknown>) => { const o: Record<string, unknown> = {}; for (const k of keep) if (k in r) o[k] = r[k]; return o; }
+        : (r: Record<string, unknown>) => r;
+      const path = await store.stagingPath();
+      staged.push(path);
+      await writeFile(path, "", "utf8");
+      let firstKeys: string[] | null = null;
+      const count = await streamAllRows(config.resources[resource], resource, { filters, columnFilters: columnFilters[resource], user }, budget, async (part) => {
+        const projected = part.map(project);
+        if (!firstKeys && projected.length > 0) firstKeys = Object.keys(projected[0]);
+        await appendFile(path, projected.map((r) => JSON.stringify(r)).join("\n") + "\n", "utf8");
+      });
+      budget -= count;
+      if (count > 0) {
+        datasets.push({ name: resource, sourcePath: path, rowCount: count });
+        columns[resource] = (firstKeys ?? []).slice().sort();
       } else {
+        await rm(path, { force: true }).catch(() => {});
+        staged.splice(staged.indexOf(path), 1);
         // An empty sheet is still a sheet: the table must exist (with the
         // columns the page declares for it) so a check that reads it sees
         // zero rows rather than a missing table. Zero exceptions is the
         // healthy state of an exceptions sheet, not an error.
-        const declared = declaredColumns(config, pageId, resource);
+        const declaredAll = declaredColumns(config, pageId, resource);
+        const declared = keep ? declaredAll.filter((c) => keep.has(c)) : declaredAll;
         datasets.push({ name: resource, rows: [], columns: declared, columnTypes: previousTypes[resource] });
         columns[resource] = declared;
       }
-      rowCounts[resource] = rows.length;
+      rowCounts[resource] = count;
       if (budget <= 0) break;
     }
     const takenAt = new Date().toISOString();
     datasets.push({ name: "__meta", rows: [{ page_id: pageId, taken_at: takenAt, last_sync: lastSync }] });
 
+    // materialize removes the staged files itself, on success and on failure.
     const manifest = await store.materializeDatasets(datasets, requester);
     return reply.send({ manifest, columns, rowCounts, lastSync, takenAt, truncated: budget <= 0 });
+    } catch (err) {
+      // A fetch that failed part-way leaves staged files behind: not ours to keep.
+      await Promise.all(staged.map((p) => rm(p, { force: true }).catch(() => {})));
+      throw err;
+    }
   });
 }
 

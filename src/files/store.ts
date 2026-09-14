@@ -675,18 +675,35 @@ export class FileStore {
    * table is named, so the FIRST dataset is what a client that knows nothing
    * about sections will render. Callers should put the primary one first.
    */
+  /**
+   * A path a caller may stream rows into (newline-delimited JSON) before
+   * handing it to materializeDatasets as `sourcePath`. On the store's own
+   * disk, so the load is a local read; removed by materialize on both paths.
+   */
+  async stagingPath(): Promise<string> {
+    await mkdir(this.cfg.dir, { recursive: true });
+    return join(this.cfg.dir, `${randomUUID()}.staged.json`);
+  }
+
   async materializeDatasets(
-    datasets: { name: string; rows: Record<string, unknown>[]; columns?: string[]; columnTypes?: Record<string, string> }[],
+    datasets: {
+      name: string;
+      /** Rows in memory, or… */
+      rows?: Record<string, unknown>[];
+      /** …a newline-delimited JSON file already written (by the caller, chunk by chunk), with its row count. */
+      sourcePath?: string;
+      rowCount?: number;
+      columns?: string[];
+      columnTypes?: Record<string, string>;
+    }[],
     requester: Requester,
   ): Promise<FileManifest> {
     if (!Array.isArray(datasets) || datasets.length === 0) {
       throw new FileStoreError(400, "Artifact has no datasets.");
     }
 
-    const totalRows = datasets.reduce(
-      (n, d) => n + (Array.isArray(d.rows) ? d.rows.length : 0),
-      0,
-    );
+    const countOf = (d: (typeof datasets)[number]) => (Array.isArray(d.rows) ? d.rows.length : d.sourcePath ? Math.max(0, Number(d.rowCount) || 0) : 0);
+    const totalRows = datasets.reduce((n, d) => n + countOf(d), 0);
     // Zero rows is allowed when at least one dataset declares its columns: a
     // page snapshot of empty sheets is a real (empty) snapshot.
     if (totalRows === 0 && !datasets.some((d) => Array.isArray(d.columns) && d.columns.length > 0)) {
@@ -718,10 +735,14 @@ export class FileStore {
         safe,
         requested,
         rows: Array.isArray(d.rows) ? d.rows : [],
+        sourcePath: typeof d.sourcePath === "string" && d.sourcePath ? d.sourcePath : null,
+        count: countOf(d),
         columns: Array.isArray(d.columns) ? d.columns : [],
         columnTypes: d.columnTypes && typeof d.columnTypes === "object" ? d.columnTypes : {},
       };
     });
+    // A staged file is the caller's until here; from here it is ours to remove.
+    const stagedPaths = prepared.map((p) => p.sourcePath).filter((p): p is string => !!p);
 
     const fileId = randomUUID();
     const jsonPath = join(this.cfg.dir, `${fileId}.rows.json`);
@@ -747,7 +768,7 @@ export class FileStore {
         const conn = await inst.connect();
         tables = [];
         for (const [i, ds] of prepared.entries()) {
-          if (ds.rows.length === 0) {
+          if (ds.count === 0) {
             // No rows: create the table from its declared columns so queries
             // against it run and return nothing. Types come from the caller
             // when it has them (the page's previous photo), else text — a
@@ -765,15 +786,20 @@ export class FileStore {
             tables.push(table);
             continue;
           }
-          const tmp =
-            i === 0 ? jsonPath : join(this.cfg.dir, `${fileId}.rows.${i}.json`);
-          tempPaths.push(tmp);
-          // Newline-delimited JSON written in chunks: memory stays flat at the
-          // chunk size whatever the row count (the ceiling is maxIngestRows).
-          await writeFile(tmp, "", "utf8");
-          const CHUNK = 20_000;
-          for (let i = 0; i < ds.rows.length; i += CHUNK) {
-            await appendFile(tmp, ds.rows.slice(i, i + CHUNK).map((r) => JSON.stringify(r)).join("\n") + "\n", "utf8");
+          let tmp: string;
+          if (ds.sourcePath) {
+            // Streamed by the caller: never held in memory here at all.
+            tmp = ds.sourcePath;
+          } else {
+            tmp = i === 0 ? jsonPath : join(this.cfg.dir, `${fileId}.rows.${i}.json`);
+            tempPaths.push(tmp);
+            // Newline-delimited JSON written in chunks: memory stays flat at the
+            // chunk size whatever the row count (the ceiling is maxIngestRows).
+            await writeFile(tmp, "", "utf8");
+            const CHUNK = 20_000;
+            for (let i = 0; i < ds.rows.length; i += CHUNK) {
+              await appendFile(tmp, ds.rows.slice(i, i + CHUNK).map((r) => JSON.stringify(r)).join("\n") + "\n", "utf8");
+            }
           }
           await conn.run(
             `CREATE TABLE ${ds.safe} AS SELECT * FROM read_json_auto(${sqlString(tmp)}, format='newline_delimited', maximum_object_size=16777216)`,
@@ -797,7 +823,7 @@ export class FileStore {
       // Still honour "no datasets at all" but let all-empty-with-columns through.
 
       // Drop the temp sources — the DuckDB is the source of truth.
-      await Promise.all(tempPaths.map((p) => rm(p, { force: true }).catch(() => {})));
+      await Promise.all([...tempPaths, ...stagedPaths].map((p) => rm(p, { force: true }).catch(() => {})));
 
       const safeTable = tables[0].name;
       const manifest: FileManifest = {
@@ -822,7 +848,7 @@ export class FileStore {
     } catch (err) {
       // Clean up every temp source, not just the first — a failure partway
       // through a multi-dataset write would otherwise strand the rest on disk.
-      await Promise.all(tempPaths.map((p) => rm(p, { force: true }).catch(() => {})));
+      await Promise.all([...tempPaths, ...stagedPaths].map((p) => rm(p, { force: true }).catch(() => {})));
       await rm(jsonPath, { force: true }).catch(() => {});
       await this.removeFiles(fileId, { uploadPath: jsonPath, dbPath } as FileRecord).catch(() => {});
       if (err instanceof FileStoreError) throw err;
