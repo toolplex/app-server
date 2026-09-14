@@ -114,7 +114,7 @@ export function registerSnapshotRoutes(fastify: FastifyInstance, config: AppServ
   });
 
   fastify.post<{
-    Body: { pageId?: string; filters?: Record<string, string>; resources?: string[]; maxRows?: number };
+    Body: { pageId?: string; filters?: Record<string, string>; resources?: string[]; maxRows?: number; previousFileId?: string };
   }>("/snapshots", async (request, reply) => {
     const body = request.body ?? {};
     const pageId = typeof body.pageId === "string" ? body.pageId : "";
@@ -140,7 +140,24 @@ export function registerSnapshotRoutes(fastify: FastifyInstance, config: AppServ
     };
     const lastSync = await readSync();
 
-    const datasets: { name: string; rows: Record<string, unknown>[]; columns?: string[] }[] = [];
+    // The page's previous photo, when the caller names it: an empty sheet
+    // today keeps the column types it had yesterday, so a check comparing a
+    // number still runs against it. Best effort — a missing or foreign file
+    // just means text columns.
+    const previousTypes: Record<string, Record<string, string>> = {};
+    if (typeof body.previousFileId === "string" && /^[0-9a-f-]{36}$/i.test(body.previousFileId)) {
+      try {
+        const prev = await store.getManifest(body.previousFileId, requester);
+        for (const t of prev.tables ?? []) {
+          const types: Record<string, string> = {};
+          for (const c of t.columns ?? []) types[c.name] = c.type;
+          previousTypes[t.sheetName || t.name] = types;
+          previousTypes[t.name] = types;
+        }
+      } catch { /* no previous types */ }
+    }
+
+    const datasets: { name: string; rows: Record<string, unknown>[]; columns?: string[]; columnTypes?: Record<string, string> }[] = [];
     const columns: Record<string, string[]> = {};
     const rowCounts: Record<string, number> = {};
     let budget = maxRows;
@@ -156,7 +173,7 @@ export function registerSnapshotRoutes(fastify: FastifyInstance, config: AppServ
         // zero rows rather than a missing table. Zero exceptions is the
         // healthy state of an exceptions sheet, not an error.
         const declared = declaredColumns(config, pageId, resource);
-        datasets.push({ name: resource, rows: [], columns: declared });
+        datasets.push({ name: resource, rows: [], columns: declared, columnTypes: previousTypes[resource] });
         columns[resource] = declared;
       }
       rowCounts[resource] = rows.length;

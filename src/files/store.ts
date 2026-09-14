@@ -676,7 +676,7 @@ export class FileStore {
    * about sections will render. Callers should put the primary one first.
    */
   async materializeDatasets(
-    datasets: { name: string; rows: Record<string, unknown>[]; columns?: string[] }[],
+    datasets: { name: string; rows: Record<string, unknown>[]; columns?: string[]; columnTypes?: Record<string, string> }[],
     requester: Requester,
   ): Promise<FileManifest> {
     if (!Array.isArray(datasets) || datasets.length === 0) {
@@ -714,7 +714,13 @@ export class FileStore {
       let n = 2;
       while (used.has(safe)) safe = `${safe}_${n++}`;
       used.add(safe);
-      return { safe, requested, rows: Array.isArray(d.rows) ? d.rows : [], columns: Array.isArray(d.columns) ? d.columns : [] };
+      return {
+        safe,
+        requested,
+        rows: Array.isArray(d.rows) ? d.rows : [],
+        columns: Array.isArray(d.columns) ? d.columns : [],
+        columnTypes: d.columnTypes && typeof d.columnTypes === "object" ? d.columnTypes : {},
+      };
     });
 
     const fileId = randomUUID();
@@ -742,12 +748,18 @@ export class FileStore {
         tables = [];
         for (const [i, ds] of prepared.entries()) {
           if (ds.rows.length === 0) {
-            // No rows: create the table from its declared columns (all text,
-            // there is nothing to infer from) so queries against it run and
-            // return nothing. Without declared columns there is no table.
+            // No rows: create the table from its declared columns so queries
+            // against it run and return nothing. Types come from the caller
+            // when it has them (the page's previous photo), else text — a
+            // numeric comparison against an all-text empty sheet is a binder
+            // error, not zero rows, and that parked an alert.
             const cols = ds.columns.filter((c) => /^[A-Za-z_][A-Za-z0-9_]{0,62}$/.test(c));
             if (cols.length === 0) continue;
-            await conn.run(`CREATE TABLE ${ds.safe} (${cols.map((c) => `"${c}" VARCHAR`).join(", ")})`);
+            const typeOf = (c: string) => {
+              const t = ds.columnTypes[c];
+              return typeof t === "string" && /^[A-Z][A-Z0-9_ (),\[\]]{0,60}$/.test(t) ? t : "VARCHAR";
+            };
+            await conn.run(`CREATE TABLE ${ds.safe} (${cols.map((c) => `"${c}" ${typeOf(c)}`).join(", ")})`);
             const table = await this.describeTable(conn, ds.safe);
             if (ds.requested && ds.requested !== ds.safe) table.sheetName = ds.requested;
             tables.push(table);
