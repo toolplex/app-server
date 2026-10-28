@@ -19,6 +19,10 @@ export const OFFICE_TEXT_MIME_TYPES = new Set([
   "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 ]);
 
+// The largest XML part we will inflate; a document body past this is not a
+// document anyone reads, and inflating it would take the box's memory.
+const MAX_XML_BYTES = 50 * 1024 * 1024;
+
 export async function extractOfficeText(buffer: Buffer, mimeType: string): Promise<TextExtractionResult | null> {
   if (!OFFICE_TEXT_MIME_TYPES.has(mimeType)) return null;
   const zip = await JSZip.loadAsync(buffer);
@@ -30,19 +34,47 @@ export async function extractOfficeText(buffer: Buffer, mimeType: string): Promi
 
 /** Paragraph text of the body, split into pages at explicit page breaks. */
 async function docxPages(zip: JSZip): Promise<string[]> {
-  const xml = await zip.file("word/document.xml")?.async("string");
+  let xml = await partXml(zip, "word/document.xml");
   if (!xml) return [];
+  // Word writes drawings twice (mc:Choice and a Fallback for old readers);
+  // keep one. A text box nests whole paragraphs inside a paragraph, which a
+  // flat paragraph split would cut in half — lift each box out, mark its
+  // place, and splice its paragraphs back in where it sat.
+  xml = xml.replace(/<mc:Fallback>[\s\S]*?<\/mc:Fallback>/g, "");
+  const boxes: string[] = [];
+  xml = xml.replace(/<w:txbxContent>([\s\S]*?)<\/w:txbxContent>/g, (_, inner: string) => {
+    boxes.push(paragraphs(inner).join("\n"));
+    return `<w:t>[[TXBX${boxes.length - 1}]]</w:t>`;
+  });
   const pages: string[] = [];
   let current: string[] = [];
-  for (const para of xml.match(/<w:p[\s>][\s\S]*?<\/w:p>|<w:p\/>/g) ?? []) {
+  for (const para of paragraphsXml(xml)) {
     if (/<w:br\b[^>]*w:type="page"/.test(para) || /<w:lastRenderedPageBreak\b/.test(para)) {
       if (current.length > 0) pages.push(current.join("\n"));
       current = [];
     }
-    current.push(runsText(para));
+    current.push(runsText(para).replace(/\[\[TXBX(\d+)\]\]/g, (_, i: string) => `\n${boxes[Number(i)] ?? ""}\n`));
   }
   if (current.length > 0) pages.push(current.join("\n"));
   return pages;
+}
+
+function paragraphsXml(xml: string): string[] {
+  return xml.match(/<w:p[\s>][\s\S]*?<\/w:p>|<w:p\/>/g) ?? [];
+}
+
+/** Text of each <w:p> in a fragment, in order. */
+function paragraphs(xml: string): string[] {
+  return paragraphsXml(xml).map((p) => runsText(p));
+}
+
+/** One XML part as a string, or null when absent or too large to inflate. */
+async function partXml(zip: JSZip, path: string): Promise<string | null> {
+  const entry = zip.file(path);
+  if (!entry) return null;
+  const size = (entry as unknown as { _data?: { uncompressedSize?: number } })._data?.uncompressedSize;
+  if (typeof size === "number" && size > MAX_XML_BYTES) return null;
+  return entry.async("string");
 }
 
 /** One page per slide, in slide order, titled "Slide N". */
@@ -53,12 +85,12 @@ async function pptxSlides(zip: JSZip): Promise<string[]> {
     .sort((a, b) => a.n - b.n);
   const pages: string[] = [];
   for (const { name, n } of slideFiles) {
-    const xml = await zip.file(name)?.async("string");
+    const xml = await partXml(zip, name);
     if (!xml) continue;
-    const paragraphs = (xml.match(/<a:p[\s>][\s\S]*?<\/a:p>/g) ?? [])
+    const lines = (xml.match(/<a:p[\s>][\s\S]*?<\/a:p>/g) ?? [])
       .map((p) => runsText(p))
       .filter((t) => t.trim().length > 0);
-    pages.push([`Slide ${n}`, ...paragraphs].join("\n"));
+    pages.push([`Slide ${n}`, ...lines].join("\n"));
   }
   return pages;
 }

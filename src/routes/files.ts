@@ -31,7 +31,7 @@ export function registerFileRoutes(
   // An `X-Upload-Id` header (a UUID the client minted) makes the upload
   // idempotent — see FileStore.ingest.
   fastify.post<{ Querystring: { pinned?: string } }>("/files", async (request, reply) => {
-    const file = await readFirstFile(request);
+    const file = await readFirstFile(request, store.config.maxUploadBytes);
     if (!file) {
       return reply.code(400).send({ error: "No file found in the upload." });
     }
@@ -429,7 +429,9 @@ function requesterOf(request: FastifyRequest): Requester {
 export function contentDisposition(name: string): string {
   const clean = (name || "download").replace(/[\r\n"]/g, "").slice(0, 200) || "download";
   const ascii = clean.replace(/[^\x20-\x7e]/g, "_");
-  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(clean)}`;
+  // RFC 5987 also wants !'()* percent-encoded; encodeURIComponent leaves them.
+  const encoded = encodeURIComponent(clean).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encoded}`;
 }
 
 /**
@@ -437,7 +439,7 @@ export function contentDisposition(name: string): string {
  * route's parsing but only cares about the file — ids/filters/params aren't
  * meaningful for a raw attachment upload.
  */
-async function readFirstFile(request: FastifyRequest): Promise<UploadedFile | null> {
+async function readFirstFile(request: FastifyRequest, maxBytes: number): Promise<UploadedFile | null> {
   const contentType = request.headers["content-type"] ?? "";
   if (!contentType.startsWith("multipart/form-data")) {
     throw new FileStoreError(
@@ -457,7 +459,9 @@ async function readFirstFile(request: FastifyRequest): Promise<UploadedFile | nu
     );
   }
 
-  for await (const part of reqWithParts.parts()) {
+  // The store's cap applies at the parser, so an oversized upload is cut off
+  // while streaming (413) instead of buffered whole and then refused.
+  for await (const part of reqWithParts.parts({ limits: { fileSize: maxBytes } })) {
     if (part.type === "file") {
       const buffer = await part.toBuffer();
       return {

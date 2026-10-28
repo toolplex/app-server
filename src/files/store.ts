@@ -82,7 +82,11 @@ const EXPORT_STEP_TIMEOUT_MS = 60_000;
 // Scratch files (per-sheet CSVs, staged rows, record temp files) older than
 // this are leftovers of a crash, never a write in progress.
 const SCRATCH_MAX_AGE_MS = 60 * 60_000;
-const SCRATCH_SUFFIX = /(\.json\.\d+\.tmp|\.staged\.json|\.rows(\.\d+)?\.json|__[^/]+\.csv|\.ocr-(in|out)\.pdf)$/;
+const SCRATCH_SUFFIX = /(\.json\.\d+\.tmp|\.staged\.json|\.rows(\.\d+)?\.json|\.export\.csv|__[^/]+\.csv|\.ocr-(in|out)\.pdf)$/;
+// DuckDB spill space: one leaf per instance under this, inside the store (never
+// the OS temp dir). Two instances sharing one spill directory corrupt each
+// other's files and take the process down with them.
+const SPILL_DIR = ".duckdb-tmp";
 // Columns a worksheet keeps. Real sheets have tens; a "used range" that a stray
 // format stretched to thousands is noise, and past this it is only cost.
 const MAX_SHEET_COLUMNS = 2000;
@@ -105,10 +109,22 @@ const QUERY_INSTANCE_CONFIG = {
 // nothing to configure.
 // ---------------------------------------------------------------------------
 const HOST_CORES = Math.max(1, cpus().length);
-const INSTANCE_MEMORY_MB = Math.min(1024, Math.max(128, Math.floor(totalmem() / (8 * 1024 * 1024))));
-const INSTANCE_THREADS = String(Math.min(HOST_CORES, 4));
-const QUERY_SLOTS = HOST_CORES <= 2 ? 2 : Math.min(4, Math.ceil(HOST_CORES / 2));
+const HOST_MEM_BYTES = totalmem();
 const SPILL_MAX = "2GB";
+
+/**
+ * What one host can afford. Small boxes (under 4 GB) run one query at a time;
+ * each instance's memory limit is a share of RAM across the query slots, the
+ * concurrent ingests the consumer allows, and two more for Node and an upload
+ * in flight — so the worst case stays inside a 1.5 GB process ceiling on a
+ * 2 GB box and scales up on a workstation.
+ */
+function hostBounds(maxConcurrentIngests: number): { slots: number; memoryMb: number; threads: string } {
+  const slots = HOST_MEM_BYTES < 4 * 1024 ** 3 ? 1 : HOST_CORES <= 2 ? 2 : Math.min(4, Math.ceil(HOST_CORES / 2));
+  const share = HOST_MEM_BYTES / (slots + maxConcurrentIngests + 2);
+  const memoryMb = Math.min(1024, Math.max(128, Math.floor(share / 1024 ** 2)));
+  return { slots, memoryMb, threads: String(Math.min(HOST_CORES, 4)) };
+}
 
 /** A counting semaphore; `acquire` resolves with the matching release. */
 class Slots {
@@ -116,7 +132,9 @@ class Slots {
   private used = 0;
   constructor(private readonly size: number) {}
   async acquire(): Promise<() => void> {
-    if (this.used >= this.size) await new Promise<void>((wake) => this.waiting.push(wake));
+    // Loop, not if: a newcomer can take the slot between a release and the
+    // woken waiter's turn, so the waiter checks again before counting itself.
+    while (this.used >= this.size) await new Promise<void>((wake) => this.waiting.push(wake));
     this.used++;
     let done = false;
     return () => {
@@ -133,8 +151,9 @@ export class FileStore {
   private sweepTimer?: NodeJS.Timeout;
   /** Ingests currently in flight in this process (concurrency guard). */
   private activeIngests = 0;
-  /** Read paths in flight (queries, pages, exports); see QUERY_SLOTS. */
-  private readonly querySlots = new Slots(QUERY_SLOTS);
+  /** Host-derived limits (see hostBounds) and the read-path slots they allow. */
+  private readonly bounds: ReturnType<typeof hostBounds>;
+  private readonly querySlots: Slots;
   /** Uploads in flight by client-chosen id; a retry awaits the first instead of ingesting twice. */
   private readonly inflight = new Map<string, Promise<FileManifest>>();
 
@@ -160,18 +179,26 @@ export class FileStore {
       // in init() (realpath needs the path to exist).
       reportDirs: (config.reportDirs ?? []).map((d) => resolvePath(d)),
     };
+    this.bounds = hostBounds(this.cfg.maxConcurrentIngests);
+    this.querySlots = new Slots(this.bounds.slots);
   }
 
   get config(): ResolvedFilesConfig {
     return this.cfg;
   }
 
-  /** Resource bounds every DuckDB instance gets (see HOST_CORES above). */
+  /**
+   * Resource bounds every DuckDB instance gets (see hostBounds). The spill
+   * directory is a fresh leaf per instance: DuckDB names spill files by a
+   * per-instance index, so two instances in one directory open the same file
+   * and crash the process. DuckDB creates the leaf on first spill and removes
+   * it on close; init() makes sure the parent exists.
+   */
   private boundsConfig(): Record<string, string> {
     return {
-      memory_limit: `${INSTANCE_MEMORY_MB}MB`,
-      threads: INSTANCE_THREADS,
-      temp_directory: join(this.cfg.dir, ".duckdb-tmp"),
+      memory_limit: `${this.bounds.memoryMb}MB`,
+      threads: this.bounds.threads,
+      temp_directory: join(this.cfg.dir, SPILL_DIR, `${process.pid}-${randomUUID()}`),
       max_temp_directory_size: SPILL_MAX,
     };
   }
@@ -238,7 +265,7 @@ export class FileStore {
           `persistent path.`,
       );
     }
-    await mkdir(this.cfg.dir, { recursive: true });
+    await mkdir(join(this.cfg.dir, SPILL_DIR), { recursive: true });
     // Resolve symlinks in the allowlist roots so the containment check below
     // compares realpaths on both sides. Roots that don't exist are dropped —
     // they can't be an ancestor of any real file anyway.
@@ -312,6 +339,15 @@ export class FileStore {
       const mtime = await stat(path).then((st) => st.mtimeMs).catch(() => Date.now());
       if (mtime >= cutoff) continue;
       await rm(path, { force: true }).catch(() => {});
+      removed++;
+    }
+    // Spill leaves outlive their instance only when the process died mid-query.
+    const spillRoot = join(this.cfg.dir, SPILL_DIR);
+    for (const leaf of await readdir(spillRoot).catch(() => [] as string[])) {
+      const path = join(spillRoot, leaf);
+      const mtime = await stat(path).then((st) => st.mtimeMs).catch(() => Date.now());
+      if (mtime >= cutoff) continue;
+      await rm(path, { recursive: true, force: true }).catch(() => {});
       removed++;
     }
     if (removed > 0) log(`file cleanup: removed ${removed} leftover scratch file(s)`);
@@ -419,6 +455,7 @@ export class FileStore {
       } catch (err) {
         // Ingestion failed — leave nothing behind.
         await this.removeFiles(fileId, { uploadPath, dbPath } as FileRecord);
+        if (err instanceof FileStoreError) throw err;
         throw new FileStoreError(
           422,
           `Could not process file: ${err instanceof Error ? err.message : String(err)}`,
@@ -1524,16 +1561,21 @@ export class FileStore {
           const result = await bounded(conn.stream(sql));
           columns = result.columnNames();
           const out = lineWriter(staged);
-          for (;;) {
-            const chunk = await bounded(result.fetchChunk());
-            if (!chunk || chunk.rowCount === 0) break;
-            rowCount += chunk.rowCount;
-            if (rowCount > this.cfg.maxIngestRows) {
-              throw new FileStoreError(413, `Result has too many rows. Maximum is ${this.cfg.maxIngestRows.toLocaleString()}.`);
+          try {
+            for (;;) {
+              const chunk = await bounded(result.fetchChunk());
+              if (!chunk || chunk.rowCount === 0) break;
+              rowCount += chunk.rowCount;
+              if (rowCount > this.cfg.maxIngestRows) {
+                throw new FileStoreError(413, `Result has too many rows. Maximum is ${this.cfg.maxIngestRows.toLocaleString()}.`);
+              }
+              await out.write(chunk.getRowObjects(columns).map((r) => JSON.stringify(normalizeRow(r))).join("\n") + "\n");
             }
-            await out.write(chunk.getRowObjects(columns).map((r) => JSON.stringify(normalizeRow(r))).join("\n") + "\n");
+            await out.end();
+          } catch (err) {
+            out.destroy();
+            throw err;
           }
-          await out.end();
         },
         { timeoutMs: EXPORT_STEP_TIMEOUT_MS },
       );
@@ -1557,25 +1599,30 @@ export class FileStore {
         const names = result.columnNames();
         const out = lineWriter(outPath);
         const line = (row: Record<string, unknown>) => names.map((c) => csvField(csvText(row[c]))).join(",") + "\r\n";
-        await out.write("\uFEFF" + names.map(csvField).join(",") + "\r\n");
-        let heldEmpty = "";
-        for (;;) {
-          const chunk = await bounded(result.fetchChunk());
-          if (!chunk || chunk.rowCount === 0) break;
-          let text = "";
-          for (const raw of chunk.getRowObjects(names)) {
-            const row = normalizeRow(raw);
-            const l = line(row);
-            if (names.every((c) => csvText(row[c]) === "")) {
-              heldEmpty += l;
-            } else {
-              text += heldEmpty + l;
-              heldEmpty = "";
+        try {
+          await out.write("\uFEFF" + names.map(csvField).join(",") + "\r\n");
+          let heldEmpty = "";
+          for (;;) {
+            const chunk = await bounded(result.fetchChunk());
+            if (!chunk || chunk.rowCount === 0) break;
+            let text = "";
+            for (const raw of chunk.getRowObjects(names)) {
+              const row = normalizeRow(raw);
+              const l = line(row);
+              if (names.every((c) => csvText(row[c]) === "")) {
+                heldEmpty += l;
+              } else {
+                text += heldEmpty + l;
+                heldEmpty = "";
+              }
             }
+            if (text) await out.write(text);
           }
-          if (text) await out.write(text);
+          await out.end();
+        } catch (err) {
+          out.destroy();
+          throw err;
         }
-        await out.end();
       },
       { timeoutMs: EXPORT_STEP_TIMEOUT_MS },
     );
@@ -1917,11 +1964,17 @@ function csvField(s: string): string {
 }
 
 /** Append-only UTF-8 text file with awaited writes, so memory stays at one chunk. */
-function lineWriter(path: string): { write: (text: string) => Promise<void>; end: () => Promise<void> } {
+function lineWriter(path: string): {
+  write: (text: string) => Promise<void>;
+  end: () => Promise<void>;
+  /** Release the descriptor after a failure; `end` already closed it on success. */
+  destroy: () => void;
+} {
   const out = createWriteStream(path, { encoding: "utf8" });
   return {
     write: (text) => new Promise((done, fail) => out.write(text, (err) => (err ? fail(err) : done()))),
     end: () => new Promise((done, fail) => out.end((err?: Error | null) => (err ? fail(err) : done()))),
+    destroy: () => out.destroy(),
   };
 }
 
@@ -1951,13 +2004,17 @@ async function loadJsonTable(conn: DuckDBConnection, table: string, path: string
     // A column whose values disagree (numbers, then "N/A") comes out as JSON,
     // which reads back as quoted text. Plain text is what a person and the
     // agent expect; convert it in place and say so.
-    const mixed = (await conn.runAndReadAll(`SELECT column_name FROM (DESCRIBE ${table}) WHERE column_type = 'JSON'`))
+    // An all-NULL column also comes out as JSON; it becomes text quietly.
+    const jsonColumns = (await conn.runAndReadAll(`SELECT column_name FROM (DESCRIBE ${table}) WHERE column_type = 'JSON'`))
       .getRowObjects()
       .map((r) => String(r.column_name));
-    for (const c of mixed) {
+    let mixed = false;
+    for (const c of jsonColumns) {
+      const filled = (await conn.runAndReadAll(`SELECT count(*) AS n FROM ${table} WHERE ${quoteIdent(c)} IS NOT NULL`)).getRowObjects()[0];
+      if (Number(filled?.n ?? 0) > 0) mixed = true;
       await conn.run(`ALTER TABLE ${table} ALTER COLUMN ${quoteIdent(c)} SET DATA TYPE VARCHAR USING ${quoteIdent(c)}->>'$'`);
     }
-    return mixed.length > 0;
+    return mixed;
   } catch (err) {
     const cols = columns.filter((c) => /^[A-Za-z_][A-Za-z0-9_]{0,62}$/.test(c));
     if (cols.length === 0) throw err;
@@ -2015,17 +2072,22 @@ async function writeSheetCsv(
 
   const out = lineWriter(csvPath);
   const CHUNK = 5000;
-  for (let i = headerIndex; i < rows.length; i += CHUNK) {
-    const text = rows
-      .slice(i, i + CHUNK)
-      .map((vals) => {
-        const padded = vals.length < width ? vals.concat(new Array(width - vals.length).fill("")) : vals;
-        return padded.map(csvField).join(",");
-      })
-      .join("\n") + "\n";
-    await out.write(text);
+  try {
+    for (let i = headerIndex; i < rows.length; i += CHUNK) {
+      const text = rows
+        .slice(i, i + CHUNK)
+        .map((vals) => {
+          const padded = vals.length < width ? vals.concat(new Array(width - vals.length).fill("")) : vals;
+          return padded.map(csvField).join(",");
+        })
+        .join("\n") + "\n";
+      await out.write(text);
+    }
+    await out.end();
+  } catch (err) {
+    out.destroy();
+    throw err;
   }
-  await out.end();
   return { dataRows: rows.length - headerIndex - 1, skippedTitleRows, droppedColumns: Math.max(0, maxCol - MAX_SHEET_COLUMNS) };
 }
 

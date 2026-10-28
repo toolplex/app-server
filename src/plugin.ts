@@ -59,9 +59,9 @@ async function appServerPlugin(
     });
     await fastify.register(multipartModule.default, {
       limits: {
-        // The same cap the store enforces, so an oversized upload is refused
-        // at the parser instead of buffered whole and then rejected.
-        fileSize: config.files?.maxUploadBytes ?? 100 * 1024 * 1024,
+        // Action file inputs keep their 100 MB; smart-file uploads apply the
+        // store's own cap per request (routes/files.ts readFirstFile).
+        fileSize: Math.max(100 * 1024 * 1024, config.files?.maxUploadBytes ?? 0),
         files: 50,
       },
     });
