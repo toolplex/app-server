@@ -1,4 +1,5 @@
 import { createReadStream } from "node:fs";
+import { rm } from "node:fs/promises";
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
@@ -26,6 +27,9 @@ export function registerFileRoutes(
   // Uploads are PINNED (durable) by default since 0.8.0: user files are
   // never TTL-swept — they live until explicitly deleted. A caller that
   // genuinely wants scratch semantics opts out with ?pinned=false.
+  //
+  // An `X-Upload-Id` header (a UUID the client minted) makes the upload
+  // idempotent — see FileStore.ingest.
   fastify.post<{ Querystring: { pinned?: string } }>("/files", async (request, reply) => {
     const file = await readFirstFile(request);
     if (!file) {
@@ -34,6 +38,7 @@ export function registerFileRoutes(
     const pinned = request.query?.pinned !== "false";
     const manifest = await store.ingest(file.filename, file.buffer, requesterOf(request), {
       pinned,
+      fileId: uploadIdOf(request),
     });
     return reply.send({ manifest });
   });
@@ -44,14 +49,13 @@ export function registerFileRoutes(
   // them across turns via read_attachment. Multipart is not required because
   // the caller (cloud-agent) already has the bytes in memory as base64.
   //
-  // bodyLimit is 150MB: FileStore.maxUploadBytes caps at 100MB per file, and
-  // base64 expands the payload by 4/3 (plus JSON envelope). The host Fastify
-  // instance's default bodyLimit is 1MB — without this per-route override,
-  // real-world PDFs (5MB+) would be rejected before reaching the handler
-  // with an unhelpful "Request body is too large".
+  // bodyLimit follows maxUploadBytes: base64 expands the payload by 4/3, plus
+  // the JSON envelope. The host Fastify instance's default bodyLimit is 1MB —
+  // without this per-route override, real-world PDFs (5MB+) would be rejected
+  // before reaching the handler with an unhelpful "Request body is too large".
   fastify.post<{
     Body: { filename?: string; mimeType?: string; dataBase64?: string; pinned?: boolean };
-  }>("/files/raw", { bodyLimit: 150 * 1024 * 1024 }, async (request, reply) => {
+  }>("/files/raw", { bodyLimit: Math.ceil(store.config.maxUploadBytes * 1.4) + 1024 * 1024 }, async (request, reply) => {
     const body = request.body || {};
     if (typeof body.filename !== "string" || body.filename.length === 0) {
       return reply.code(400).send({ error: "Body must include a 'filename' string." });
@@ -77,6 +81,7 @@ export function registerFileRoutes(
     const manifest = await store.ingest(body.filename, buffer, requesterOf(request), {
       rawMimeType: body.mimeType,
       pinned: body.pinned !== false,
+      fileId: uploadIdOf(request),
     });
     return reply.send({ manifest });
   });
@@ -97,38 +102,36 @@ export function registerFileRoutes(
   );
 
   // POST /files/:id/query — run one read-only SQL statement against the file.
-  fastify.post<{ Params: { id: string }; Body: { sql?: string } }>(
-    "/files/:id/query",
-    async (request, reply) => {
-      const sql = request.body?.sql;
-      if (typeof sql !== "string") {
-        return reply.code(400).send({ error: "Body must include a 'sql' string." });
-      }
-      const result = await store.query(request.params.id, sql, requesterOf(request));
-      return reply.send(result);
-    },
-  );
+  // An artifact is a file in the same store, so /artifacts/:id/query is the
+  // same handler under its older name.
+  const queryHandler = async (
+    request: FastifyRequest<{ Params: { id: string }; Body: { sql?: string } }>,
+    reply: FastifyReply,
+  ) => {
+    const sql = request.body?.sql;
+    if (typeof sql !== "string") {
+      return reply.code(400).send({ error: "Body must include a 'sql' string." });
+    }
+    return reply.send(await store.query(request.params.id, sql, requesterOf(request)));
+  };
+  fastify.post("/files/:id/query", queryHandler);
+  fastify.post("/artifacts/:id/query", queryHandler);
 
   // GET /files/:id/raw — stream a file's ORIGINAL bytes, any kind. Raw/text
   // serves the cloud-agent's read_attachment (re-inject bytes into a later
   // LLM turn); tabular serves the original workbook/CSV for downloads from
   // chat file links, attachment tiles, and page file cells (queries still go
-  // through /query). `.replace(/[\r\n"]/g, "")` on the Content-Disposition
-  // filename guards against header injection via crafted uploaded filenames
-  // (defense-in-depth; the call chain is auth-gated).
+  // through /query).
   fastify.get<{ Params: { id: string } }>(
     "/files/:id/raw",
     async (request, reply) => {
-      const { manifest, uploadPath } = await store.getRawOrTextBytes(
+      const { manifest, uploadPath, sizeBytes } = await store.getRawOrTextBytes(
         request.params.id,
         requesterOf(request),
       );
       reply.header("Content-Type", manifest.mimeType || "application/octet-stream");
-      reply.header("Content-Length", String(manifest.sizeBytes));
-      reply.header(
-        "Content-Disposition",
-        `attachment; filename="${manifest.filename.replace(/[\r\n"]/g, "")}"`,
-      );
+      reply.header("Content-Length", String(sizeBytes));
+      reply.header("Content-Disposition", contentDisposition(manifest.filename));
       return reply.send(createReadStream(uploadPath));
     },
   );
@@ -156,13 +159,14 @@ export function registerFileRoutes(
 
   // DELETE /files/:id — remove an upload (powers the desktop's cancel/remove).
   // Idempotent: deleting an unknown / expired file is a success.
-  fastify.delete<{ Params: { id: string } }>(
-    "/files/:id",
-    async (request, reply) => {
-      await store.delete(request.params.id, requesterOf(request));
-      return reply.send({ deleted: true });
-    },
-  );
+  // DELETE /files/:id — remove a file and its data. Idempotent; /artifacts/:id
+  // is the same handler under its older name.
+  const deleteHandler = async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
+    await store.delete(request.params.id, requesterOf(request));
+    return reply.send({ deleted: true });
+  };
+  fastify.delete("/files/:id", deleteHandler);
+  fastify.delete("/artifacts/:id", deleteHandler);
 
   // -------------------------------------------------------------------------
   // Artifacts — durable, pinned snapshots (never TTL-swept). Same DuckDB store
@@ -171,9 +175,11 @@ export function registerFileRoutes(
 
   // POST /artifacts — materialize JSON rows into a pinned DuckDB snapshot.
   //
-  // Two body shapes:
+  // Three body shapes:
   //   { tableName?, rows[] }   single dataset (original; still the common case)
   //   { datasets: [{ name, rows[] }, …] }   several, for composite artifacts
+  //   { tableName?, source: { fileId, sql } }   the result of a read-only query
+  //       over an existing file, streamed server-side (an attachment → report)
   //
   // With `datasets`, ORDER MATTERS: the first is what a client that doesn't
   // understand sections will render, because `selectTable` defaults to
@@ -183,10 +189,25 @@ export function registerFileRoutes(
       tableName?: string;
       rows?: Record<string, unknown>[];
       datasets?: { name?: string; rows?: Record<string, unknown>[] }[];
+      source?: { fileId?: string; sql?: string };
     };
   }>(
     "/artifacts",
     async (request, reply) => {
+      const source = request.body?.source;
+      if (source) {
+        if (typeof source.fileId !== "string" || typeof source.sql !== "string") {
+          return reply.code(400).send({ error: "'source' must include 'fileId' and 'sql' strings." });
+        }
+        const manifest = await store.materializeFromQuery(
+          source.fileId,
+          source.sql,
+          request.body?.tableName || "data",
+          requesterOf(request),
+        );
+        return reply.send({ manifest });
+      }
+
       const datasets = request.body?.datasets;
 
       if (Array.isArray(datasets)) {
@@ -241,18 +262,6 @@ export function registerFileRoutes(
   );
 
   // POST /artifacts/:id/query — run one read-only SQL statement (ask follow-ups).
-  fastify.post<{ Params: { id: string }; Body: { sql?: string } }>(
-    "/artifacts/:id/query",
-    async (request, reply) => {
-      const sql = request.body?.sql;
-      if (typeof sql !== "string") {
-        return reply.code(400).send({ error: "Body must include a 'sql' string." });
-      }
-      const result = await store.query(request.params.id, sql, requesterOf(request));
-      return reply.send(result);
-    },
-  );
-
   // GET /artifacts/:id/data — the artifact's rows for the viewer (SELECT * LIMIT).
   // ?table= selects a sheet (name or original sheetName); default = first.
   fastify.get<{ Params: { id: string }; Querystring: { limit?: string; table?: string } }>(
@@ -285,10 +294,7 @@ export function registerFileRoutes(
         "Content-Type",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
       );
-      reply.header(
-        "Content-Disposition",
-        `attachment; filename="${sanitizeFilename(info.filename)}"`,
-      );
+      reply.header("Content-Disposition", contentDisposition(info.filename));
       return reply.send(createReadStream(info.path));
     },
   );
@@ -304,17 +310,15 @@ export function registerFileRoutes(
         table: request.query.table,
       });
       reply.header("Content-Type", out.contentType);
-      reply.header("Content-Disposition", `attachment; filename="${sanitizeFilename(out.filename)}"`);
+      reply.header("Content-Disposition", contentDisposition(out.filename));
+      if ("path" in out) {
+        // Streamed from a scratch file that goes away once the bytes are out.
+        const stream = createReadStream(out.path);
+        stream.once("close", () => void rm(out.path, { force: true }).catch(() => {}));
+        return reply.send(stream);
+      }
+      if (out.truncated) reply.header("X-Truncated", "true");
       return reply.send(out.buffer);
-    },
-  );
-
-  // DELETE /artifacts/:id — remove a pinned snapshot. Idempotent.
-  fastify.delete<{ Params: { id: string } }>(
-    "/artifacts/:id",
-    async (request, reply) => {
-      await store.delete(request.params.id, requesterOf(request));
-      return reply.send({ deleted: true });
     },
   );
 
@@ -401,6 +405,13 @@ export function registerFileRoutes(
   void config;
 }
 
+/** The client-minted upload id, when the request carries one. */
+function uploadIdOf(request: FastifyRequest): string | undefined {
+  const raw = request.headers["x-upload-id"];
+  const id = Array.isArray(raw) ? raw[0] : raw;
+  return typeof id === "string" && id.length > 0 ? id : undefined;
+}
+
 function requesterOf(request: FastifyRequest): Requester {
   const user = readUserHeaders(request);
   // Org read independently of user identity (see readOrgHeader): step 1 of
@@ -409,9 +420,16 @@ function requesterOf(request: FastifyRequest): Requester {
   return { userId: user?.id, orgId: user?.orgId ?? readOrgHeader(request) };
 }
 
-/** Strip CR/LF/quotes so a filename is safe inside a Content-Disposition header. */
-function sanitizeFilename(name: string): string {
-  return name.replace(/[\r\n"]/g, "").slice(0, 200) || "download";
+/**
+ * Content-Disposition for a download. Node refuses a header with a character
+ * outside Latin-1, so a name like "Q3 — summary.xlsx" or "報告.csv" used to
+ * 500 the download. RFC 5987: an ASCII fallback in `filename=` and the real
+ * name, percent-encoded UTF-8, in `filename*=`. Every download route uses this.
+ */
+export function contentDisposition(name: string): string {
+  const clean = (name || "download").replace(/[\r\n"]/g, "").slice(0, 200) || "download";
+  const ascii = clean.replace(/[^\x20-\x7e]/g, "_");
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(clean)}`;
 }
 
 /**

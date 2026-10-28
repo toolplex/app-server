@@ -8,9 +8,7 @@ import { registerDataRoutes } from "./routes/data.js";
 import { registerActionRoutes } from "./routes/actions.js";
 import { registerContextRoutes } from "./routes/context.js";
 import { registerDownloadRoutes } from "./routes/download.js";
-import { registerFileRoutes } from "./routes/files.js";
-import { registerSnapshotRoutes } from "./routes/snapshots.js";
-import { FileStore } from "./files/store.js";
+import type { FileStore } from "./files/store.js";
 import { createRequire } from "node:module";
 
 const PKG_VERSION: string = (() => {
@@ -61,8 +59,9 @@ async function appServerPlugin(
     });
     await fastify.register(multipartModule.default, {
       limits: {
-        // 100MB per file is plenty for distributor Excel uploads.
-        fileSize: 100 * 1024 * 1024,
+        // The same cap the store enforces, so an oversized upload is refused
+        // at the parser instead of buffered whole and then rejected.
+        fileSize: config.files?.maxUploadBytes ?? 100 * 1024 * 1024,
         files: 50,
       },
     });
@@ -87,10 +86,29 @@ async function appServerPlugin(
   fastify.get("/capabilities", async () => ({
     version: PKG_VERSION,
     capabilities,
-    ...(storeForStats ? { storage: await storeForStats.storage() } : {}),
+    ...(storeForStats
+      ? {
+          storage: await storeForStats.storage(),
+          // What a client may send, so it can refuse an oversized file before
+          // transferring it instead of learning the limit from a 413.
+          limits: {
+            maxUploadBytes: storeForStats.config.maxUploadBytes,
+            maxIngestRows: storeForStats.config.maxIngestRows,
+            maxQueryRows: storeForStats.config.maxQueryRows,
+          },
+        }
+      : {}),
   }));
 
   if (config.files?.enabled) {
+    // The file store pulls in DuckDB (a ~70 MB native library) and ExcelJS.
+    // Loaded here, only when files are on, so a server without them starts
+    // light and the cost shows up where it belongs.
+    const [{ FileStore }, { registerFileRoutes }, { registerSnapshotRoutes }] = await Promise.all([
+      import("./files/store.js"),
+      import("./routes/files.js"),
+      import("./routes/snapshots.js"),
+    ]);
     const store = new FileStore(config.files);
     await store.init();
     storeForStats = store;

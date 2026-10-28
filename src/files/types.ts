@@ -32,10 +32,8 @@ export interface FilesConfig {
    */
   dir?: string;
   /**
-   * Auto-delete an UNPINNED file (and its DuckDB db) this many minutes after
-   * upload. Since 0.8.0 uploads are pinned (durable) by default, so this only
-   * applies to callers that opt out with pinned=false and to unpinned files
-   * created by older versions. Default: 10080 (7 days).
+   * @deprecated No-op since 0.8.12. Records are never swept: a file lives
+   * until it is deleted. Accepted so existing configs keep compiling.
    */
   ttlMinutes?: number;
   /** Reject uploads larger than this. Default: 100 MB. */
@@ -87,7 +85,6 @@ export interface FilesConfig {
 /** Resolved config with defaults applied — what the store actually uses. */
 export interface ResolvedFilesConfig {
   dir: string;
-  ttlMinutes: number;
   maxUploadBytes: number;
   maxQueryRows: number;
   minFreeBytes: number;

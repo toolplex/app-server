@@ -13,7 +13,7 @@
  * cursor/page loop the /download route uses.
  */
 
-import type { FastifyInstance, FastifyRequest } from "fastify";
+import type { FastifyInstance } from "fastify";
 import { appendFile, writeFile, rm } from "node:fs/promises";
 import type { AppServerConfig, ColumnFilter, FetchRequest, ResourceDefinition } from "../types.js";
 import { readUserHeaders, readOrgHeader } from "../user.js";
@@ -106,18 +106,6 @@ export async function streamAllRows(
     }
   }
   return count;
-}
-
-/** All rows of a resource under filters, in memory. Kept for callers that want an array; the photo route streams instead. */
-export async function collectAllRows(
-  definition: ResourceDefinition,
-  resource: string,
-  base: Pick<FetchRequest, "filters" | "columnFilters" | "sort" | "user">,
-  maxRows: number,
-): Promise<Record<string, unknown>[]> {
-  const rows: Record<string, unknown>[] = [];
-  await streamAllRows(definition, resource, base, maxRows, async (part) => { rows.push(...part); });
-  return rows;
 }
 
 /** In-table column filters per resource from a request body, kept to the shape the handlers accept. */

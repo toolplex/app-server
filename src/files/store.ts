@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
+import { createReadStream, createWriteStream } from "node:fs";
 import { copyFile, mkdir, readFile, readdir, realpath, rename, rm, stat, statfs, writeFile, appendFile } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { cpus, homedir, tmpdir, totalmem } from "node:os";
 import { basename, extname, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
 
-import { DuckDBInstance } from "@duckdb/node-api";
+import { DuckDBInstance, type DuckDBConnection, type DuckDBResultReader } from "@duckdb/node-api";
 import ExcelJS from "exceljs";
 
 import type {
@@ -62,11 +63,6 @@ export interface Requester {
 }
 
 const DEFAULTS = {
-  // 7 days — but note that since 0.8.0 the upload routes pin by default, so
-  // the TTL only applies to callers that explicitly opt out (?pinned=false)
-  // and to unpinned files created by pre-0.8.0 versions. User content is
-  // durable: it lives until explicitly deleted.
-  ttlMinutes: 10080,
   maxUploadBytes: 100 * 1024 * 1024,
   maxQueryRows: 1000,
   maxResultBytes: 512 * 1024,
@@ -78,9 +74,18 @@ const DEFAULTS = {
   maxIngestRows: 2_000_000,
 };
 
-// Cap for on-the-fly CSV/XLSX exports of a snapshot (held in memory). Larger
-// exports would need a streaming writer — a follow-up (see DOCUMENT_ARTIFACTS_SCOPING.md).
-const EXPORT_MAX_ROWS = 100_000;
+// An xlsx rendition is built in memory by ExcelJS, so it is capped; the CSV
+// rendition streams from DuckDB to disk a chunk at a time and has no cap.
+const EXPORT_XLSX_MAX_ROWS = 100_000;
+// Per step (a chunk fetch) while streaming an export, not for the whole file.
+const EXPORT_STEP_TIMEOUT_MS = 60_000;
+// Scratch files (per-sheet CSVs, staged rows, record temp files) older than
+// this are leftovers of a crash, never a write in progress.
+const SCRATCH_MAX_AGE_MS = 60 * 60_000;
+const SCRATCH_SUFFIX = /(\.json\.\d+\.tmp|\.staged\.json|\.rows(\.\d+)?\.json|__[^/]+\.csv|\.ocr-(in|out)\.pdf)$/;
+// Columns a worksheet keeps. Real sheets have tens; a "used range" that a stray
+// format stretched to thousands is noise, and past this it is only cost.
+const MAX_SHEET_COLUMNS = 2000;
 
 // Query-instance sandbox: read-only + no host filesystem access + config
 // locked so the agent's SQL can't re-enable any of it. Verified to block
@@ -91,11 +96,47 @@ const QUERY_INSTANCE_CONFIG = {
   lock_configuration: "true",
 } as const;
 
+// ---------------------------------------------------------------------------
+// Host bounds. One DuckDB query must never take the box: every instance gets a
+// slice of RAM, threads matched to the cores, and spill space inside the store
+// (never the OS temp dir). Read paths also run under a fixed number of slots —
+// a query beyond that waits for one rather than failing. Derived once from the
+// host, so a 2 GB VPS and a 16 GB workstation both get sensible numbers with
+// nothing to configure.
+// ---------------------------------------------------------------------------
+const HOST_CORES = Math.max(1, cpus().length);
+const INSTANCE_MEMORY_MB = Math.min(1024, Math.max(128, Math.floor(totalmem() / (8 * 1024 * 1024))));
+const INSTANCE_THREADS = String(Math.min(HOST_CORES, 4));
+const QUERY_SLOTS = HOST_CORES <= 2 ? 2 : Math.min(4, Math.ceil(HOST_CORES / 2));
+const SPILL_MAX = "2GB";
+
+/** A counting semaphore; `acquire` resolves with the matching release. */
+class Slots {
+  private readonly waiting: Array<() => void> = [];
+  private used = 0;
+  constructor(private readonly size: number) {}
+  async acquire(): Promise<() => void> {
+    if (this.used >= this.size) await new Promise<void>((wake) => this.waiting.push(wake));
+    this.used++;
+    let done = false;
+    return () => {
+      if (done) return;
+      done = true;
+      this.used--;
+      this.waiting.shift()?.();
+    };
+  }
+}
+
 export class FileStore {
   private cfg: ResolvedFilesConfig;
   private sweepTimer?: NodeJS.Timeout;
   /** Ingests currently in flight in this process (concurrency guard). */
   private activeIngests = 0;
+  /** Read paths in flight (queries, pages, exports); see QUERY_SLOTS. */
+  private readonly querySlots = new Slots(QUERY_SLOTS);
+  /** Uploads in flight by client-chosen id; a retry awaits the first instead of ingesting twice. */
+  private readonly inflight = new Map<string, Promise<FileManifest>>();
 
   constructor(config: FilesConfig) {
     this.cfg = {
@@ -107,7 +148,6 @@ export class FileStore {
       // deploy/repo tree and a clean redeploy could wipe it; home survives both
       // redeploys and reboots).
       dir: resolvePath(config.dir ?? join(homedir(), ".toolplex-app-files")),
-      ttlMinutes: config.ttlMinutes ?? DEFAULTS.ttlMinutes,
       maxUploadBytes: config.maxUploadBytes ?? DEFAULTS.maxUploadBytes,
       maxQueryRows: config.maxQueryRows ?? DEFAULTS.maxQueryRows,
       maxResultBytes: config.maxResultBytes ?? DEFAULTS.maxResultBytes,
@@ -124,6 +164,64 @@ export class FileStore {
 
   get config(): ResolvedFilesConfig {
     return this.cfg;
+  }
+
+  /** Resource bounds every DuckDB instance gets (see HOST_CORES above). */
+  private boundsConfig(): Record<string, string> {
+    return {
+      memory_limit: `${INSTANCE_MEMORY_MB}MB`,
+      threads: INSTANCE_THREADS,
+      temp_directory: join(this.cfg.dir, ".duckdb-tmp"),
+      max_temp_directory_size: SPILL_MAX,
+    };
+  }
+
+  /**
+   * One sandboxed, resource-bounded connection for the duration of `fn`, under
+   * a host-wide slot. `bounded(p)` races `p` against the query timeout and, on
+   * timeout, interrupts the connection — closing the instance does not stop a
+   * running query, interrupting does. Instance, connection and slot are
+   * released in order whatever happened. Every read path goes through here,
+   * and a DuckDB error comes out as a 400 with DuckDB's own first line, the
+   * most useful thing the agent can get for fixing its SQL.
+   */
+  private async withQueryConn<T>(
+    dbPath: string,
+    fn: (conn: DuckDBConnection, bounded: <R>(p: Promise<R>) => Promise<R>) => Promise<T>,
+    opts: { timeoutMs?: number; config?: Record<string, string> } = {},
+  ): Promise<T> {
+    const release = await this.querySlots.acquire();
+    try {
+      // Bounds first: options are applied in order, and `lock_configuration`
+      // in the sandbox config must come last or the bounds after it are refused.
+      const inst = await DuckDBInstance.create(dbPath, { ...this.boundsConfig(), ...(opts.config ?? QUERY_INSTANCE_CONFIG) });
+      try {
+        const conn = await inst.connect();
+        try {
+          const ms = opts.timeoutMs ?? this.cfg.queryTimeoutMs;
+          const bounded = <R,>(p: Promise<R>) => withTimeout(p, ms, () => conn.interrupt());
+          return await fn(conn, bounded);
+        } catch (err) {
+          if (err instanceof FileStoreError) throw err;
+          const msg = err instanceof Error ? err.message.split("\n")[0] : String(err);
+          throw new FileStoreError(400, `Query failed: ${msg}`);
+        } finally {
+          try { conn.disconnectSync(); } catch { /* already gone */ }
+        }
+      } finally {
+        try { inst.closeSync(); } catch { /* already gone */ }
+      }
+    } finally {
+      release();
+    }
+  }
+
+  /** Columns, rows and the truncated flag from a reader, within the row and byte caps. */
+  private cappedResult(reader: DuckDBResultReader): FileQueryResult {
+    const columns: FileColumn[] = reader.columnNames().map((name, i) => ({ name, type: String(reader.columnTypes()[i]) }));
+    const all = reader.getRowObjects();
+    const fitted = fitBytes(all.slice(0, this.cfg.maxQueryRows).map((r) => normalizeRow(r)), this.cfg.maxResultBytes);
+    return { columns, rows: fitted.rows, rowCount: fitted.rows.length, truncated: all.length > this.cfg.maxQueryRows || fitted.truncated };
   }
 
   async init(): Promise<void> {
@@ -178,16 +276,11 @@ export class FileStore {
   // -------------------------------------------------------------------------
 
   startCleanup(log: (msg: string) => void): void {
-    // Sweep at a quarter of the TTL, clamped to [1min, 30min].
-    const intervalMs = Math.min(
-      30 * 60_000,
-      Math.max(60_000, (this.cfg.ttlMinutes * 60_000) / 4),
-    );
     this.sweepTimer = setInterval(() => {
-      this.sweepExpired(log).catch((err) => {
+      this.sweepScratch(log).catch((err) => {
         log(`file cleanup sweep failed: ${err instanceof Error ? err.message : String(err)}`);
       });
-    }, intervalMs);
+    }, 30 * 60_000);
     // Don't keep the event loop alive for the sweep alone.
     this.sweepTimer.unref?.();
   }
@@ -197,8 +290,15 @@ export class FileStore {
     this.sweepTimer = undefined;
   }
 
-  private async sweepExpired(log: (msg: string) => void): Promise<void> {
-    const cutoff = Date.now() - this.cfg.ttlMinutes * 60_000;
+  /**
+   * Remove scratch left by a crash: record temp files, staged rows, per-sheet
+   * CSVs, OCR intermediates. Only files matching SCRATCH_SUFFIX and older than
+   * SCRATCH_MAX_AGE_MS, so a write in progress is never touched. Records are
+   * never swept — a user's file lives until someone deletes it (0.8.12; the
+   * earlier TTL on unpinned records removed pre-0.8.0 attachments silently).
+   */
+  private async sweepScratch(log: (msg: string) => void): Promise<void> {
+    const cutoff = Date.now() - SCRATCH_MAX_AGE_MS;
     let entries: string[];
     try {
       entries = await readdir(this.cfg.dir);
@@ -207,41 +307,52 @@ export class FileStore {
     }
     let removed = 0;
     for (const entry of entries) {
-      // Orphaned temp files from writeRecord — only possible if the process
-      // died between the write and the rename, since the write path removes
-      // its own temp on failure. Swept on age so a live write in progress is
-      // never pulled out from under itself. Handled here because these do not
-      // end in .json and would otherwise accumulate forever.
-      if (entry.endsWith(".tmp")) {
-        const tmpPath = join(this.cfg.dir, entry);
-        const age = await stat(tmpPath)
-          .then((s) => s.mtimeMs)
-          .catch(() => Date.now());
-        if (age < cutoff) await rm(tmpPath, { force: true }).catch(() => {});
-        continue;
-      }
-      if (!entry.endsWith(".json")) continue;
-      const fileId = entry.slice(0, -5);
-      const record = await this.readRecord(fileId).catch(() => null);
-      if (!record) continue;
-      // Pinned records (durable artifacts) are never swept.
-      if (!record.pinned && record.createdAtMs < cutoff) {
-        await this.removeFiles(fileId, record);
-        removed++;
-      }
+      if (!SCRATCH_SUFFIX.test(entry)) continue;
+      const path = join(this.cfg.dir, entry);
+      const mtime = await stat(path).then((st) => st.mtimeMs).catch(() => Date.now());
+      if (mtime >= cutoff) continue;
+      await rm(path, { force: true }).catch(() => {});
+      removed++;
     }
-    if (removed > 0) log(`file cleanup: removed ${removed} expired upload(s)`);
+    if (removed > 0) log(`file cleanup: removed ${removed} leftover scratch file(s)`);
   }
 
   // -------------------------------------------------------------------------
   // Ingest
   // -------------------------------------------------------------------------
 
+  /**
+   * Ingest an upload. With `fileId` (a UUID the client minted) the upload is
+   * idempotent: the same file sent twice — a retry after a slow network — is
+   * one file. A finished upload returns its manifest, one still running is
+   * awaited, and an id that belongs to someone else is refused.
+   */
   async ingest(
     filename: string,
     buffer: Buffer,
     requester: Requester,
-    opts: { pinned?: boolean; rawMimeType?: string } = {},
+    opts: { pinned?: boolean; rawMimeType?: string; fileId?: string } = {},
+  ): Promise<FileManifest> {
+    const id = opts.fileId;
+    if (!id) return this.ingestNew(filename, buffer, requester, opts);
+    if (!isSafeId(id)) throw new FileStoreError(400, "Invalid upload id.");
+    const existing = await this.readRecord(id).catch(() => null);
+    if (existing) {
+      if (!this.ownsRecord(existing, requester)) throw new FileStoreError(409, "Upload id already in use.");
+      return existing.manifest;
+    }
+    const running = this.inflight.get(id);
+    if (running) return running;
+    const started = this.ingestNew(filename, buffer, requester, opts).finally(() => this.inflight.delete(id));
+    this.inflight.set(id, started);
+    return started;
+  }
+
+  private async ingestNew(
+    filename: string,
+    buffer: Buffer,
+    requester: Requester,
+    opts: { pinned?: boolean; rawMimeType?: string; fileId?: string },
   ): Promise<FileManifest> {
     if (buffer.length === 0) {
       throw new FileStoreError(400, "Uploaded file is empty.");
@@ -258,7 +369,7 @@ export class FileStore {
     // by passing `rawMimeType`; auto-detecting from the filename would silently
     // absorb tabular typos (e.g. a mis-extensioned CSV) into the raw bucket.
     if (opts.rawMimeType) {
-      return this.ingestRaw(filename, buffer, requester, opts.rawMimeType, opts.pinned);
+      return this.ingestRaw(filename, buffer, requester, opts.rawMimeType, opts.pinned, opts.fileId);
     }
 
     const kind = detectKind(filename);
@@ -280,7 +391,7 @@ export class FileStore {
     }
     this.activeIngests++;
     try {
-      const fileId = randomUUID();
+      const fileId = opts.fileId ?? randomUUID();
       const uploadPath = join(this.cfg.dir, `${fileId}${extname(filename) || `.${kind}`}`);
       const dbPath = join(this.cfg.dir, `${fileId}.duckdb`);
       const notes: string[] = [];
@@ -375,6 +486,7 @@ export class FileStore {
     requester: Requester,
     mimeType: string,
     pinned?: boolean,
+    givenId?: string,
   ): Promise<FileManifest> {
     // Validate the client-declared mimeType — RFC 6838 shape
     // (`type/subtype[+suffix][; params]`). Untrusted input flows straight into
@@ -397,7 +509,7 @@ export class FileStore {
     }
     this.activeIngests++;
     try {
-      const fileId = randomUUID();
+      const fileId = givenId ?? randomUUID();
       // Preserve the original extension so the on-disk file is directly
       // openable if an operator inspects the drop dir. Fall back to `.bin`
       // when the filename has no extension.
@@ -557,14 +669,17 @@ export class FileStore {
   async getRawOrTextBytes(
     fileId: string,
     requester: Requester,
-  ): Promise<{ manifest: FileManifest; uploadPath: string }> {
+  ): Promise<{ manifest: FileManifest; uploadPath: string; sizeBytes: number }> {
     const record = await this.getOwnedRecord(fileId, requester);
     // All kinds serve their ORIGINAL bytes: raw/text for read_attachment,
     // and tabular (csv/tsv/xlsx) so durable workbooks are downloadable from
-    // chat file links, attachment tiles, and page file cells. The old
-    // tabular rejection ("use /query, not /raw") predates durability —
-    // querying and downloading the original are both legitimate now.
-    return { manifest: record.manifest, uploadPath: record.uploadPath };
+    // chat file links, attachment tiles, and page file cells. The size comes
+    // from the file on disk, not the manifest: a CSV is stored transcoded to
+    // UTF-8 while the manifest counts the bytes as uploaded. An artifact built
+    // from rows has no original at all — its export route is the download.
+    const st = await stat(record.uploadPath).catch(() => null);
+    if (!st) throw new FileStoreError(404, "This file has no original to download; use its export instead.");
+    return { manifest: record.manifest, uploadPath: record.uploadPath, sizeBytes: st.size };
   }
 
   /**
@@ -746,6 +861,7 @@ export class FileStore {
 
     const fileId = randomUUID();
     const jsonPath = join(this.cfg.dir, `${fileId}.rows.json`);
+    const notes: string[] = [];
     const dbPath = join(this.cfg.dir, `${fileId}.duckdb`);
     // One temp file per dataset; all are cleaned up on both paths.
     const tempPaths: string[] = [];
@@ -763,7 +879,7 @@ export class FileStore {
     }
     try {
       let tables: FileTableManifest[];
-      const inst = await DuckDBInstance.create(dbPath);
+      const inst = await DuckDBInstance.create(dbPath, this.boundsConfig());
       try {
         const conn = await inst.connect();
         tables = [];
@@ -801,9 +917,9 @@ export class FileStore {
               await appendFile(tmp, ds.rows.slice(i, i + CHUNK).map((r) => JSON.stringify(r)).join("\n") + "\n", "utf8");
             }
           }
-          await conn.run(
-            `CREATE TABLE ${ds.safe} AS SELECT * FROM read_json_auto(${sqlString(tmp)}, format='newline_delimited', maximum_object_size=16777216)`,
-          );
+          if (await loadJsonTable(conn, ds.safe, tmp, ds.columns)) {
+            notes.push(`Some columns of "${ds.requested || ds.safe}" mix numbers and text; they are stored as text.`);
+          }
           const table = await this.describeTable(conn, ds.safe);
           // Carry the caller's label when it differs from the SQL-safe name,
           // mirroring how xlsx keeps the original worksheet title.
@@ -832,6 +948,7 @@ export class FileStore {
         kind: "csv",
         sizeBytes: 0,
         tables,
+        ...(notes.length > 0 ? { notes } : {}),
         createdAt: new Date().toISOString(),
       };
       const record: FileRecord = {
@@ -1030,7 +1147,7 @@ export class FileStore {
     kind: "csv" | "tsv",
     notes: string[],
   ): Promise<FileTableManifest[]> {
-    const inst = await DuckDBInstance.create(dbPath);
+    const inst = await DuckDBInstance.create(dbPath, this.boundsConfig());
     try {
       const conn = await inst.connect();
       const dataRows = Math.max(0, (await countLines(uploadPath)) - 1);
@@ -1061,7 +1178,7 @@ export class FileStore {
     const wb = new ExcelJS.Workbook();
     await wb.xlsx.readFile(uploadPath);
 
-    const inst = await DuckDBInstance.create(dbPath);
+    const inst = await DuckDBInstance.create(dbPath, this.boundsConfig());
     const usedNames = new Set<string>();
     const tempCsvs: string[] = [];
     try {
@@ -1083,10 +1200,13 @@ export class FileStore {
         // apart and, via the error-skipping fallback, throw away every other
         // row of the sheet. DuckDB still does type inference uniformly with
         // the delimited path.
-        const written = await writeSheetCsv(ws, csvPath);
+        const written = await writeSheetCsv(ws, csvPath, this.cfg.maxIngestRows);
         if (written.dataRows < 0) {
           notes.push(`Skipped empty sheet "${ws.name}".`);
           continue;
+        }
+        if (written.droppedColumns > 0) {
+          notes.push(`Sheet "${ws.name}": kept the first ${MAX_SHEET_COLUMNS} columns; ${written.droppedColumns} more were dropped.`);
         }
         if (written.skippedTitleRows > 0) {
           notes.push(
@@ -1173,16 +1293,15 @@ export class FileStore {
     if (files.length > 200) throw new FileStoreError(400, "Too many files in one query (max 200).");
     const guard = validateReadOnlySql(sql);
     if (!guard.ok) throw new FileStoreError(400, guard.error!);
-    const records = [];
+    const records: Array<(typeof files)[number] & { record: FileRecord }> = [];
     for (const f of files) records.push({ ...f, record: await this.getOwnedRecord(f.fileId, requester) });
 
     // ATTACH is a file operation, so external access must be on while the
     // album's files are attached — and off, then locked, before any SQL the
     // caller wrote can run. Same end state as `query`, reached in two steps.
-    const inst = await DuckDBInstance.create(":memory:");
-    try {
-      const conn = await inst.connect();
-      try {
+    return this.withQueryConn(
+      ":memory:",
+      async (conn, bounded) => {
         for (const [i, r] of records.entries()) {
           await conn.run(`ATTACH ${sqlString(r.record.dbPath)} AS s${i} (READ_ONLY)`);
         }
@@ -1202,27 +1321,11 @@ export class FileStore {
             .map(({ r, i }) => `SELECT ${sqlString(r.takenAt)}::TIMESTAMPTZ AS taken_at, ${r.sourceSync === null ? "NULL::VARCHAR" : sqlString(r.sourceSync)} AS source_sync, * FROM s${i}."${t}"`);
           await conn.run(`CREATE VIEW history."${t}" AS ${parts.join(" UNION ALL BY NAME ")}`);
         }
-        const reader = await withTimeout(conn.runAndReadUntil(sql, this.cfg.maxQueryRows + 1), this.cfg.queryTimeoutMs * 2, () => inst.closeSync());
-        const columns: FileColumn[] = reader.columnNames().map((name, i) => ({ name, type: String(reader.columnTypes()[i]) }));
-        const all = reader.getRowObjects();
-        let truncated = all.length > this.cfg.maxQueryRows;
-        let rows = all.slice(0, this.cfg.maxQueryRows).map((r) => normalizeRow(r));
-        if (byteLen(rows) > this.cfg.maxResultBytes) {
-          truncated = true;
-          while (rows.length > 0 && byteLen(rows) > this.cfg.maxResultBytes) rows = rows.slice(0, Math.max(1, Math.floor(rows.length * 0.8)) - 1);
-        }
-        return { columns, rows, rowCount: rows.length, truncated };
-      } catch (err) {
-        if (err instanceof FileStoreError) throw err;
-        const msg = err instanceof Error ? err.message.split("\n")[0] : String(err);
-        throw new FileStoreError(400, `Query failed: ${msg}`);
-      } finally {
-        try { inst.closeSync(); } catch { /* closed by timeout */ }
-      }
-    } catch (err) {
-      if (err instanceof FileStoreError) throw err;
-      throw new FileStoreError(500, err instanceof Error ? err.message : String(err));
-    }
+        const reader = await bounded(conn.runAndReadUntil(sql, this.cfg.maxQueryRows + 1));
+        return this.cappedResult(reader);
+      },
+      { timeoutMs: this.cfg.queryTimeoutMs * 2, config: {} },
+    );
   }
 
   async query(
@@ -1231,56 +1334,12 @@ export class FileStore {
     requester: Requester,
   ): Promise<FileQueryResult> {
     const record = await this.getOwnedRecord(fileId, requester);
-
     const guard = validateReadOnlySql(sql);
     if (!guard.ok) throw new FileStoreError(400, guard.error!);
-
-    const inst = await DuckDBInstance.create(record.dbPath, QUERY_INSTANCE_CONFIG);
-    try {
-      const conn = await inst.connect();
-      try {
-        const reader = await withTimeout(
-          conn.runAndReadUntil(sql, this.cfg.maxQueryRows + 1),
-          this.cfg.queryTimeoutMs,
-          () => inst.closeSync(),
-        );
-
-        const columns: FileColumn[] = reader
-          .columnNames()
-          .map((name, i) => ({ name, type: String(reader.columnTypes()[i]) }));
-
-        const all = reader.getRowObjects();
-        let truncated = all.length > this.cfg.maxQueryRows;
-        let rows = all.slice(0, this.cfg.maxQueryRows).map((r) => normalizeRow(r));
-
-        // Byte cap — drop rows until the serialized payload fits.
-        if (byteLen(rows) > this.cfg.maxResultBytes) {
-          truncated = true;
-          while (rows.length > 0 && byteLen(rows) > this.cfg.maxResultBytes) {
-            rows = rows.slice(0, Math.max(1, Math.floor(rows.length * 0.8)) - 1);
-          }
-        }
-
-        return { columns, rows, rowCount: rows.length, truncated };
-      } catch (err) {
-        // Surface DuckDB's message — it's the most useful feedback for the
-        // agent to fix its SQL (unknown column, syntax error, etc.).
-        const msg = err instanceof Error ? err.message.split("\n")[0] : String(err);
-        throw new FileStoreError(400, `Query failed: ${msg}`);
-      } finally {
-        try {
-          conn.disconnectSync();
-        } catch {
-          /* instance may already be closed by the timeout path */
-        }
-      }
-    } finally {
-      try {
-        inst.closeSync();
-      } catch {
-        /* already closed */
-      }
-    }
+    return this.withQueryConn(record.dbPath, async (conn, bounded) => {
+      const reader = await bounded(conn.runAndReadUntil(sql, this.cfg.maxQueryRows + 1));
+      return this.cappedResult(reader);
+    });
   }
 
   /**
@@ -1357,57 +1416,22 @@ export class FileStore {
     const page = Math.max(1, Math.floor(opts.page) || 1);
     const offset = (page - 1) * pageSize;
 
-    const inst = await DuckDBInstance.create(record.dbPath, QUERY_INSTANCE_CONFIG);
-    try {
-      const conn = await inst.connect();
-      try {
-        const countReader = await withTimeout(
-          conn.runAndReadAll(`SELECT count(*) AS c FROM ${tbl} ${where}`),
-          this.cfg.queryTimeoutMs,
-          () => inst.closeSync(),
-        );
-        const total = Number(countReader.getRowObjects()[0]?.c ?? 0);
-
-        // `rowid` gives a stable per-row key for the client (the snapshot is
-        // immutable). It's added as `_id` and isn't in the manifest columns, so
-        // it never renders as a data column.
-        const reader = await withTimeout(
-          conn.runAndReadUntil(
-            `SELECT *, rowid AS _id FROM ${tbl} ${where} ${orderBy} LIMIT ${pageSize} OFFSET ${offset}`,
-            pageSize + 1,
-          ),
-          this.cfg.queryTimeoutMs,
-          () => inst.closeSync(),
-        );
-        const columns: FileColumn[] = reader
-          .columnNames()
-          .map((name, i) => ({ name, type: String(reader.columnTypes()[i]) }))
-          .filter((c) => c.name !== "_id");
-        let rows = reader.getRowObjects().map((r) => normalizeRow(r));
-        if (byteLen(rows) > this.cfg.maxResultBytes) {
-          while (rows.length > 0 && byteLen(rows) > this.cfg.maxResultBytes) {
-            rows = rows.slice(0, Math.max(1, Math.floor(rows.length * 0.8)) - 1);
-          }
-        }
-        conn.disconnectSync();
-        return { rows, total, columns };
-      } catch (err) {
-        const msg = err instanceof Error ? err.message.split("\n")[0] : String(err);
-        throw new FileStoreError(400, `Query failed: ${msg}`);
-      } finally {
-        try {
-          conn.disconnectSync();
-        } catch {
-          /* instance may already be closed by the timeout path */
-        }
-      }
-    } finally {
-      try {
-        inst.closeSync();
-      } catch {
-        /* already closed */
-      }
-    }
+    return this.withQueryConn(record.dbPath, async (conn, bounded) => {
+      const countReader = await bounded(conn.runAndReadAll(`SELECT count(*) AS c FROM ${tbl} ${where}`));
+      const total = Number(countReader.getRowObjects()[0]?.c ?? 0);
+      // `rowid` gives a stable per-row key for the client (the snapshot is
+      // immutable). It's added as `_id` and isn't in the manifest columns, so
+      // it never renders as a data column.
+      const reader = await bounded(
+        conn.runAndReadUntil(`SELECT *, rowid AS _id FROM ${tbl} ${where} ${orderBy} LIMIT ${pageSize} OFFSET ${offset}`, pageSize + 1),
+      );
+      const columns: FileColumn[] = reader
+        .columnNames()
+        .map((name, i) => ({ name, type: String(reader.columnTypes()[i]) }))
+        .filter((c) => c.name !== "_id");
+      const { rows } = fitBytes(reader.getRowObjects().map((r) => normalizeRow(r)), this.cfg.maxResultBytes);
+      return { rows, total, columns };
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -1430,83 +1454,137 @@ export class FileStore {
   }
 
   /**
-   * On-the-fly CSV / XLSX rendition of a snapshot table — the "Download as…"
-   * path for report artifacts. NOT persisted; rendered in memory (capped at
-   * EXPORT_MAX_ROWS). For xlsx it's a single, default-styled sheet.
+   * On-the-fly rendition of a snapshot table — the "Download as…" path for
+   * report artifacts. CSV streams from DuckDB into a scratch file the caller
+   * sends and removes, so a report of any size exports whole. XLSX is built in
+   * memory by ExcelJS and is capped; `truncated` says when that happened.
    */
   async exportRows(
     fileId: string,
     requester: Requester,
     opts: { format: "csv" | "xlsx"; table?: string },
-  ): Promise<{ buffer: Buffer; filename: string; contentType: string }> {
+  ): Promise<
+    | { filename: string; contentType: string; path: string }
+    | { filename: string; contentType: string; buffer: Buffer; truncated: boolean }
+  > {
     const record = await this.getOwnedRecord(fileId, requester);
     const table = selectTable(record.manifest, opts.table);
+    const base = (record.manifest.filename || "export").replace(/\.[^.]+$/, "") || "export";
+
+    if (opts.format === "csv") {
+      const path = join(this.cfg.dir, `${randomUUID()}.export.csv`);
+      try {
+        await this.writeTableCsv(record.dbPath, table, path);
+      } catch (err) {
+        await rm(path, { force: true }).catch(() => {});
+        throw err;
+      }
+      return { path, filename: `${base}.csv`, contentType: "text/csv; charset=utf-8" };
+    }
+
     // Trailing all-empty rows ride along in some snapshots (trailing blank
     // lines in an ingested sheet, empty objects in an agent's rows) — in a
     // downloaded file they read as a formatting bug, so the rendition trims
     // them. Trailing only: an interior blank row stays, faithfully.
-    const rows = trimTrailingEmptyRows(
-      await this.readTableRows(record.dbPath, table.name, EXPORT_MAX_ROWS),
-    );
-    const base = (record.manifest.filename || "export").replace(/\.[^.]+$/, "") || "export";
-
-    if (opts.format === "xlsx") {
-      // Styled defaults for the rendition: header row shaded + frozen, columns
-      // sized/formatted by inference (see inferColumns) — the export opens
-      // readable in Excel/Numbers instead of raw keys in 8.43-char columns.
-      const wb = buildWorkbook([
-        {
-          name: table.sheetName || table.name,
-          rows,
-          style: { header: { bold: true, fill: "#F2F2F2" }, freeze: "A2" },
-        },
-      ]);
-      const buffer = Buffer.from(await wb.xlsx.writeBuffer());
-      return {
-        buffer,
-        filename: `${base}.xlsx`,
-        contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-      };
-    }
-    // CSV — prepend a UTF-8 BOM so Excel detects the encoding.
-    const csv = rowsToCsv(rows, table.columns.map((c) => c.name));
+    const all = await this.readTableRows(record.dbPath, table.name, EXPORT_XLSX_MAX_ROWS + 1);
+    const rows = trimTrailingEmptyRows(all.slice(0, EXPORT_XLSX_MAX_ROWS));
+    // Styled defaults for the rendition: header row shaded + frozen, columns
+    // sized/formatted by inference (see inferColumns) — the export opens
+    // readable in Excel/Numbers instead of raw keys in 8.43-char columns.
+    const wb = buildWorkbook([
+      { name: table.sheetName || table.name, rows, style: { header: { bold: true, fill: "#F2F2F2" }, freeze: "A2" } },
+    ]);
     return {
-      buffer: Buffer.from(`﻿${csv}`, "utf8"),
-      filename: `${base}.csv`,
-      contentType: "text/csv; charset=utf-8",
+      buffer: Buffer.from(await wb.xlsx.writeBuffer()),
+      filename: `${base}.xlsx`,
+      contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      truncated: all.length > EXPORT_XLSX_MAX_ROWS,
     };
   }
 
-  /** Read up to `limit` rows of a table from a snapshot's DuckDB (read-only sandbox). */
-  private async readTableRows(
-    dbPath: string,
-    tableName: string,
-    limit: number,
-  ): Promise<Record<string, unknown>[]> {
-    const inst = await DuckDBInstance.create(dbPath, QUERY_INSTANCE_CONFIG);
+  /**
+   * A new pinned artifact from a read-only query over an existing file. The
+   * result streams from DuckDB into a staged NDJSON file and is ingested like
+   * any dataset, so a report built from an attachment never passes through
+   * the caller (or a model's context). Capped by maxIngestRows like every artifact.
+   */
+  async materializeFromQuery(fileId: string, sql: string, tableName: string, requester: Requester): Promise<FileManifest> {
+    const record = await this.getOwnedRecord(fileId, requester);
+    const guard = validateReadOnlySql(sql);
+    if (!guard.ok) throw new FileStoreError(400, guard.error!);
+    const staged = await this.stagingPath();
+    let rowCount = 0;
+    let columns: string[] = [];
     try {
-      const conn = await inst.connect();
-      try {
-        const reader = await withTimeout(
-          conn.runAndReadUntil(`SELECT * FROM ${quoteIdent(tableName)} LIMIT ${limit}`, limit + 1),
-          this.cfg.queryTimeoutMs,
-          () => inst.closeSync(),
-        );
-        return reader.getRowObjects().slice(0, limit).map((r) => normalizeRow(r));
-      } finally {
-        try {
-          conn.disconnectSync();
-        } catch {
-          /* instance may already be closed by the timeout path */
-        }
-      }
-    } finally {
-      try {
-        inst.closeSync();
-      } catch {
-        /* already closed */
-      }
+      await this.withQueryConn(
+        record.dbPath,
+        async (conn, bounded) => {
+          const result = await bounded(conn.stream(sql));
+          columns = result.columnNames();
+          const out = lineWriter(staged);
+          for (;;) {
+            const chunk = await bounded(result.fetchChunk());
+            if (!chunk || chunk.rowCount === 0) break;
+            rowCount += chunk.rowCount;
+            if (rowCount > this.cfg.maxIngestRows) {
+              throw new FileStoreError(413, `Result has too many rows. Maximum is ${this.cfg.maxIngestRows.toLocaleString()}.`);
+            }
+            await out.write(chunk.getRowObjects(columns).map((r) => JSON.stringify(normalizeRow(r))).join("\n") + "\n");
+          }
+          await out.end();
+        },
+        { timeoutMs: EXPORT_STEP_TIMEOUT_MS },
+      );
+    } catch (err) {
+      await rm(staged, { force: true }).catch(() => {});
+      throw err;
     }
+    return this.materializeDatasets([{ name: tableName, sourcePath: staged, rowCount, columns }], requester);
+  }
+
+  /**
+   * Whole table → CSV file, one DuckDB chunk at a time, with a UTF-8 BOM so
+   * Excel detects the encoding. Trailing all-empty rows are held back and only
+   * written if data follows, which trims them without a second pass.
+   */
+  private async writeTableCsv(dbPath: string, table: FileTableManifest, outPath: string): Promise<void> {
+    await this.withQueryConn(
+      dbPath,
+      async (conn, bounded) => {
+        const result = await bounded(conn.stream(`SELECT * FROM ${quoteIdent(table.name)}`));
+        const names = result.columnNames();
+        const out = lineWriter(outPath);
+        const line = (row: Record<string, unknown>) => names.map((c) => csvField(csvText(row[c]))).join(",") + "\r\n";
+        await out.write("\uFEFF" + names.map(csvField).join(",") + "\r\n");
+        let heldEmpty = "";
+        for (;;) {
+          const chunk = await bounded(result.fetchChunk());
+          if (!chunk || chunk.rowCount === 0) break;
+          let text = "";
+          for (const raw of chunk.getRowObjects(names)) {
+            const row = normalizeRow(raw);
+            const l = line(row);
+            if (names.every((c) => csvText(row[c]) === "")) {
+              heldEmpty += l;
+            } else {
+              text += heldEmpty + l;
+              heldEmpty = "";
+            }
+          }
+          if (text) await out.write(text);
+        }
+        await out.end();
+      },
+      { timeoutMs: EXPORT_STEP_TIMEOUT_MS },
+    );
+  }
+
+  /** Read up to `limit` rows of a table from a snapshot's DuckDB (read-only sandbox). */
+  private async readTableRows(dbPath: string, tableName: string, limit: number): Promise<Record<string, unknown>[]> {
+    return this.withQueryConn(dbPath, async (conn, bounded) => {
+      const reader = await bounded(conn.runAndReadUntil(`SELECT * FROM ${quoteIdent(tableName)} LIMIT ${limit}`, limit + 1));
+      return reader.getRowObjects().slice(0, limit).map((r) => normalizeRow(r));
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -1799,7 +1877,6 @@ async function loadCsvTable(
 
 /** Newline count of a text file, streamed (files can be up to the upload cap). */
 async function countLines(path: string): Promise<number> {
-  const { createReadStream } = await import("node:fs");
   return new Promise((resolve, reject) => {
     let n = 0;
     let sawAny = false;
@@ -1837,43 +1914,117 @@ function csvField(s: string): string {
   return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
+/** Append-only UTF-8 text file with awaited writes, so memory stays at one chunk. */
+function lineWriter(path: string): { write: (text: string) => Promise<void>; end: () => Promise<void> } {
+  const out = createWriteStream(path, { encoding: "utf8" });
+  return {
+    write: (text) => new Promise((done, fail) => out.write(text, (err) => (err ? fail(err) : done()))),
+    end: () => new Promise((done, fail) => out.end((err?: Error | null) => (err ? fail(err) : done()))),
+  };
+}
+
+/** A cell value as CSV text: null and undefined are empty, everything else as-is. */
+function csvText(v: unknown): string {
+  return v === null || v === undefined ? "" : String(v);
+}
+
+/** Drop rows from the end until the serialized payload fits the byte cap. */
+function fitBytes<T>(rows: T[], maxBytes: number): { rows: T[]; truncated: boolean } {
+  let out = rows;
+  while (out.length > 0 && byteLen(out) > maxBytes) out = out.slice(0, Math.max(1, Math.floor(out.length * 0.8)) - 1);
+  return { rows: out, truncated: out.length < rows.length };
+}
+
 /**
- * Write one worksheet as CSV from display text. Leading rows carrying at most
- * one distinct value (a merged title, a blank spacer) are skipped until the
- * first row with two or more distinct cells — that row is the header. Trailing
- * all-empty columns are trimmed. Returns dataRows = -1 for a sheet with no
- * usable rows at all.
+ * NDJSON → table. Types are inferred from the whole file, not a sample: a
+ * column that is empty for its first 20k rows must not come out as JSON text.
+ * If inference still fails (a late "N/A" in a number column), everything loads
+ * as text instead of the whole photo failing and parking an alert. Returns
+ * true when that fallback was used.
+ */
+async function loadJsonTable(conn: DuckDBConnection, table: string, path: string, columns: string[]): Promise<boolean> {
+  const source = `${sqlString(path)}, format='newline_delimited', maximum_object_size=16777216`;
+  try {
+    await conn.run(`CREATE TABLE ${table} AS SELECT * FROM read_json_auto(${source}, sample_size=-1)`);
+    // A column whose values disagree (numbers, then "N/A") comes out as JSON,
+    // which reads back as quoted text. Plain text is what a person and the
+    // agent expect; convert it in place and say so.
+    const mixed = (await conn.runAndReadAll(`SELECT column_name FROM (DESCRIBE ${table}) WHERE column_type = 'JSON'`))
+      .getRowObjects()
+      .map((r) => String(r.column_name));
+    for (const c of mixed) {
+      await conn.run(`ALTER TABLE ${table} ALTER COLUMN ${quoteIdent(c)} SET DATA TYPE VARCHAR USING ${quoteIdent(c)}->>'$'`);
+    }
+    return mixed.length > 0;
+  } catch (err) {
+    const cols = columns.filter((c) => /^[A-Za-z_][A-Za-z0-9_]{0,62}$/.test(c));
+    if (cols.length === 0) throw err;
+    const asText = cols.map((c) => `${sqlString(c)}: 'VARCHAR'`).join(", ");
+    await conn.run(`CREATE TABLE ${table} AS SELECT * FROM read_json(${source}, columns={${asText}})`);
+    return true;
+  }
+}
+
+/**
+ * Write one worksheet as CSV from display text. Only populated rows are
+ * visited and only cells that exist — never the declared range, which one
+ * stray value at row 20,000 can stretch into millions of empty cells (each
+ * one an object). Leading rows carrying at most one distinct value (a merged
+ * title, a blank spacer) are skipped until the first row with two or more
+ * distinct cells — that row is the header. Trailing all-empty columns are
+ * trimmed; columns past MAX_SHEET_COLUMNS are dropped and counted. Returns
+ * dataRows = -1 for a sheet with no usable rows at all.
  */
 async function writeSheetCsv(
   ws: ExcelJS.Worksheet,
   csvPath: string,
-): Promise<{ dataRows: number; skippedTitleRows: number }> {
-  const colCount = Math.max(ws.columnCount, ws.actualColumnCount);
-  const rows: string[][] = [];
-  for (let r = 1; r <= ws.rowCount; r++) {
-    const row = ws.getRow(r);
-    const vals: string[] = [];
-    for (let c = 1; c <= colCount; c++) vals.push(stripNulls(cellDisplayText(row.getCell(c))));
-    rows.push(vals);
+  maxRows: number,
+): Promise<{ dataRows: number; skippedTitleRows: number; droppedColumns: number }> {
+  if (ws.actualRowCount > maxRows) {
+    throw new FileStoreError(
+      413,
+      `Sheet "${ws.name}" has too many rows (${ws.actualRowCount.toLocaleString()}). Maximum is ${maxRows.toLocaleString()}.`,
+    );
   }
-  // Drop trailing all-empty rows and columns.
-  while (rows.length > 0 && rows[rows.length - 1].every((v) => v === "")) rows.pop();
-  let width = colCount;
-  while (width > 0 && rows.every((vals) => vals[width - 1] === "")) width--;
-  if (rows.length === 0 || width === 0) return { dataRows: -1, skippedTitleRows: 0 };
+  const rows: string[][] = [];
+  let width = 0;
+  let maxCol = 0;
+  ws.eachRow({ includeEmpty: false }, (row) => {
+    const vals: string[] = [];
+    row.eachCell({ includeEmpty: false }, (cell, col) => {
+      if (col > maxCol) maxCol = col;
+      if (col > MAX_SHEET_COLUMNS) return;
+      const text = stripNulls(cellDisplayText(cell));
+      if (text === "") return;
+      while (vals.length < col - 1) vals.push("");
+      vals.push(text);
+    });
+    if (vals.length > width) width = vals.length;
+    rows.push(vals);
+  });
+  while (rows.length > 0 && rows[rows.length - 1].length === 0) rows.pop();
+  if (rows.length === 0 || width === 0) return { dataRows: -1, skippedTitleRows: 0, droppedColumns: 0 };
 
-  const distinct = (vals: string[]) => new Set(vals.slice(0, width).filter((v) => v !== "")).size;
+  const distinct = (vals: string[]) => new Set(vals.filter((v) => v !== "")).size;
   const firstWide = rows.findIndex((vals) => distinct(vals) >= 2);
   // A one-column sheet has no "wide" row; keep everything from the first non-empty row.
   const headerIndex = firstWide >= 0 ? firstWide : rows.findIndex((vals) => distinct(vals) >= 1);
   const skippedTitleRows = firstWide >= 0 ? rows.slice(0, headerIndex).filter((vals) => distinct(vals) === 1).length : 0;
 
-  const out = rows
-    .slice(headerIndex)
-    .map((vals) => vals.slice(0, width).map(csvField).join(","))
-    .join("\n") + "\n";
-  await writeFile(csvPath, out, "utf8");
-  return { dataRows: rows.length - headerIndex - 1, skippedTitleRows };
+  const out = lineWriter(csvPath);
+  const CHUNK = 5000;
+  for (let i = headerIndex; i < rows.length; i += CHUNK) {
+    const text = rows
+      .slice(i, i + CHUNK)
+      .map((vals) => {
+        const padded = vals.length < width ? vals.concat(new Array(width - vals.length).fill("")) : vals;
+        return padded.map(csvField).join(",");
+      })
+      .join("\n") + "\n";
+    await out.write(text);
+  }
+  await out.end();
+  return { dataRows: rows.length - headerIndex - 1, skippedTitleRows, droppedColumns: Math.max(0, maxCol - MAX_SHEET_COLUMNS) };
 }
 
 function selectTable(manifest: FileManifest, name?: string): FileTableManifest {
@@ -1888,18 +2039,6 @@ function selectTable(manifest: FileManifest, name?: string): FileTableManifest {
     throw new FileStoreError(404, `Sheet "${name}" not found. Available: ${have || "(none)"}.`);
   }
   return t;
-}
-
-/** Serialize rows to RFC-4180 CSV in the given column order. */
-function rowsToCsv(rows: Record<string, unknown>[], columns: string[]): string {
-  const esc = (v: unknown): string => {
-    if (v === null || v === undefined) return "";
-    const s = String(v);
-    return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-  };
-  const lines = [columns.map(esc).join(",")];
-  for (const r of rows) lines.push(columns.map((c) => esc(r[c])).join(","));
-  return lines.join("\r\n");
 }
 
 /**
@@ -2097,8 +2236,9 @@ function capStr(s: string, maxLen?: number): string {
 }
 
 /**
- * Race a promise against a timeout. On timeout, run `onTimeout` (closes the
- * DuckDB instance to abort the in-flight query) and reject.
+ * Race a promise against a timeout. On timeout, run `onTimeout` (interrupts
+ * the DuckDB connection, which is what actually stops a running query) and
+ * reject with a 408.
  */
 function withTimeout<T>(p: Promise<T>, ms: number, onTimeout: () => void): Promise<T> {
   return new Promise<T>((resolve, reject) => {
