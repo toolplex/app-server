@@ -374,7 +374,11 @@ export class FileStore {
     if (!isSafeId(id)) throw new FileStoreError(400, "Invalid upload id.");
     const existing = await this.readRecord(id).catch(() => null);
     if (existing) {
-      if (!this.ownsRecord(existing, requester)) throw new FileStoreError(409, "Upload id already in use.");
+      // The same person retrying: give them their file. Anyone else naming a
+      // taken id — even in the same org — gets nothing back, or a retry would
+      // be a way to read another member's manifest and sample rows.
+      const sameUploader = !!requester.userId && existing.ownerUserId === requester.userId;
+      if (!this.ownsRecord(existing, requester) || !sameUploader) throw new FileStoreError(409, "Upload id already in use.");
       return existing.manifest;
     }
     const running = this.inflight.get(id);
