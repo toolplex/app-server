@@ -196,7 +196,7 @@ export async function extractPdfText(
   // Stage 1
   const stage1 = await extractWithPdfjs(buffer);
   if (stage1 && looksLikeRealText(stage1.pages)) {
-    return buildResult(stage1.pages, false);
+    return buildTextResult(stage1.pages, false);
   }
 
   // Stage 2: OCR fallback
@@ -208,7 +208,7 @@ export async function extractPdfText(
     if (!ocrPdf) return null;
     const stage2 = await extractWithPdfjs(ocrPdf);
     if (!stage2 || !looksLikeRealText(stage2.pages)) return null;
-    return buildResult(stage2.pages, true);
+    return buildTextResult(stage2.pages, true);
   } finally {
     // Best-effort cleanup — worst case the TTL sweep gets these later.
     await unlink(inputPath).catch(() => {});
@@ -216,7 +216,23 @@ export async function extractPdfText(
   }
 }
 
-function buildResult(pages: string[], ocrApplied: boolean): TextExtractionResult {
+/**
+ * Text from any document kind we can read: PDFs here (text layer, then OCR
+ * where the binary exists), Word and PowerPoint via officeText.ts. Returns
+ * null for anything else, or when nothing readable came out.
+ */
+export async function extractDocumentText(
+  buffer: Buffer,
+  mimeType: string,
+  tempDir: string,
+  fileId: string,
+): Promise<TextExtractionResult | null> {
+  if (mimeType === "application/pdf") return extractPdfText(buffer, tempDir, fileId);
+  const { extractOfficeText } = await import("./officeText.js");
+  return extractOfficeText(buffer, mimeType);
+}
+
+export function buildTextResult(pages: string[], ocrApplied: boolean): TextExtractionResult {
   const joined = pages.join(" ");
   const wordCount = joined.split(/\s+/).filter(Boolean).length;
   const charCount = pages.reduce((sum, p) => sum + p.length, 0);

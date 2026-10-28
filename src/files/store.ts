@@ -26,7 +26,7 @@ import {
   type XlsxDocSpec,
   type XlsxOpSpec,
 } from "./documents.js";
-import { extractPdfText } from "./textExtract.js";
+import { extractDocumentText } from "./textExtract.js";
 
 // ---------------------------------------------------------------------------
 // Errors — carry an HTTP status so the route can map them directly.
@@ -253,7 +253,7 @@ export class FileStore {
       }
       this.cfg.reportDirs = resolved;
     }
-    // Sweep any lingering OCR staging files. extractPdfText writes
+    // Sweep any lingering OCR staging files. extractDocumentText (PDF path) writes
     // `${fileId}.ocr-in.pdf` / `${fileId}.ocr-out.pdf` next to the record and
     // cleans them in a finally block, but SIGKILL / OOM / hard restart mid-OCR
     // leaks them. The TTL sweep doesn't handle these (only `.json` records);
@@ -532,10 +532,12 @@ export class FileStore {
       // worst the user loses cheap text mode for that file.
       let kind: "raw" | "text" = "raw";
       let textStats: FileManifest["textStats"];
-      if (mimeType === "application/pdf") {
-        let extracted: Awaited<ReturnType<typeof extractPdfText>> = null;
+      {
+        // PDF, Word or PowerPoint: a text layer the agent can read cheaply,
+        // page by page (slide by slide for a deck). Anything else stays raw.
+        let extracted: Awaited<ReturnType<typeof extractDocumentText>> = null;
         try {
-          extracted = await extractPdfText(buffer, this.cfg.dir, fileId);
+          extracted = await extractDocumentText(buffer, mimeType, this.cfg.dir, fileId);
         } catch {
           extracted = null;
         }
