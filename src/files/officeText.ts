@@ -8,6 +8,8 @@
  * result has the same shape as a PDF's extracted text, so the agent reads a
  * Word file page by page and a deck slide by slide through one tool.
  *
+ * Tables keep their rows: cells of a row are joined by tabs, so a table reads
+ * the way it does in a PDF's text layer rather than as one cell per line.
  * Layout, styling and images are not represented here — this is what the
  * document says, for reading and quoting. The original bytes stay on disk.
  */
@@ -32,20 +34,41 @@ export async function extractOfficeText(buffer: Buffer, mimeType: string): Promi
   return buildTextResult(kept, false);
 }
 
+/**
+ * Structures that nest paragraphs (text boxes, tables) are lifted out of the
+ * XML and replaced by a placeholder paragraph, then spliced back as text
+ * where they sat. Nested cases (a table in a cell, a box in a table) resolve
+ * because expansion repeats until no placeholder is left.
+ */
+class Lifted {
+  private readonly parts: string[] = [];
+  add(text: string): string {
+    this.parts.push(text);
+    return `[[LIFT${this.parts.length - 1}]]`;
+  }
+  expand(text: string): string {
+    let prev: string;
+    do {
+      prev = text;
+      text = text.replace(/\[\[LIFT(\d+)\]\]/g, (_, i: string) => `\n${this.parts[Number(i)] ?? ""}\n`);
+    } while (text !== prev);
+    return text;
+  }
+}
+
 /** Paragraph text of the body, split into pages at explicit page breaks. */
 async function docxPages(zip: JSZip): Promise<string[]> {
   let xml = await partXml(zip, "word/document.xml");
   if (!xml) return [];
-  // Word writes drawings twice (mc:Choice and a Fallback for old readers);
-  // keep one. A text box nests whole paragraphs inside a paragraph, which a
-  // flat paragraph split would cut in half — lift each box out, mark its
-  // place, and splice its paragraphs back in where it sat.
+  // Word writes drawings twice (mc:Choice and a Fallback for old readers); keep one.
   xml = xml.replace(/<mc:Fallback>[\s\S]*?<\/mc:Fallback>/g, "");
-  const boxes: string[] = [];
-  xml = xml.replace(/<w:txbxContent>([\s\S]*?)<\/w:txbxContent>/g, (_, inner: string) => {
-    boxes.push(paragraphs(inner).join("\n"));
-    return `<w:t>[[TXBX${boxes.length - 1}]]</w:t>`;
-  });
+  const lifted = new Lifted();
+  // A text box nests whole paragraphs inside a paragraph, which a flat
+  // paragraph split would cut in half.
+  xml = xml.replace(/<w:txbxContent>([\s\S]*?)<\/w:txbxContent>/g, (_, inner: string) =>
+    `<w:t>${lifted.add(paragraphs(inner).join("\n"))}</w:t>`,
+  );
+  xml = liftTables(xml, lifted, { table: "w:tbl", row: "w:tr", cell: "w:tc", placeholder: (p) => `<w:p><w:r><w:t>${p}</w:t></w:r></w:p>` });
   const pages: string[] = [];
   let current: string[] = [];
   for (const para of paragraphsXml(xml)) {
@@ -53,17 +76,41 @@ async function docxPages(zip: JSZip): Promise<string[]> {
       if (current.length > 0) pages.push(current.join("\n"));
       current = [];
     }
-    current.push(runsText(para).replace(/\[\[TXBX(\d+)\]\]/g, (_, i: string) => `\n${boxes[Number(i)] ?? ""}\n`));
+    current.push(lifted.expand(runsText(para)));
   }
   if (current.length > 0) pages.push(current.join("\n"));
   return pages;
 }
 
-function paragraphsXml(xml: string): string[] {
-  return xml.match(/<w:p[\s>][\s\S]*?<\/w:p>|<w:p\/>/g) ?? [];
+/**
+ * Replace every table with a placeholder paragraph, innermost first, and
+ * record its text: one line per row, cells joined by tabs, a cell's own
+ * paragraphs joined by " / ".
+ */
+function liftTables(
+  xml: string,
+  lifted: Lifted,
+  tags: { table: string; row: string; cell: string; placeholder: (p: string) => string },
+): string {
+  const innermost = new RegExp(`<${tags.table}[\\s>](?:(?!<${tags.table}[\\s>])[\\s\\S])*?</${tags.table}>`);
+  const rowRe = new RegExp(`<${tags.row}[\\s>][\\s\\S]*?</${tags.row}>`, "g");
+  const cellRe = new RegExp(`<${tags.cell}[\\s>][\\s\\S]*?</${tags.cell}>`, "g");
+  for (let m = innermost.exec(xml); m; m = innermost.exec(xml)) {
+    const rows = (m[0].match(rowRe) ?? []).map((tr) =>
+      (tr.match(cellRe) ?? [])
+        .map((tc) => paragraphs(tc).map((t) => t.trim()).filter(Boolean).join(" / "))
+        .join("\t"),
+    );
+    xml = xml.slice(0, m.index) + tags.placeholder(lifted.add(rows.join("\n"))) + xml.slice(m.index + m[0].length);
+  }
+  return xml;
 }
 
-/** Text of each <w:p> in a fragment, in order. */
+function paragraphsXml(xml: string): string[] {
+  return xml.match(/<(?:w|a):p[\s>][\s\S]*?<\/(?:w|a):p>|<(?:w|a):p\/>/g) ?? [];
+}
+
+/** Text of each paragraph (<w:p> or <a:p>) in a fragment, in order. */
 function paragraphs(xml: string): string[] {
   return paragraphsXml(xml).map((p) => runsText(p));
 }
@@ -85,10 +132,14 @@ async function pptxSlides(zip: JSZip): Promise<string[]> {
     .sort((a, b) => a.n - b.n);
   const pages: string[] = [];
   for (const { name, n } of slideFiles) {
-    const xml = await partXml(zip, name);
+    let xml = await partXml(zip, name);
     if (!xml) continue;
-    const lines = (xml.match(/<a:p[\s>][\s\S]*?<\/a:p>/g) ?? [])
-      .map((p) => runsText(p))
+    xml = xml.replace(/<mc:Fallback>[\s\S]*?<\/mc:Fallback>/g, "");
+    const lifted = new Lifted();
+    xml = liftTables(xml, lifted, { table: "a:tbl", row: "a:tr", cell: "a:tc", placeholder: (p) => `<a:p><a:r><a:t>${p}</a:t></a:r></a:p>` });
+    const lines = paragraphsXml(xml)
+      .map((p) => lifted.expand(runsText(p)))
+      .flatMap((t) => t.split("\n"))
       .filter((t) => t.trim().length > 0);
     pages.push([`Slide ${n}`, ...lines].join("\n"));
   }

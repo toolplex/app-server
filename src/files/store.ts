@@ -26,7 +26,7 @@ import {
   type XlsxDocSpec,
   type XlsxOpSpec,
 } from "./documents.js";
-import { extractDocumentText } from "./textExtract.js";
+import { resolveDocumentMime, extractDocumentText } from "./textExtract.js";
 
 // ---------------------------------------------------------------------------
 // Errors — carry an HTTP status so the route can map them directly.
@@ -525,10 +525,13 @@ export class FileStore {
     filename: string,
     buffer: Buffer,
     requester: Requester,
-    mimeType: string,
+    declaredMimeType: string,
     pinned?: boolean,
     givenId?: string,
   ): Promise<FileManifest> {
+    // A generic declaration for a .pdf/.docx/.pptx becomes the document type
+    // (see resolveDocumentMime); validation below runs on the result.
+    const mimeType = resolveDocumentMime(filename, declaredMimeType);
     // Validate the client-declared mimeType — RFC 6838 shape
     // (`type/subtype[+suffix][; params]`). Untrusted input flows straight into
     // the `Content-Type` header when the file is later read via `/files/:id/raw`;

@@ -228,8 +228,32 @@ export async function extractDocumentText(
   fileId: string,
 ): Promise<TextExtractionResult | null> {
   if (mimeType === "application/pdf") return extractPdfText(buffer, tempDir, fileId);
+  if (!OFFICE_TEXT_MIME_TYPES.has(mimeType)) return null;
   const { extractOfficeText } = await import("./officeText.js");
   return extractOfficeText(buffer, mimeType);
+}
+
+const DOCUMENT_MIME_BY_EXTENSION: Record<string, string> = {
+  ".pdf": "application/pdf",
+  ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+};
+const OFFICE_TEXT_MIME_TYPES = new Set(Object.values(DOCUMENT_MIME_BY_EXTENSION).slice(1));
+// What a picker says when it does not know: Windows without Office reports
+// no type for .docx, some Android providers say zip or octet-stream.
+const GENERIC_MIME_TYPES = new Set(["application/octet-stream", "binary/octet-stream", "application/zip", "application/x-zip-compressed", ""]);
+
+/**
+ * The media type to treat an upload as. Clients declare one, and it is kept
+ * when it is specific; a generic declaration for a file whose name says
+ * .pdf/.docx/.pptx resolves to the document type, so the text is extracted
+ * and a later download carries the right Content-Type. The bytes are then
+ * parsed as that type; a wrong guess fails the extraction, nothing worse.
+ */
+export function resolveDocumentMime(filename: string, declared: string): string {
+  if (!GENERIC_MIME_TYPES.has(declared.toLowerCase().split(";")[0].trim())) return declared;
+  const ext = filename.slice(filename.lastIndexOf(".")).toLowerCase();
+  return DOCUMENT_MIME_BY_EXTENSION[ext] ?? declared;
 }
 
 export function buildTextResult(pages: string[], ocrApplied: boolean): TextExtractionResult {
