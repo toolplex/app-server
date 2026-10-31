@@ -244,13 +244,16 @@ const OFFICE_TEXT_MIME_TYPES = new Set(Object.values(DOCUMENT_MIME_BY_EXTENSION)
 const GENERIC_MIME_TYPES = new Set(["application/octet-stream", "binary/octet-stream", "application/zip", "application/x-zip-compressed", ""]);
 
 /**
- * The media type to treat an upload as. Clients declare one, and it is kept
- * when it is specific; a generic declaration for a file whose name says
- * .pdf/.docx/.pptx resolves to the document type, so the text is extracted
- * and a later download carries the right Content-Type. The bytes are then
- * parsed as that type; a wrong guess fails the extraction, nothing worse.
+ * The media type to treat an upload as. The bytes win when they are
+ * unambiguous: a file that starts with %PDF is a PDF whatever it is called
+ * (a mis-extensioned .docx that is really a PDF is common enough). Otherwise
+ * the client's declaration is kept when it is specific; a generic one for a
+ * file whose name says .pdf/.docx/.pptx resolves to the document type, so the
+ * text is extracted and a later download carries the right Content-Type. A
+ * wrong guess fails the extraction and the file stays raw, nothing worse.
  */
-export function resolveDocumentMime(filename: string, declared: string): string {
+export function resolveDocumentMime(filename: string, declared: string, bytes?: Buffer): string {
+  if (bytes && bytes.subarray(0, 5).toString("latin1") === "%PDF-") return DOCUMENT_MIME_BY_EXTENSION[".pdf"];
   if (!GENERIC_MIME_TYPES.has(declared.toLowerCase().split(";")[0].trim())) return declared;
   const ext = filename.slice(filename.lastIndexOf(".")).toLowerCase();
   return DOCUMENT_MIME_BY_EXTENSION[ext] ?? declared;

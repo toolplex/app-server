@@ -531,7 +531,7 @@ export class FileStore {
   ): Promise<FileManifest> {
     // A generic declaration for a .pdf/.docx/.pptx becomes the document type
     // (see resolveDocumentMime); validation below runs on the result.
-    const mimeType = resolveDocumentMime(filename, declaredMimeType);
+    const mimeType = resolveDocumentMime(filename, declaredMimeType, buffer);
     // Validate the client-declared mimeType — RFC 6838 shape
     // (`type/subtype[+suffix][; params]`). Untrusted input flows straight into
     // the `Content-Type` header when the file is later read via `/files/:id/raw`;
