@@ -47,14 +47,18 @@ async function appServerPlugin(
   const authHook = createAuthHook(config.authToken);
   fastify.addHook("onRequest", authHook);
 
+  // File handling is on unless the host turned it off explicitly.
+  const filesEnabled = config.files?.enabled !== false;
+
   // Register @fastify/multipart when either an action declares a file input
-  // OR the smart file-attachment feature is enabled — both parse multipart
-  // bodies. Lazy-imported so consumers that use neither don't need the dep.
-  if (hasFileInputs(config) || config.files?.enabled) {
+  // OR file handling is on — both parse multipart bodies. Lazy-imported so a
+  // server that has turned both off doesn't need the dep.
+  if (hasFileInputs(config) || filesEnabled) {
     const multipartModule = await import("@fastify/multipart").catch(() => {
       throw new Error(
-        "@toolplex/app-server: an action declares a file input but " +
-          "@fastify/multipart is not installed. Run `npm install @fastify/multipart`.",
+        "@toolplex/app-server: @fastify/multipart is not installed. File handling is on by default " +
+          "(and an action may declare a file input). Run `npm install @fastify/multipart`, " +
+          "or pass `files: { enabled: false }` to run without it.",
       );
     });
     await fastify.register(multipartModule.default, {
@@ -74,13 +78,12 @@ async function appServerPlugin(
   registerContextRoutes(fastify, config);
   registerDownloadRoutes(fastify, config);
 
-  // Smart file-attachment feature — ingest CSV/XLSX into an isolated,
-  // read-only DuckDB db and expose manifest + read-only SQL. Encapsulated in
-  // its own scope so its FileStoreError → HTTP-status error handler doesn't
-  // shadow the plugin-level one for the other route groups.
-  const filesEnabled = !!config.files?.enabled;
-  // Alerts, snapshots and history all live in the file store: without it this
-  // server reports none of them, and ToolPlex hides the alerts UI.
+  // File handling — ingest CSV/XLSX/documents into an isolated, read-only
+  // DuckDB db and expose manifest + read-only SQL. Encapsulated in its own
+  // scope so its FileStoreError → HTTP-status error handler doesn't shadow
+  // the plugin-level one for the other route groups.
+  // Alerts, snapshots and history all live in the file store: a server that
+  // turned it off reports none of them, and ToolPlex hides the alerts UI.
   const capabilities = filesEnabled ? CAPABILITIES : { ...CAPABILITIES, snapshots: false, alerts: false, history: false, storage: false };
   let storeForStats: FileStore | null = null;
   fastify.get("/capabilities", async () => ({
@@ -100,16 +103,16 @@ async function appServerPlugin(
       : {}),
   }));
 
-  if (config.files?.enabled) {
+  if (filesEnabled) {
     // The file store pulls in DuckDB (a ~70 MB native library) and ExcelJS.
-    // Loaded here, only when files are on, so a server without them starts
-    // light and the cost shows up where it belongs.
+    // Loaded here, only when files are on, so a server that turned them off
+    // starts light and the cost shows up where it belongs.
     const [{ FileStore }, { registerFileRoutes }, { registerSnapshotRoutes }] = await Promise.all([
       import("./files/store.js"),
       import("./routes/files.js"),
       import("./routes/snapshots.js"),
     ]);
-    const store = new FileStore(config.files);
+    const store = new FileStore(config.files ?? {});
     await store.init();
     storeForStats = store;
     await fastify.register(async (filesScope) => {

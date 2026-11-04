@@ -198,6 +198,11 @@ DuckDB database** instead: the agent receives a compact *manifest* (tables,
 columns + inferred types, row counts, a few sample rows) and pulls exactly
 what it needs on demand via **read-only SQL**.
 
+File handling is **on by default** (since 0.8.14): a server that omits `files`
+still gets uploads, snapshots, alerts and history under the default store
+directory. Pass `files: { enabled: false }` to run without DuckDB. Everything
+below is optional tuning.
+
 ```typescript
 await server.register(registerAppPages, {
   authToken: process.env.TOOLPLEX_APP_TOKEN,
@@ -205,7 +210,7 @@ await server.register(registerAppPages, {
   resources: { /* … */ },
   actions: {},
   files: {
-    enabled: true,
+    // on by default; `enabled: false` turns file handling off
     // dir defaults to ~/.toolplex-app-files (never the OS temp dir)
     ttlMinutes: 10080,      // sweeps only files uploaded with pinned=false (uploads are durable by default since 0.8.0)
     maxUploadBytes: 100 * 1024 * 1024,

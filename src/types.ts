@@ -1110,11 +1110,12 @@ export interface AppServerConfig {
   resources: Record<string, ResourceDefinition>;
   actions: Record<string, ActionHandler>;
   /**
-   * Optional smart file-attachment handling. When `enabled`, the plugin
-   * mounts `/files` routes that ingest uploaded CSV/XLSX into an isolated,
-   * read-only DuckDB database and expose a compact manifest + read-only SQL
-   * query interface for the agent. See FilesConfig. Requires
-   * @fastify/multipart (auto-registered when enabled).
+   * File handling: uploaded CSV/XLSX/documents are ingested into an isolated,
+   * read-only DuckDB database with a compact manifest + read-only SQL for the
+   * agent; page snapshots, alerts and history use the same store. ON BY
+   * DEFAULT — omit this to take the defaults (see FilesConfig for the store
+   * directory and limits); set `{ enabled: false }` to run without it.
+   * Requires @fastify/multipart (auto-registered).
    */
   files?: FilesConfig;
 }

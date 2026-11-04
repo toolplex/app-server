@@ -15,8 +15,13 @@
 // ---------------------------------------------------------------------------
 
 export interface FilesConfig {
-  /** Master switch. When false/absent, no file routes are registered. */
-  enabled: boolean;
+  /**
+   * On unless set to false. File handling is part of what an app server is —
+   * chat attachments, page snapshots, alerts and history all live in its
+   * store — so a server that omits `files` entirely still has it. Set
+   * `enabled: false` only for a server that must run without DuckDB.
+   */
+  enabled?: boolean;
   /**
    * The single persistent store holding uploaded files (smart attachments) AND
    * durable pinned snapshots (artifacts), their per-file DuckDB databases, and
