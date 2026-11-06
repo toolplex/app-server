@@ -1410,53 +1410,8 @@ export class FileStore {
   ): Promise<{ rows: Record<string, unknown>[]; total: number; columns: FileColumn[] }> {
     const record = await this.getOwnedRecord(fileId, requester);
     const table = selectTable(record.manifest, opts.table);
-    const validCols = new Set(table.columns.map((c) => c.name));
     const tbl = quoteIdent(table.name);
-
-    // WHERE — only recognized columns/operators; values are escaped. Semantics
-    // mirror the client's inline filters (case-insensitive contains/equals,
-    // numeric gt/lt, empty/not_empty).
-    const clauses: string[] = [];
-    for (const f of opts.filters ?? []) {
-      if (!validCols.has(f.column)) continue;
-      const col = quoteIdent(f.column);
-      const val = sqlString(f.value ?? "");
-      switch (f.operator) {
-        case "contains":
-          clauses.push(`strpos(lower(CAST(${col} AS VARCHAR)), lower(${val})) > 0`);
-          break;
-        case "equals":
-          clauses.push(`lower(CAST(${col} AS VARCHAR)) = lower(${val})`);
-          break;
-        case "gt":
-          clauses.push(`${numericCoerce(col)} > ${numericCoerce(val)}`);
-          break;
-        case "lt":
-          clauses.push(`${numericCoerce(col)} < ${numericCoerce(val)}`);
-          break;
-        case "empty":
-          clauses.push(`(${col} IS NULL OR CAST(${col} AS VARCHAR) = '')`);
-          break;
-        case "not_empty":
-          clauses.push(`(${col} IS NOT NULL AND CAST(${col} AS VARCHAR) <> '')`);
-          break;
-        default:
-          break;
-      }
-    }
-    const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
-
-    let orderBy = "";
-    if (opts.sort && validCols.has(opts.sort.key)) {
-      const dir = opts.sort.direction === "desc" ? "DESC" : "ASC";
-      const col = quoteIdent(opts.sort.key);
-      // Sort numerically even when the column is stored as text because of
-      // display formatting ("98.20%", "4,600", "₱1,234") — otherwise ORDER BY
-      // collates as strings and "8.71%" lands above "78.16%". Genuine text
-      // (e.g. "May 2026") coerces to NULL, so it falls through to the
-      // lexicographic tie-break; native numeric columns are unaffected.
-      orderBy = `ORDER BY ${numericCoerce(col)} ${dir} NULLS LAST, ${col} ${dir} NULLS LAST`;
-    }
+    const { where, orderBy } = buildRowsClauses(table, opts);
 
     const pageSize = Math.min(Math.max(Math.floor(opts.pageSize) || 100, 1), 1000);
     const page = Math.max(1, Math.floor(opts.page) || 1);
@@ -1508,7 +1463,7 @@ export class FileStore {
   async exportRows(
     fileId: string,
     requester: Requester,
-    opts: { format: "csv" | "xlsx"; table?: string },
+    opts: { format: "csv" | "xlsx"; table?: string } & RowsClauseOpts,
   ): Promise<
     | { filename: string; contentType: string; path: string }
     | { filename: string; contentType: string; buffer: Buffer; truncated: boolean }
@@ -1516,11 +1471,15 @@ export class FileStore {
     const record = await this.getOwnedRecord(fileId, requester);
     const table = selectTable(record.manifest, opts.table);
     const base = (record.manifest.filename || "export").replace(/\.[^.]+$/, "") || "export";
+    // The rendition honours the same filter/sort the table page does, so a
+    // filtered view downloads as the filtered view. Unfiltered callers get
+    // the whole table, as before.
+    const { where, orderBy } = buildRowsClauses(table, opts);
 
     if (opts.format === "csv") {
       const path = join(this.cfg.dir, `${randomUUID()}.export.csv`);
       try {
-        await this.writeTableCsv(record.dbPath, table, path);
+        await this.writeTableCsv(record.dbPath, table, path, where, orderBy);
       } catch (err) {
         await rm(path, { force: true }).catch(() => {});
         throw err;
@@ -1532,7 +1491,7 @@ export class FileStore {
     // lines in an ingested sheet, empty objects in an agent's rows) — in a
     // downloaded file they read as a formatting bug, so the rendition trims
     // them. Trailing only: an interior blank row stays, faithfully.
-    const all = await this.readTableRows(record.dbPath, table.name, EXPORT_XLSX_MAX_ROWS + 1);
+    const all = await this.readTableRows(record.dbPath, table.name, EXPORT_XLSX_MAX_ROWS + 1, where, orderBy);
     const rows = trimTrailingEmptyRows(all.slice(0, EXPORT_XLSX_MAX_ROWS));
     // Styled defaults for the rendition: header row shaded + frozen, columns
     // sized/formatted by inference (see inferColumns) — the export opens
@@ -1598,11 +1557,11 @@ export class FileStore {
    * Excel detects the encoding. Trailing all-empty rows are held back and only
    * written if data follows, which trims them without a second pass.
    */
-  private async writeTableCsv(dbPath: string, table: FileTableManifest, outPath: string): Promise<void> {
+  private async writeTableCsv(dbPath: string, table: FileTableManifest, outPath: string, where = "", orderBy = ""): Promise<void> {
     await this.withQueryConn(
       dbPath,
       async (conn, bounded) => {
-        const result = await bounded(conn.stream(`SELECT * FROM ${quoteIdent(table.name)}`));
+        const result = await bounded(conn.stream(`SELECT * FROM ${quoteIdent(table.name)} ${where} ${orderBy}`));
         const names = result.columnNames();
         const out = lineWriter(outPath);
         const line = (row: Record<string, unknown>) => names.map((c) => csvField(csvText(row[c]))).join(",") + "\r\n";
@@ -1636,9 +1595,9 @@ export class FileStore {
   }
 
   /** Read up to `limit` rows of a table from a snapshot's DuckDB (read-only sandbox). */
-  private async readTableRows(dbPath: string, tableName: string, limit: number): Promise<Record<string, unknown>[]> {
+  private async readTableRows(dbPath: string, tableName: string, limit: number, where = "", orderBy = ""): Promise<Record<string, unknown>[]> {
     return this.withQueryConn(dbPath, async (conn, bounded) => {
-      const reader = await bounded(conn.runAndReadUntil(`SELECT * FROM ${quoteIdent(tableName)} LIMIT ${limit}`, limit + 1));
+      const reader = await bounded(conn.runAndReadUntil(`SELECT * FROM ${quoteIdent(tableName)} ${where} ${orderBy} LIMIT ${limit}`, limit + 1));
       return reader.getRowObjects().slice(0, limit).map((r) => normalizeRow(r));
     });
   }
@@ -2121,6 +2080,63 @@ function selectTable(manifest: FileManifest, name?: string): FileTableManifest {
  * (e.g. "May 2026") doesn't reduce to a number → NULL, so callers fall back to
  * a text comparison. `expr` must already be a quoted identifier or literal.
  */
+/** The filter/sort a table page or export honours. Shared so "Download as…"
+ *  produces exactly the rows the user is looking at: the desktop sends the
+ *  same _cf_/sort on both, and this is the one place they turn into SQL. */
+export type RowsClauseOpts = {
+  sort?: { key: string; direction: "asc" | "desc" };
+  filters?: { column: string; operator: string; value: string }[];
+};
+
+/** WHERE/ORDER BY for a snapshot table. Only recognized columns/operators;
+ *  values are escaped. Semantics mirror the client's inline filters
+ *  (case-insensitive contains/equals, numeric gt/lt, empty/not_empty). */
+function buildRowsClauses(table: FileTableManifest, opts: RowsClauseOpts): { where: string; orderBy: string } {
+  const validCols = new Set(table.columns.map((c) => c.name));
+  const clauses: string[] = [];
+  for (const f of opts.filters ?? []) {
+    if (!validCols.has(f.column)) continue;
+    const col = quoteIdent(f.column);
+    const val = sqlString(f.value ?? "");
+    switch (f.operator) {
+      case "contains":
+        clauses.push(`strpos(lower(CAST(${col} AS VARCHAR)), lower(${val})) > 0`);
+        break;
+      case "equals":
+        clauses.push(`lower(CAST(${col} AS VARCHAR)) = lower(${val})`);
+        break;
+      case "gt":
+        clauses.push(`${numericCoerce(col)} > ${numericCoerce(val)}`);
+        break;
+      case "lt":
+        clauses.push(`${numericCoerce(col)} < ${numericCoerce(val)}`);
+        break;
+      case "empty":
+        clauses.push(`(${col} IS NULL OR CAST(${col} AS VARCHAR) = '')`);
+        break;
+      case "not_empty":
+        clauses.push(`(${col} IS NOT NULL AND CAST(${col} AS VARCHAR) <> '')`);
+        break;
+      default:
+        break;
+    }
+  }
+  const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+
+  let orderBy = "";
+  if (opts.sort && validCols.has(opts.sort.key)) {
+    const dir = opts.sort.direction === "desc" ? "DESC" : "ASC";
+    const col = quoteIdent(opts.sort.key);
+    // Sort numerically even when the column is stored as text because of
+    // display formatting ("98.20%", "4,600", "₱1,234") — otherwise ORDER BY
+    // collates as strings and "8.71%" lands above "78.16%". Genuine text
+    // (e.g. "May 2026") coerces to NULL, so it falls through to the
+    // lexicographic tie-break; native numeric columns are unaffected.
+    orderBy = `ORDER BY ${numericCoerce(col)} ${dir} NULLS LAST, ${col} ${dir} NULLS LAST`;
+  }
+  return { where, orderBy };
+}
+
 function numericCoerce(expr: string): string {
   return `TRY_CAST(regexp_replace(CAST(${expr} AS VARCHAR), '[%,$€£₱ ]', '', 'g') AS DOUBLE)`;
 }

@@ -8,6 +8,31 @@ import { readUserHeaders, readOrgHeader } from "../user.js";
 import { FileStore, FileStoreError, type Requester } from "../files/store.js";
 import type { XlsxDocSpec } from "../files/documents.js";
 
+/** The desktop's page-data contract, shared by /rows and /export:
+ *  sort=key,dir and column filters as _cf_<col>__<op>=value. */
+function parseRowsQuery(q: Record<string, string>): {
+  sort?: { key: string; direction: "asc" | "desc" };
+  filters: { column: string; operator: string; value: string }[];
+} {
+  let sort: { key: string; direction: "asc" | "desc" } | undefined;
+  if (typeof q.sort === "string" && q.sort.includes(",")) {
+    const [key, dir] = q.sort.split(",");
+    if (key) sort = { key, direction: dir === "desc" ? "desc" : "asc" };
+  }
+  const filters: { column: string; operator: string; value: string }[] = [];
+  for (const [k, v] of Object.entries(q)) {
+    if (!k.startsWith("_cf_") || typeof v !== "string") continue;
+    const rest = k.slice(4);
+    const idx = rest.indexOf("__");
+    if (idx === -1) continue;
+    const operator = rest.slice(idx + 2);
+    // empty / not_empty carry no value; the rest need one.
+    if (v === "" && operator !== "empty" && operator !== "not_empty") continue;
+    filters.push({ column: rest.slice(0, idx), operator, value: v });
+  }
+  return { sort, filters };
+}
+
 // ---------------------------------------------------------------------------
 // File routes — upload, manifest, read-only query, delete.
 //
@@ -301,13 +326,20 @@ export function registerFileRoutes(
 
   // GET /artifacts/:id/export?format=csv|xlsx&table= — on-the-fly rendition of a
   // report snapshot (NOT persisted). Powers "Download as…" on table artifacts.
-  fastify.get<{ Params: { id: string }; Querystring: { format?: string; table?: string } }>(
+  // Accepts the same sort=key,dir and _cf_<col>__<op>=value as /rows, so the
+  // download is the filtered, sorted view the user is looking at — not the
+  // whole table under a filtered table's name.
+  fastify.get<{ Params: { id: string }; Querystring: Record<string, string> }>(
     "/artifacts/:id/export",
     async (request, reply) => {
-      const format = request.query.format === "xlsx" ? "xlsx" : "csv";
+      const q = request.query;
+      const format = q.format === "xlsx" ? "xlsx" : "csv";
+      const { sort, filters } = parseRowsQuery(q);
       const out = await store.exportRows(request.params.id, requesterOf(request), {
         format,
-        table: request.query.table,
+        table: typeof q.table === "string" ? q.table : undefined,
+        sort,
+        filters,
       });
       reply.header("Content-Type", out.contentType);
       reply.header("Content-Disposition", contentDisposition(out.filename));
@@ -334,23 +366,7 @@ export function registerFileRoutes(
       const page = Math.max(1, Number(q.page) || 1);
       const pageSize = Math.min(Math.max(Number(q.pageSize) || 100, 1), 1000);
 
-      let sort: { key: string; direction: "asc" | "desc" } | undefined;
-      if (typeof q.sort === "string" && q.sort.includes(",")) {
-        const [key, dir] = q.sort.split(",");
-        if (key) sort = { key, direction: dir === "desc" ? "desc" : "asc" };
-      }
-
-      const filters: { column: string; operator: string; value: string }[] = [];
-      for (const [k, v] of Object.entries(q)) {
-        if (!k.startsWith("_cf_") || typeof v !== "string") continue;
-        const rest = k.slice(4);
-        const idx = rest.indexOf("__");
-        if (idx === -1) continue;
-        const operator = rest.slice(idx + 2);
-        // empty / not_empty carry no value; the rest need one.
-        if (v === "" && operator !== "empty" && operator !== "not_empty") continue;
-        filters.push({ column: rest.slice(0, idx), operator, value: v });
-      }
+      const { sort, filters } = parseRowsQuery(q);
 
       const result = await store.queryRows(request.params.id, requesterOf(request), {
         page,
