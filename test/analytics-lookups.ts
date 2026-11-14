@@ -12,6 +12,8 @@ db.exec(`
   CREATE TABLE dim_store (store_name TEXT, chain TEXT);
   CREATE TABLE dim_sku (stock_num TEXT, brand TEXT);
   CREATE TABLE dim_variant (stock_id INTEGER, color TEXT);
+  CREATE TABLE monthly (year INTEGER, month INTEGER, sale_date TEXT, amt REAL);
+  INSERT INTO monthly VALUES (2025,12,'2025-12-31',1),(2026,7,'2026-07-21',2),(2026,3,'2026-03-05',3),(NULL,9,NULL,4);
   CREATE TABLE secrets (k TEXT);
   INSERT INTO dim_store VALUES ('TSB BAZAAR','Other'),('TSB BAZAAR','Other'),('SM AURA','SM'),('LONE','Other'),('LONE','Other');
   INSERT INTO dim_variant VALUES (142,'RED'),(142,'BLUE'),(7,'RED');
@@ -23,7 +25,7 @@ const cfg = { dialect: "sqlite" as const, query, deniedTables: ["secrets"], sqlT
 const a = createAnalytics(cfg);
 
 const tables = await a.schema();
-assert.deepEqual(tables.map((t) => t.name).sort(), ["dim_sku", "dim_store", "dim_variant", "fact_sales"]); // the denied table is absent
+assert.deepEqual(tables.map((t) => t.name).sort(), ["dim_sku", "dim_store", "dim_variant", "fact_sales", "monthly"]); // the denied table is absent
 assert.deepEqual(tables.find((t) => t.name === "dim_sku")!.columns.map((c) => c.name), ["stock_num", "brand"]);
 
 const d = await a.distinct({ table: "DIM_SKU", column: "Brand", values: ["BURLINGTON", "Pumas", ""] }) as any;
@@ -46,12 +48,18 @@ await mixed.repeats({ left: { table: "fact_sales", columns: ["store_name"] }, ri
 assert.doesNotMatch(seen[seen.length - 1], /CAST/); // same kind of type: compared as they are
 assert.match(((await a.repeats({ left: { table: "fact_sales", columns: ["x"] }, right: { table: "dim_sku", columns: ["stock_num"] } })) as any).error, /unknown column/);
 
+// where the data ends: the latest (year, month) is 2026-07, not the greatest month of any year
+assert.deepEqual(await a.latest({ table: "monthly", columns: ["year", "month"] }), { table: "monthly", columns: ["year", "month"], latest: ["2026", "7"] });
+assert.deepEqual(((await a.latest({ table: "MONTHLY", columns: ["sale_date"] })) as any).latest, ["2026-07-21"]);
+assert.equal(((await a.latest({ table: "secrets", columns: ["k"] })) as any).latest, undefined);
+assert.match(((await a.latest({ table: "monthly", columns: [] })) as any).error, /1 to 3 columns/);
+
 // Over HTTP, behind the plugin's bearer token; absent when not configured.
 const on = Fastify();
 await on.register(registerAppPages, { authToken: "t", pages: {}, resources: {}, actions: {}, files: { enabled: false }, analytics: cfg });
 const h = { authorization: "Bearer t" };
 assert.equal((await on.inject({ url: "/analytics/schema" })).statusCode, 401);
-assert.deepEqual((await on.inject({ url: "/analytics/info", headers: h })).json(), { analytics_version: 3, dialect: "sqlite", sql_tools: ["execute_sql", "generate_from_sql"] });
+assert.deepEqual((await on.inject({ url: "/analytics/info", headers: h })).json(), { analytics_version: 4, dialect: "sqlite", sql_tools: ["execute_sql", "generate_from_sql"] });
 assert.equal((await on.inject({ url: "/capabilities", headers: h })).json().capabilities.analytics, true);
 const rep = await on.inject({ method: "POST", url: "/analytics/repeats", headers: h, payload: { left: { table: "fact_sales", columns: ["store_name"] }, right: { table: "dim_store", columns: ["store_name"] } } });
 assert.equal(rep.json().repeated, 1);

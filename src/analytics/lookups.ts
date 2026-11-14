@@ -7,6 +7,7 @@
 //   GET  /analytics/schema    tables and views with their columns and types
 //   POST /analytics/distinct  { table, column, values } → which values exist, and the closest real ones
 //   POST /analytics/repeats   { left, right } → how many join-key values repeat in both tables
+//   POST /analytics/latest    { table, columns } → the latest row by a date, or by a year and a month
 //
 // Every route is read-only. Identifiers are only ever taken from the live
 // schema, never from the request, and values are bound as parameters, so a
@@ -39,11 +40,12 @@ export interface AnalyticsTable { name: string; kind: "table" | "view"; columns:
 /** One side of a join: a table and the column(s) it is joined on. */
 export interface JoinSide { table?: string; columns?: unknown[] }
 
-export const ANALYTICS_VERSION = 3;
+export const ANALYTICS_VERSION = 4;
 const SCHEMA_TTL_MS = 10 * 60_000;
 const MAX_VALUES = 20;
 const MAX_CLOSEST_LOOKUPS = 8;
 const MAX_JOIN_COLUMNS = 6;
+const MAX_LATEST_COLUMNS = 3;
 
 export function createAnalytics(deps: AnalyticsConfig) {
   let cached: { at: number; tables: AnalyticsTable[] } | null = null;
@@ -191,7 +193,33 @@ export function createAnalytics(deps: AnalyticsConfig) {
     return { left: out(l), right: out(r), repeated: Number(rows[0]?.n ?? 0) };
   }
 
-  return { schema, distinct, repeats, resolve };
+  /**
+   * Where a table's data ends: the greatest value of a date column, or of an
+   * ordered pair such as (year, month). Data often lags the calendar, and a
+   * query whose period runs past this point is totalling a period that is
+   * missing or only partly there. Values come back as text.
+   */
+  async function latest(body: { table?: string; columns?: unknown[] }) {
+    const cols = Array.isArray(body?.columns) ? body!.columns.map(String) : [];
+    if (!body?.table || !cols.length || cols.length > MAX_LATEST_COLUMNS) return { error: "a table and 1 to 3 columns are required" };
+    const resolved: string[] = [];
+    let table = "";
+    for (const c of cols) {
+      const r = await resolve(body.table, c);
+      if ("error" in r) return { error: r.error };
+      table = r.table;
+      resolved.push(r.column);
+    }
+    const rows = await deps.query(
+      `SELECT ${resolved.map((c, i) => `CAST(${quoteIdent(c)} AS TEXT) AS c${i + 1}`).join(", ")} FROM ${quoteIdent(table)}` +
+        ` WHERE ${resolved.map((c) => `${quoteIdent(c)} IS NOT NULL`).join(" AND ")}` +
+        ` ORDER BY ${resolved.map((c) => `${quoteIdent(c)} DESC`).join(", ")} LIMIT 1`,
+      [],
+    );
+    return { table, columns: resolved, latest: rows[0] ? resolved.map((_, i) => String(rows[0][`c${i + 1}`])) : null };
+  }
+
+  return { schema, distinct, repeats, latest, resolve };
 }
 
 /** Types that compare with each other without a cast: numbers, text, dates. "" when the type is not known. */
@@ -230,4 +258,6 @@ export function registerAnalyticsRoutes(app: FastifyInstance, deps: AnalyticsCon
     guard(reply, () => analytics.distinct(req.body ?? {})));
   app.post<{ Body: { left?: JoinSide; right?: JoinSide } }>("/analytics/repeats", async (req, reply) =>
     guard(reply, () => analytics.repeats(req.body ?? {})));
+  app.post<{ Body: { table?: string; columns?: unknown[] } }>("/analytics/latest", async (req, reply) =>
+    guard(reply, () => analytics.latest(req.body ?? {})));
 }

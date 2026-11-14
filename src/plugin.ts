@@ -89,7 +89,7 @@ async function appServerPlugin(
   // turned it off reports none of them, and ToolPlex hides the alerts UI.
   const capabilities = {
     ...(filesEnabled ? CAPABILITIES : { ...CAPABILITIES, snapshots: false, alerts: false, history: false, storage: false }),
-    /** GET /analytics/schema, POST /analytics/distinct, POST /analytics/repeats. */
+    /** GET /analytics/schema, POST /analytics/distinct, /analytics/repeats, /analytics/latest. */
     analytics: !!config.analytics,
   };
   let storeForStats: FileStore | null = null;
