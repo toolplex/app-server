@@ -8,6 +8,7 @@ import { registerDataRoutes } from "./routes/data.js";
 import { registerActionRoutes } from "./routes/actions.js";
 import { registerContextRoutes } from "./routes/context.js";
 import { registerDownloadRoutes } from "./routes/download.js";
+import { registerAnalyticsRoutes } from "./analytics/lookups.js";
 import type { FileStore } from "./files/store.js";
 import { createRequire } from "node:module";
 
@@ -77,6 +78,8 @@ async function appServerPlugin(
   registerActionRoutes(fastify, config);
   registerContextRoutes(fastify, config);
   registerDownloadRoutes(fastify, config);
+  // Analytics lookups for the ToolPlex analytics engine — only when the host configured them.
+  if (config.analytics) registerAnalyticsRoutes(fastify, config.analytics);
 
   // File handling — ingest CSV/XLSX/documents into an isolated, read-only
   // DuckDB db and expose manifest + read-only SQL. Encapsulated in its own
@@ -84,7 +87,11 @@ async function appServerPlugin(
   // the plugin-level one for the other route groups.
   // Alerts, snapshots and history all live in the file store: a server that
   // turned it off reports none of them, and ToolPlex hides the alerts UI.
-  const capabilities = filesEnabled ? CAPABILITIES : { ...CAPABILITIES, snapshots: false, alerts: false, history: false, storage: false };
+  const capabilities = {
+    ...(filesEnabled ? CAPABILITIES : { ...CAPABILITIES, snapshots: false, alerts: false, history: false, storage: false }),
+    /** GET /analytics/schema, POST /analytics/distinct, POST /analytics/repeats. */
+    analytics: !!config.analytics,
+  };
   let storeForStats: FileStore | null = null;
   fastify.get("/capabilities", async () => ({
     version: PKG_VERSION,

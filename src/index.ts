@@ -1,6 +1,8 @@
 // @toolplex/app-server — Fastify plugin for serving ToolPlex App Pages
 
 export { registerAppPages } from "./plugin.js";
+export { createAnalytics } from "./analytics/lookups.js";
+export type { AnalyticsConfig, AnalyticsDialect, AnalyticsTable, AnalyticsColumn } from "./analytics/lookups.js";
 
 // In-memory column filter helper for handlers that work with JS arrays
 // (dev/demo data sources). DB-backed handlers should translate

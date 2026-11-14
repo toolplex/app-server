@@ -1118,6 +1118,14 @@ export interface AppServerConfig {
    * Requires @fastify/multipart (auto-registered).
    */
   files?: FilesConfig;
+  /**
+   * Analytics lookups for the ToolPlex analytics engine: read-only facts
+   * about the client's analytics database (its tables and columns, whether
+   * given values exist in a column, whether a join's key values repeat) and
+   * the names of the client's SQL tools. Omit to run without them; the
+   * engine then records its checks for this server as not run.
+   */
+  analytics?: import("./analytics/lookups.js").AnalyticsConfig;
 }
 
 // ---------------------------------------------------------------------------

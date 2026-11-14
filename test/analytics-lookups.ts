@@ -1,0 +1,53 @@
+// Analytics lookups against a real SQLite database (node:sqlite): schema,
+// values that exist / do not, join keys that repeat, and the HTTP routes.
+// Run: npx tsx test/analytics-lookups.ts
+import assert from "node:assert/strict";
+import { DatabaseSync } from "node:sqlite";
+import Fastify from "fastify";
+import { registerAppPages, createAnalytics } from "../src/index.js";
+
+const db = new DatabaseSync(":memory:");
+db.exec(`
+  CREATE TABLE fact_sales (stock_num TEXT, store_name TEXT, sold INTEGER);
+  CREATE TABLE dim_store (store_name TEXT, chain TEXT);
+  CREATE TABLE dim_sku (stock_num TEXT, brand TEXT);
+  CREATE TABLE secrets (k TEXT);
+  INSERT INTO dim_store VALUES ('TSB BAZAAR','Other'),('TSB BAZAAR','Other'),('SM AURA','SM'),('LONE','Other'),('LONE','Other');
+  INSERT INTO dim_sku VALUES ('142','Burlington'),('0222','Burlington'),('PM','Puma');
+  INSERT INTO fact_sales VALUES ('142','TSB BAZAAR',30),('0222','TSB BAZAAR',60),('142','SM AURA',5),('PM','SM AURA',7),('PM','LONE',1);
+`);
+const query = async (sql: string, params: unknown[]) => db.prepare(sql).all(...(params as any[])) as Record<string, unknown>[];
+const cfg = { dialect: "sqlite" as const, query, deniedTables: ["secrets"], sqlTools: ["execute_sql", "generate_from_sql"] };
+const a = createAnalytics(cfg);
+
+const tables = await a.schema();
+assert.deepEqual(tables.map((t) => t.name).sort(), ["dim_sku", "dim_store", "fact_sales"]); // the denied table is absent
+assert.deepEqual(tables.find((t) => t.name === "dim_sku")!.columns.map((c) => c.name), ["stock_num", "brand"]);
+
+const d = await a.distinct({ table: "DIM_SKU", column: "Brand", values: ["BURLINGTON", "Pumas", ""] }) as any;
+assert.deepEqual(d.matches, [{ value: "Burlington", count: 2 }]); // found, in its real spelling
+assert.deepEqual(d.missing, [{ value: "Pumas", closest: [{ value: "Puma", count: 1 }] }]);
+assert.match(((await a.distinct({ table: "secrets", column: "k", values: ["x"] })) as any).error, /unknown table/);
+assert.match(((await a.distinct({ table: "dim_sku", column: "nope\"; DROP", values: ["x"] })) as any).error, /unknown column/);
+
+// TSB BAZAAR repeats in both tables; LONE repeats only in dim_store; SM AURA only in fact_sales.
+assert.equal(((await a.repeats({ left: { table: "fact_sales", columns: ["store_name"] }, right: { table: "dim_store", columns: ["store_name"] } })) as any).repeated, 1);
+// a key that is unique on one side repeats nothing
+assert.equal(((await a.repeats({ left: { table: "fact_sales", columns: ["stock_num"] }, right: { table: "dim_sku", columns: ["stock_num"] } })) as any).repeated, 0);
+assert.match(((await a.repeats({ left: { table: "fact_sales", columns: ["x"] }, right: { table: "dim_sku", columns: ["stock_num"] } })) as any).error, /unknown column/);
+
+// Over HTTP, behind the plugin's bearer token; absent when not configured.
+const on = Fastify();
+await on.register(registerAppPages, { authToken: "t", pages: {}, resources: {}, actions: {}, files: { enabled: false }, analytics: cfg });
+const h = { authorization: "Bearer t" };
+assert.equal((await on.inject({ url: "/analytics/schema" })).statusCode, 401);
+assert.deepEqual((await on.inject({ url: "/analytics/info", headers: h })).json(), { analytics_version: 2, dialect: "sqlite", sql_tools: ["execute_sql", "generate_from_sql"] });
+assert.equal((await on.inject({ url: "/capabilities", headers: h })).json().capabilities.analytics, true);
+const rep = await on.inject({ method: "POST", url: "/analytics/repeats", headers: h, payload: { left: { table: "fact_sales", columns: ["store_name"] }, right: { table: "dim_store", columns: ["store_name"] } } });
+assert.equal(rep.json().repeated, 1);
+assert.equal((await on.inject({ method: "POST", url: "/analytics/distinct", headers: h, payload: { table: "nope", column: "x" } })).statusCode, 400);
+const off = Fastify();
+await off.register(registerAppPages, { authToken: "t", pages: {}, resources: {}, actions: {}, files: { enabled: false } });
+assert.equal((await off.inject({ url: "/analytics/schema", headers: h })).statusCode, 404);
+assert.equal((await off.inject({ url: "/capabilities", headers: h })).json().capabilities.analytics, false);
+console.log("analytics lookups: ok");
