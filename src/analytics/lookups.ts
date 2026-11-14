@@ -39,7 +39,7 @@ export interface AnalyticsTable { name: string; kind: "table" | "view"; columns:
 /** One side of a join: a table and the column(s) it is joined on. */
 export interface JoinSide { table?: string; columns?: unknown[] }
 
-export const ANALYTICS_VERSION = 2;
+export const ANALYTICS_VERSION = 3;
 const SCHEMA_TTL_MS = 10 * 60_000;
 const MAX_VALUES = 20;
 const MAX_CLOSEST_LOOKUPS = 8;
@@ -100,7 +100,7 @@ export function createAnalytics(deps: AnalyticsConfig) {
     if (!t) return { error: `unknown table '${table}'` } as const;
     const c = t.columns.find((x) => x.name.toLowerCase() === String(column).toLowerCase());
     if (!c) return { error: `unknown column '${column}' on '${t.name}'` } as const;
-    return { table: t.name, column: c.name } as const;
+    return { table: t.name, column: c.name, type: c.type } as const;
   }
 
   /**
@@ -162,30 +162,46 @@ export function createAnalytics(deps: AnalyticsConfig) {
    * nothing. One aggregate; the same SQL on Postgres and SQLite.
    */
   async function repeats(body: { left?: JoinSide; right?: JoinSide }) {
-    const sides: { table: string; columns: string[] }[] = [];
+    const sides: { table: string; columns: string[]; types: string[] }[] = [];
     for (const side of [body?.left, body?.right]) {
       const cols = Array.isArray(side?.columns) ? side!.columns.map(String) : [];
       if (!side?.table || !cols.length || cols.length > MAX_JOIN_COLUMNS) return { error: "left and right each need a table and 1 to 6 columns" };
       const resolved: string[] = [];
+      const types: string[] = [];
       let table = "";
       for (const c of cols) {
         const r = await resolve(side.table, c);
         if ("error" in r) return { error: r.error };
         table = r.table;
         resolved.push(r.column);
+        types.push(typeFamily(r.type));
       }
-      sides.push({ table, columns: resolved });
+      sides.push({ table, columns: resolved, types });
     }
     const [l, r] = sides;
     if (l.columns.length !== r.columns.length) return { error: "left and right need the same number of columns" };
+    // A text key joined to a number (the query casts one of them) is compared as text on both sides:
+    // '7' matches 7. A value written two ways ('007') is not matched, so the count can only be low.
+    const asText = l.types.map((t, i) => !!t && !!r.types[i] && t !== r.types[i]);
     const grouped = (s: { table: string; columns: string[] }) =>
-      `SELECT ${s.columns.map((c, i) => `${quoteIdent(c)} AS c${i + 1}`).join(", ")} FROM ${quoteIdent(s.table)} GROUP BY ${s.columns.map((_, i) => i + 1).join(", ")} HAVING COUNT(*) > 1`;
+      `SELECT ${s.columns.map((c, i) => `${asText[i] ? `CAST(${quoteIdent(c)} AS TEXT)` : quoteIdent(c)} AS c${i + 1}`).join(", ")} FROM ${quoteIdent(s.table)} GROUP BY ${s.columns.map((_, i) => i + 1).join(", ")} HAVING COUNT(*) > 1`;
     const on = l.columns.map((_, i) => `a.c${i + 1} = b.c${i + 1}`).join(" AND ");
     const rows = await deps.query(`SELECT COUNT(*) AS n FROM (${grouped(l)}) a JOIN (${grouped(r)}) b ON ${on}`, []);
-    return { left: l, right: r, repeated: Number(rows[0]?.n ?? 0) };
+    const out = (s: { table: string; columns: string[] }) => ({ table: s.table, columns: s.columns });
+    return { left: out(l), right: out(r), repeated: Number(rows[0]?.n ?? 0) };
   }
 
   return { schema, distinct, repeats, resolve };
+}
+
+/** Types that compare with each other without a cast: numbers, text, dates. "" when the type is not known. */
+export function typeFamily(type: string | undefined): string {
+  const t = (type ?? "").toLowerCase().trim();
+  if (!t) return "";
+  if (/int|numeric|decimal|real|double|float|serial|money/.test(t)) return "number";
+  if (/char|text|string|clob/.test(t)) return "text";
+  if (/date|time/.test(t)) return "time";
+  return t.replace(/\(.*$/, "");
 }
 
 /** The longest run of letters/digits (≥3 chars) — what a closest-value search keys on. */

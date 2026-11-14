@@ -11,8 +11,10 @@ db.exec(`
   CREATE TABLE fact_sales (stock_num TEXT, store_name TEXT, sold INTEGER);
   CREATE TABLE dim_store (store_name TEXT, chain TEXT);
   CREATE TABLE dim_sku (stock_num TEXT, brand TEXT);
+  CREATE TABLE dim_variant (stock_id INTEGER, color TEXT);
   CREATE TABLE secrets (k TEXT);
   INSERT INTO dim_store VALUES ('TSB BAZAAR','Other'),('TSB BAZAAR','Other'),('SM AURA','SM'),('LONE','Other'),('LONE','Other');
+  INSERT INTO dim_variant VALUES (142,'RED'),(142,'BLUE'),(7,'RED');
   INSERT INTO dim_sku VALUES ('142','Burlington'),('0222','Burlington'),('PM','Puma');
   INSERT INTO fact_sales VALUES ('142','TSB BAZAAR',30),('0222','TSB BAZAAR',60),('142','SM AURA',5),('PM','SM AURA',7),('PM','LONE',1);
 `);
@@ -21,7 +23,7 @@ const cfg = { dialect: "sqlite" as const, query, deniedTables: ["secrets"], sqlT
 const a = createAnalytics(cfg);
 
 const tables = await a.schema();
-assert.deepEqual(tables.map((t) => t.name).sort(), ["dim_sku", "dim_store", "fact_sales"]); // the denied table is absent
+assert.deepEqual(tables.map((t) => t.name).sort(), ["dim_sku", "dim_store", "dim_variant", "fact_sales"]); // the denied table is absent
 assert.deepEqual(tables.find((t) => t.name === "dim_sku")!.columns.map((c) => c.name), ["stock_num", "brand"]);
 
 const d = await a.distinct({ table: "DIM_SKU", column: "Brand", values: ["BURLINGTON", "Pumas", ""] }) as any;
@@ -34,6 +36,14 @@ assert.match(((await a.distinct({ table: "dim_sku", column: "nope\"; DROP", valu
 assert.equal(((await a.repeats({ left: { table: "fact_sales", columns: ["store_name"] }, right: { table: "dim_store", columns: ["store_name"] } })) as any).repeated, 1);
 // a key that is unique on one side repeats nothing
 assert.equal(((await a.repeats({ left: { table: "fact_sales", columns: ["stock_num"] }, right: { table: "dim_sku", columns: ["stock_num"] } })) as any).repeated, 0);
+// a text key against a number (the query casts one): compared as text, '142' is 142
+const seen: string[] = [];
+const mixed = createAnalytics({ ...cfg, query: (sql, params) => { seen.push(sql); return query(sql, params); } });
+assert.deepEqual(await mixed.repeats({ left: { table: "fact_sales", columns: ["stock_num"] }, right: { table: "dim_variant", columns: ["stock_id"] } }),
+  { left: { table: "fact_sales", columns: ["stock_num"] }, right: { table: "dim_variant", columns: ["stock_id"] }, repeated: 1 });
+assert.match(seen[seen.length - 1], /CAST\("stock_num" AS TEXT\) AS c1 FROM "fact_sales".*CAST\("stock_id" AS TEXT\) AS c1 FROM "dim_variant"/s);
+await mixed.repeats({ left: { table: "fact_sales", columns: ["store_name"] }, right: { table: "dim_store", columns: ["store_name"] } });
+assert.doesNotMatch(seen[seen.length - 1], /CAST/); // same kind of type: compared as they are
 assert.match(((await a.repeats({ left: { table: "fact_sales", columns: ["x"] }, right: { table: "dim_sku", columns: ["stock_num"] } })) as any).error, /unknown column/);
 
 // Over HTTP, behind the plugin's bearer token; absent when not configured.
@@ -41,7 +51,7 @@ const on = Fastify();
 await on.register(registerAppPages, { authToken: "t", pages: {}, resources: {}, actions: {}, files: { enabled: false }, analytics: cfg });
 const h = { authorization: "Bearer t" };
 assert.equal((await on.inject({ url: "/analytics/schema" })).statusCode, 401);
-assert.deepEqual((await on.inject({ url: "/analytics/info", headers: h })).json(), { analytics_version: 2, dialect: "sqlite", sql_tools: ["execute_sql", "generate_from_sql"] });
+assert.deepEqual((await on.inject({ url: "/analytics/info", headers: h })).json(), { analytics_version: 3, dialect: "sqlite", sql_tools: ["execute_sql", "generate_from_sql"] });
 assert.equal((await on.inject({ url: "/capabilities", headers: h })).json().capabilities.analytics, true);
 const rep = await on.inject({ method: "POST", url: "/analytics/repeats", headers: h, payload: { left: { table: "fact_sales", columns: ["store_name"] }, right: { table: "dim_store", columns: ["store_name"] } } });
 assert.equal(rep.json().repeated, 1);
