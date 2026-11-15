@@ -54,12 +54,47 @@ assert.deepEqual(((await a.latest({ table: "MONTHLY", columns: ["sale_date"] }))
 assert.equal(((await a.latest({ table: "secrets", columns: ["k"] })) as any).latest, undefined);
 assert.match(((await a.latest({ table: "monthly", columns: [] })) as any).error, /1 to 3 columns/);
 
+// a view over a denied table shows its rows under another name: it is hidden too, and so is a view over that view
+db.exec(`
+  CREATE VIEW v_secrets AS SELECT k FROM secrets;
+  CREATE VIEW v_again AS SELECT k FROM v_secrets;
+  CREATE VIEW v_stores AS SELECT store_name FROM dim_store;
+  CREATE TABLE not_secrets (k TEXT);
+  CREATE TABLE keyed (id INTEGER PRIMARY KEY, code TEXT, region TEXT, v TEXT);
+  CREATE UNIQUE INDEX keyed_code ON keyed (code, region);
+  CREATE UNIQUE INDEX keyed_part ON keyed (v) WHERE v IS NOT NULL;
+`);
+const fresh = createAnalytics(cfg);
+assert.deepEqual((await fresh.schema()).map((t) => t.name).sort(), ["dim_sku", "dim_store", "dim_variant", "fact_sales", "keyed", "monthly", "not_secrets", "v_stores"]);
+assert.match(((await fresh.distinct({ table: "v_again", column: "k", values: ["x"] })) as any).error, /unknown table/);
+// the deny list may spell the name with its schema or in another case
+assert.ok(!(await createAnalytics({ ...cfg, deniedTables: ["public.Secrets"] }).schema()).some((t) => /secret/.test(t.name) && t.name !== "not_secrets"));
+// what a view reads cannot be told: every view is left out
+const blind = createAnalytics({ ...cfg, query: (sql, params) => (/type = 'view'/.test(sql) && !/pragma/.test(sql) ? Promise.reject(new Error("no")) : query(sql, params)) });
+assert.ok(!(await blind.schema()).some((t) => t.kind === "view"));
+
+// a side with a primary key or a whole unique index on the join columns: zero, and neither table is read
+const scans: string[] = [];
+const keyed = createAnalytics({ ...cfg, query: (sql, params) => { scans.push(sql); return query(sql, params); } });
+await keyed.schema();
+scans.length = 0;
+assert.deepEqual(await keyed.repeats({ left: { table: "fact_sales", columns: ["sold"] }, right: { table: "keyed", columns: ["id"] } }),
+  { left: { table: "fact_sales", columns: ["sold"] }, right: { table: "keyed", columns: ["id"] }, repeated: 0, unique_key: true });
+assert.ok(!scans.some((q) => /GROUP BY/.test(q)));
+assert.equal(((await keyed.repeats({ left: { table: "keyed", columns: ["region", "code"] }, right: { table: "dim_store", columns: ["chain", "store_name"] } })) as any).unique_key, true);
+// part of a key, or a partial index, is not one row per value
+for (const columns of [["code"], ["v"]]) {
+  scans.length = 0;
+  assert.equal(((await keyed.repeats({ left: { table: "keyed", columns }, right: { table: "dim_sku", columns: ["brand"] } })) as any).unique_key, undefined);
+  assert.ok(scans.some((q) => /GROUP BY/.test(q)));
+}
+
 // Over HTTP, behind the plugin's bearer token; absent when not configured.
 const on = Fastify();
 await on.register(registerAppPages, { authToken: "t", pages: {}, resources: {}, actions: {}, files: { enabled: false }, analytics: cfg });
 const h = { authorization: "Bearer t" };
 assert.equal((await on.inject({ url: "/analytics/schema" })).statusCode, 401);
-assert.deepEqual((await on.inject({ url: "/analytics/info", headers: h })).json(), { analytics_version: 4, dialect: "sqlite", sql_tools: ["execute_sql", "generate_from_sql"] });
+assert.deepEqual((await on.inject({ url: "/analytics/info", headers: h })).json(), { analytics_version: 5, dialect: "sqlite", sql_tools: ["execute_sql", "generate_from_sql"] });
 assert.equal((await on.inject({ url: "/capabilities", headers: h })).json().capabilities.analytics, true);
 const rep = await on.inject({ method: "POST", url: "/analytics/repeats", headers: h, payload: { left: { table: "fact_sales", columns: ["store_name"] }, right: { table: "dim_store", columns: ["store_name"] } } });
 assert.equal(rep.json().repeated, 1);
@@ -69,3 +104,16 @@ await off.register(registerAppPages, { authToken: "t", pages: {}, resources: {},
 assert.equal((await off.inject({ url: "/analytics/schema", headers: h })).statusCode, 404);
 assert.equal((await off.inject({ url: "/capabilities", headers: h })).json().capabilities.analytics, false);
 console.log("analytics lookups: ok");
+
+// the database's own message does not leave the server
+const broken = Fastify();
+await broken.register(registerAppPages, { authToken: "t", pages: {}, resources: {}, actions: {}, files: { enabled: false },
+  analytics: { ...cfg, query: async () => { throw new Error('connection to server at "10.1.2.3", port 5432 failed: FATAL: password authentication failed for user "svc_reports"'); } } });
+const failed = await broken.inject({ method: "GET", url: "/analytics/schema", headers: { authorization: "Bearer t" } });
+assert.equal(failed.statusCode, 500);
+assert.deepEqual(failed.json(), { error: "the lookup failed" });
+const slow = Fastify();
+await slow.register(registerAppPages, { authToken: "t", pages: {}, resources: {}, actions: {}, files: { enabled: false },
+  analytics: { ...cfg, query: async () => { throw new Error("canceling statement due to statement timeout"); } } });
+assert.deepEqual((await slow.inject({ method: "GET", url: "/analytics/schema", headers: { authorization: "Bearer t" } })).json(), { error: "the lookup timed out" });
+console.log("ok: denied views, unique keys, plain errors");

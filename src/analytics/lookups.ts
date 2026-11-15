@@ -11,7 +11,9 @@
 //
 // Every route is read-only. Identifiers are only ever taken from the live
 // schema, never from the request, and values are bound as parameters, so a
-// request cannot inject SQL. A server that does not configure `analytics`
+// request cannot inject SQL. A lookup that fails answers "the lookup failed"
+// (or "timed out"): the database's own message stays in this server's log.
+// A server that does not configure `analytics`
 // has none of these routes and the engine records its checks as not run.
 import type { FastifyInstance } from "fastify";
 
@@ -25,7 +27,11 @@ export interface AnalyticsConfig {
    * Placeholders are written `?` (sqlite) or `$1, $2…` (postgres).
    */
   query: (sql: string, params: unknown[]) => Promise<Record<string, unknown>[]>;
-  /** Tables the agent may not see: left out of the schema and refused in lookups. */
+  /**
+   * Tables the agent may not see: left out of the schema and refused in lookups, together with every
+   * view that reads one of them. A bare name (`payroll`) denies that table in every schema; a name
+   * with its schema (`hr.payroll`) denies that one (`public.payroll` and `payroll` are the same table).
+   */
   deniedTables?: string[];
   /**
    * The names of this client's tools whose argument is SQL the agent wrote
@@ -40,7 +46,7 @@ export interface AnalyticsTable { name: string; kind: "table" | "view"; columns:
 /** One side of a join: a table and the column(s) it is joined on. */
 export interface JoinSide { table?: string; columns?: unknown[] }
 
-export const ANALYTICS_VERSION = 4;
+export const ANALYTICS_VERSION = 5;
 const SCHEMA_TTL_MS = 10 * 60_000;
 const MAX_VALUES = 20;
 const MAX_CLOSEST_LOOKUPS = 8;
@@ -49,7 +55,57 @@ const MAX_LATEST_COLUMNS = 3;
 
 export function createAnalytics(deps: AnalyticsConfig) {
   let cached: { at: number; tables: AnalyticsTable[] } | null = null;
-  const denied = new Set((deps.deniedTables ?? []).map((t) => t.toLowerCase()));
+  const denied = new Set((deps.deniedTables ?? []).map((t) => t.toLowerCase().replace(/"/g, "").replace(/^public\./, "")));
+  /** Is a listed table (`name`, or `schema.name` outside public) on the deny list, however the list spells it? */
+  const isDenied = (name: string) => { const n = name.toLowerCase(); return denied.has(n) || denied.has(n.slice(n.lastIndexOf(".") + 1)); };
+
+  /**
+   * Views that read a denied table, directly or through another view: a view over a denied table shows
+   * its rows under another name. If what a view reads cannot be told, every view is left out.
+   */
+  async function viewsOverDenied(all: Map<string, AnalyticsTable>): Promise<Set<string>> {
+    const hidden = new Set<string>();
+    const views = [...all.values()].filter((t) => t.kind === "view").map((t) => t.name);
+    if (!denied.size || !views.length) return hidden;
+    try {
+      /** view -> what it reads */
+      const reads = new Map<string, string[]>();
+      if (deps.dialect === "postgres") {
+        const rows = await deps.query(
+          `SELECT DISTINCT
+                  CASE WHEN vn.nspname = 'public' THEN v.relname ELSE vn.nspname || '.' || v.relname END AS v,
+                  CASE WHEN sn.nspname = 'public' THEN s.relname ELSE sn.nspname || '.' || s.relname END AS s
+             FROM pg_depend d
+             JOIN pg_rewrite r ON r.oid = d.objid
+             JOIN pg_class v ON v.oid = r.ev_class
+             JOIN pg_namespace vn ON vn.oid = v.relnamespace
+             JOIN pg_class s ON s.oid = d.refobjid
+             JOIN pg_namespace sn ON sn.oid = s.relnamespace
+            WHERE d.classid = 'pg_rewrite'::regclass AND d.refclassid = 'pg_class'::regclass AND v.oid <> s.oid`,
+          [],
+        );
+        for (const r of rows) reads.set(String(r.v), [...(reads.get(String(r.v)) ?? []), String(r.s)]);
+      } else {
+        // SQLite keeps a view as its text: any denied table or hidden view named in it counts.
+        const rows = await deps.query(`SELECT name AS v, sql FROM sqlite_master WHERE type = 'view'`, []);
+        const names = [...all.keys()];
+        for (const r of rows) {
+          const text = String(r.sql ?? "").toLowerCase();
+          reads.set(String(r.v), names.filter((n) => n !== String(r.v) && new RegExp(`(^|[^a-z0-9_])${n.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^a-z0-9_]|$)`).test(text)));
+        }
+      }
+      for (let grew = true; grew; ) {
+        grew = false;
+        for (const v of views) {
+          if (hidden.has(v)) continue;
+          if ((reads.get(v) ?? []).some((s) => isDenied(s) || hidden.has(s))) { hidden.add(v); grew = true; }
+        }
+      }
+    } catch {
+      for (const v of views) hidden.add(v);
+    }
+    return hidden;
+  }
   const ph = (i: number) => (deps.dialect === "postgres" ? `$${i}` : "?");
   const quoteIdent = (name: string) => name.split(".").map((p) => `"${p.replace(/"/g, '""')}"`).join(".");
 
@@ -81,7 +137,6 @@ export function createAnalytics(deps: AnalyticsConfig) {
     const byName = new Map<string, AnalyticsTable>();
     for (const r of rows) {
       const name = String(r.t);
-      if (denied.has(name.toLowerCase())) continue;
       let t = byName.get(name);
       if (!t) {
         t = { name, kind: r.kind === "view" ? "view" : "table", columns: [] };
@@ -90,7 +145,8 @@ export function createAnalytics(deps: AnalyticsConfig) {
       }
       t.columns.push({ name: String(r.c), type: String(r.ty ?? "") });
     }
-    const tables = [...byName.values()];
+    const hidden = await viewsOverDenied(byName);
+    const tables = [...byName.values()].filter((t) => !isDenied(t.name) && !hidden.has(t.name));
     cached = { at: Date.now(), tables };
     return tables;
   }
@@ -158,6 +214,42 @@ export function createAnalytics(deps: AnalyticsConfig) {
   }
 
   /**
+   * Do these columns of a table hold a primary key or a whole (not partial, not expression) unique index?
+   * Then the table has one row per value of them. False when it cannot be told (a view, an error).
+   */
+  async function uniqueOn(table: string, columns: string[]): Promise<boolean> {
+    const lit = (v: string) => `'${v.replace(/'/g, "''")}'`;
+    const within = (cols: Array<string | null>) => cols.length > 0 && cols.every((c) => c !== null && columns.includes(c));
+    try {
+      if (deps.dialect === "postgres") {
+        const rows = await deps.query(
+          `SELECT 1 AS u FROM pg_index i
+            WHERE i.indrelid = to_regclass(${lit(quoteIdent(table))}) AND i.indisunique AND i.indisvalid AND i.indpred IS NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM generate_series(0, i.indnkeyatts - 1) g
+                 WHERE i.indkey[g] = 0
+                    OR NOT EXISTS (SELECT 1 FROM pg_attribute a
+                                    WHERE a.attrelid = i.indrelid AND a.attnum = i.indkey[g] AND a.attname IN (${columns.map(lit).join(", ")})))
+            LIMIT 1`,
+          [],
+        );
+        return rows.length > 0;
+      }
+      const pk = await deps.query(`SELECT name FROM pragma_table_info(${lit(table)}) WHERE pk > 0`, []);
+      if (within(pk.map((r) => String(r.name)))) return true;
+      const idx = await deps.query(
+        `SELECT il.name AS idx, ii.name AS col FROM pragma_index_list(${lit(table)}) il JOIN pragma_index_info(il.name) ii WHERE il."unique" = 1 AND il.partial = 0`,
+        [],
+      );
+      const byIndex = new Map<string, Array<string | null>>();
+      for (const r of idx) byIndex.set(String(r.idx), [...(byIndex.get(String(r.idx)) ?? []), r.col == null ? null : String(r.col)]);
+      return [...byIndex.values()].some(within);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * How many values of the join key appear more than once in BOTH tables.
    * Rows carrying such a value are repeated by a join on that key, so a SUM
    * over the join counts them more than once. Zero means the join repeats
@@ -182,6 +274,10 @@ export function createAnalytics(deps: AnalyticsConfig) {
     }
     const [l, r] = sides;
     if (l.columns.length !== r.columns.length) return { error: "left and right need the same number of columns" };
+    const out = (s: { table: string; columns: string[] }) => ({ table: s.table, columns: s.columns });
+    // A side whose join columns hold a primary key or a unique index has one row per key: nothing can
+    // repeat in both, and neither table has to be read to know it.
+    if ((await uniqueOn(l.table, l.columns)) || (await uniqueOn(r.table, r.columns))) return { left: out(l), right: out(r), repeated: 0, unique_key: true };
     // A text key joined to a number (the query casts one of them) is compared as text on both sides:
     // '7' matches 7. A value written two ways ('007') is not matched, so the count can only be low.
     const asText = l.types.map((t, i) => !!t && !!r.types[i] && t !== r.types[i]);
@@ -189,7 +285,6 @@ export function createAnalytics(deps: AnalyticsConfig) {
       `SELECT ${s.columns.map((c, i) => `${asText[i] ? `CAST(${quoteIdent(c)} AS TEXT)` : quoteIdent(c)} AS c${i + 1}`).join(", ")} FROM ${quoteIdent(s.table)} GROUP BY ${s.columns.map((_, i) => i + 1).join(", ")} HAVING COUNT(*) > 1`;
     const on = l.columns.map((_, i) => `a.c${i + 1} = b.c${i + 1}`).join(" AND ");
     const rows = await deps.query(`SELECT COUNT(*) AS n FROM (${grouped(l)}) a JOIN (${grouped(r)}) b ON ${on}`, []);
-    const out = (s: { table: string; columns: string[] }) => ({ table: s.table, columns: s.columns });
     return { left: out(l), right: out(r), repeated: Number(rows[0]?.n ?? 0) };
   }
 
@@ -248,7 +343,10 @@ export function registerAnalyticsRoutes(app: FastifyInstance, deps: AnalyticsCon
       if (out && typeof out === "object" && "error" in (out as object)) return reply.code(400).send(out);
       return out;
     } catch (e) {
-      return reply.code(500).send({ error: (e as Error).message });
+      // The database's own message can name a host, a user or a file: it stays in this server's log.
+      const message = String((e as Error)?.message ?? e);
+      app.log.warn({ err: message }, "analytics lookup failed");
+      return reply.code(500).send({ error: /time ?out|timed out|cancel|interrupt/i.test(message) ? "the lookup timed out" : "the lookup failed" });
     }
   };
   app.get("/analytics/info", async () => ({ analytics_version: ANALYTICS_VERSION, dialect: deps.dialect, sql_tools: deps.sqlTools ?? [] }));
