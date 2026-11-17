@@ -10,6 +10,27 @@ export type { AnalyticsConfig, AnalyticsDialect, AnalyticsTable, AnalyticsColumn
 export { applyColumnFilters } from "./utils/columnFilters.js";
 
 export type {
+  AppDefinition,
+  AppKind,
+  AppClient,
+  DeviceCapability,
+  DocumentEncodingApp,
+  DocumentEncodingConfig,
+  EncodingAbility,
+  EncodingChange,
+  EncodingDocumentSnapshot,
+  EncodingHandle,
+  EncodingCheck,
+  EncodingDocumentType,
+  EncodingField,
+  EncodingFieldType,
+  EncodingIntake,
+  EncodingRecord,
+  EncodingTable,
+  SerializableApp,
+} from "./apps/types.js";
+
+export type {
   ColumnFilter,
   // Plugin config
   AppServerConfig,

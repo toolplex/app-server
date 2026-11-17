@@ -1126,6 +1126,24 @@ export interface AppServerConfig {
    * engine then records its checks for this server as not run.
    */
   analytics?: import("./analytics/lookups.js").AnalyticsConfig;
+  /**
+   * Apps: operational interfaces built on platform capabilities (see
+   * apps/types.ts). Keyed by a stable id. Omit for none; ToolPlex then shows
+   * no Apps entry for this client.
+   */
+  apps?: Record<string, import("./apps/types.js").AppDefinition>;
+  /**
+   * How this server reaches ToolPlex for platform capabilities that apps are
+   * built on (reading documents). `apiKey` is an organization API key; usage
+   * is metered to the organization like any other inference.
+   */
+  platform?: {
+    /** Default https://api.toolplex.ai */
+    baseUrl?: string;
+    apiKey?: string;
+    /** Replace the platform's document reader. For tests. */
+    readDocument?: import("./apps/encoding/routes.js").ReadDocument;
+  };
 }
 
 // ---------------------------------------------------------------------------

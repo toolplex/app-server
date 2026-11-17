@@ -72,6 +72,8 @@ export function validateConfig(config: AppServerConfig): void {
     }
   }
 
+  validateApps(config, errors);
+
   if (errors.length > 0) {
     throw new Error(
       `@toolplex/app-server configuration errors:\n  - ${errors.join("\n  - ")}`,
@@ -209,5 +211,87 @@ class ResponseValidationError extends Error {
   constructor(name: string, detail: string) {
     super(`@toolplex/app-server [${name}]: ${detail}`);
     this.name = "ResponseValidationError";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Apps — every reference inside an app must resolve, so a typo fails at
+// startup instead of as a question nobody can answer.
+// ---------------------------------------------------------------------------
+
+function validateApps(config: AppServerConfig, errors: string[]): void {
+  for (const [appId, app] of Object.entries(config.apps ?? {})) {
+    const at = `App "${appId}"`;
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(appId)) {
+      errors.push(`${at}: id must be lowercase letters, digits and hyphens`);
+    }
+    if (app.kind !== "document-encoding") {
+      errors.push(`${at}: unknown kind "${String((app as { kind?: unknown }).kind)}"`);
+      continue;
+    }
+    validateDocumentEncoding(at, app.config, errors);
+  }
+}
+
+function validateDocumentEncoding(
+  at: string,
+  app: import("./apps/types.js").DocumentEncodingConfig,
+  errors: string[],
+): void {
+  {
+    if (app?.context && app.context.length > 2000) {
+      errors.push(`${at}: context is ${app.context.length} characters; keep it to 2,000 so it stays worth reading on every document`);
+    }
+    if (!app?.intake?.length) errors.push(`${at}: needs at least one way to bring documents in ("intake")`);
+    const docTypes = Object.entries(app.documents ?? {});
+    if (docTypes.length === 0) errors.push(`${at}: declares no document types`);
+
+    let groupFieldSeen = false;
+    for (const [docId, doc] of docTypes) {
+      const where = `${at}, document "${docId}"`;
+      if (doc.notes && doc.notes.length > 1500) {
+        errors.push(`${where}: notes are ${doc.notes.length} characters; keep them to 1,500`);
+      }
+      const fieldKeys = new Set<string>();
+      for (const field of doc.fields) {
+        if (fieldKeys.has(field.key)) errors.push(`${where}: field "${field.key}" is declared twice`);
+        fieldKeys.add(field.key);
+        if (field.candidates && !app.lists?.[field.candidates]) {
+          errors.push(`${where}: field "${field.key}" names list "${field.candidates}" but no such list is defined`);
+        }
+      }
+      if (app.group_by && fieldKeys.has(app.group_by)) groupFieldSeen = true;
+
+      const tables = new Map<string, Set<string>>();
+      for (const table of doc.tables ?? []) {
+        if (tables.has(table.key)) errors.push(`${where}: table "${table.key}" is declared twice`);
+        tables.set(table.key, new Set(table.columns.map((c) => c.key)));
+        for (const column of table.columns) {
+          if (column.candidates && !app.lists?.[column.candidates]) {
+            errors.push(`${where}: column "${table.key}.${column.key}" names list "${column.candidates}" but no such list is defined`);
+          }
+        }
+      }
+
+      for (const check of doc.checks ?? []) {
+        if (check.type === "sum") {
+          if (!tables.get(check.table)?.has(check.column)) {
+            errors.push(`${where}: sum check refers to "${check.table}.${check.column}", which is not declared`);
+          }
+          if (!fieldKeys.has(check.equals)) {
+            errors.push(`${where}: sum check compares against field "${check.equals}", which is not declared`);
+          }
+        } else if (!fieldKeys.has(check.field)) {
+          errors.push(`${where}: ${check.type} check refers to field "${check.field}", which is not declared`);
+        }
+      }
+    }
+    if (app.group_by && !groupFieldSeen) {
+      errors.push(`${at}: group_by "${app.group_by}" is not a field of any document type`);
+    }
+    const cap = app.review?.question_cap;
+    if (cap !== undefined && (!Number.isInteger(cap) || cap < 1)) {
+      errors.push(`${at}: review.question_cap must be a whole number of 1 or more`);
+    }
   }
 }

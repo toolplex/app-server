@@ -9,6 +9,7 @@ import { registerActionRoutes } from "./routes/actions.js";
 import { registerContextRoutes } from "./routes/context.js";
 import { registerDownloadRoutes } from "./routes/download.js";
 import { registerAnalyticsRoutes } from "./analytics/lookups.js";
+import { registerAppRoutes } from "./routes/apps.js";
 import type { FileStore } from "./files/store.js";
 import { createRequire } from "node:module";
 
@@ -54,7 +55,8 @@ async function appServerPlugin(
   // Register @fastify/multipart when either an action declares a file input
   // OR file handling is on — both parse multipart bodies. Lazy-imported so a
   // server that has turned both off doesn't need the dep.
-  if (hasFileInputs(config) || filesEnabled) {
+  const hasApps = Object.keys(config.apps ?? {}).length > 0;
+  if (hasFileInputs(config) || filesEnabled || hasApps) {
     const multipartModule = await import("@fastify/multipart").catch(() => {
       throw new Error(
         "@toolplex/app-server: @fastify/multipart is not installed. File handling is on by default " +
@@ -80,6 +82,22 @@ async function appServerPlugin(
   registerDownloadRoutes(fastify, config);
   // Analytics lookups for the ToolPlex analytics engine — only when the host configured them.
   if (config.analytics) registerAnalyticsRoutes(fastify, config.analytics);
+  // Apps — the catalogue is served even when empty, so ToolPlex can tell
+  // "no apps" from "a server that predates apps" (which 404s).
+  // The file store, once created below. Apps reach chat attachments through it.
+  let storeForStats: FileStore | null = null;
+
+  // Each app's own routes come from its kind. They are registered first so
+  // the catalogue can report open work the kind itself counts.
+  const kindPending: Record<string, (abilities: string[]) => number> = {};
+  for (const [appId, app] of Object.entries(config.apps ?? {})) {
+    if (app.kind === "document-encoding") {
+      const { registerEncodingApp } = await import("./apps/encoding/routes.js");
+      const runtime = await registerEncodingApp(fastify, config, appId, app, () => storeForStats);
+      kindPending[appId] = (abilities) => runtime.pending(abilities as never);
+    }
+  }
+  registerAppRoutes(fastify, config, kindPending);
 
   // File handling — ingest CSV/XLSX/documents into an isolated, read-only
   // DuckDB db and expose manifest + read-only SQL. Encapsulated in its own
@@ -91,8 +109,9 @@ async function appServerPlugin(
     ...(filesEnabled ? CAPABILITIES : { ...CAPABILITIES, snapshots: false, alerts: false, history: false, storage: false }),
     /** GET /analytics/schema, POST /analytics/distinct, /analytics/repeats, /analytics/latest. */
     analytics: !!config.analytics,
+    /** GET /apps — this server declares at least one app. */
+    apps: Object.keys(config.apps ?? {}).length > 0,
   };
-  let storeForStats: FileStore | null = null;
   fastify.get("/capabilities", async () => ({
     version: PKG_VERSION,
     capabilities,
