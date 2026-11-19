@@ -1,6 +1,6 @@
 # @toolplex/app-server
 
-Fastify plugin for serving [ToolPlex](https://toolplex.ai) App Pages. Define page layouts, data handlers, and actions — the plugin generates the HTTP endpoints that power interactive pages in the ToolPlex desktop and mobile apps.
+Fastify plugin for serving [ToolPlex](https://toolplex.ai) App Pages and Apps. Define page layouts, data handlers, and actions — the plugin generates the HTTP endpoints that power interactive pages in the ToolPlex desktop and mobile apps. Declare [Apps](#apps) beside them for work people do, such as turning paper documents into records.
 
 ## Install
 
@@ -265,6 +265,123 @@ timeout.
   notes?: string[];      // non-fatal ingestion notes (e.g. inferred-as-text)
 }
 ```
+
+## Apps
+
+A page shows data. An app is where people do a piece of work. You declare
+which apps exist and how each behaves; ToolPlex supplies the engine and the
+interface for the app's `kind`. One kind exists today:
+
+- `document-encoding` — staff give it scans or photos of paper documents; it
+  reads them, fills in the values it is sure of, asks a person about the
+  rest, and hands you each approved record.
+
+```typescript
+await server.register(registerAppPages, {
+  authToken: process.env.TOOLPLEX_APP_TOKEN,
+
+  // An organization API key. Reading documents runs on ToolPlex and is
+  // metered to the organization.
+  platform: { apiKey: process.env.TOOLPLEX_API_KEY },
+
+  apps: {
+    receiving: {
+      kind: 'document-encoding',
+      title: 'Receiving documents',
+      config: {
+        // Background for the readers. Stays on this server.
+        context: 'We are a food distributor. "DR" means delivery receipt.',
+        intake: [{ via: 'files' }],
+        group_by: 'dr_no',
+        documents: {
+          'delivery-receipt': {
+            title: 'Delivery receipt',
+            recognise: 'Headed "Delivery Receipt", with a numbered item table.',
+            fields: [
+              { key: 'dr_no', label: 'D.R. number', type: 'code', required: true },
+              { key: 'date', label: 'Date', type: 'date', required: true },
+              { key: 'customer', label: 'Customer', type: 'name', candidates: 'customers' },
+              { key: 'total_qty', label: 'Total quantity', type: 'number' },
+            ],
+            tables: [
+              { key: 'items', label: 'Items', columns: [
+                { key: 'product', label: 'Product', type: 'name', candidates: 'products' },
+                { key: 'qty', label: 'Quantity', type: 'number' },
+              ]},
+            ],
+            checks: [
+              { type: 'sum', table: 'items', column: 'qty', equals: 'total_qty' },
+              { type: 'recent', field: 'date', days: 90 },
+            ],
+          },
+        },
+        lists: {
+          customers: async () => db.customerNames(),
+          products: async () => db.productNames(),
+        },
+        onApproved: async ({ record, user }) => {
+          await db.saveReceipt(record.values, record.tables.items, user);
+        },
+      },
+    },
+  },
+});
+```
+
+### What you configure
+
+| Setting | What it does |
+|---|---|
+| `documents` | The forms you handle. Each has the `fields` and `tables` you want, how to `recognise` it, optional `notes` on how it is filled in, and `checks`. The readers never invent a field. |
+| `context` | Short background about your paperwork, given to the readers with every read. |
+| `intake` | How documents come in: `files` (drop PDFs or images) or `camera`. |
+| `group_by` | A field that ties documents together (a shipment or dispatch number). Related documents are compared with each other. |
+| `checks` | Rules a finished document must pass: `sum`, `range`, `recent`, `same-in-group`. A failure becomes a question for a person. |
+| `lists` | Your valid values (customers, products). They offer choices and back up a reading. They never overwrite what was read. |
+| `expected` | Values you already hold for a document, so the readers confirm the paper against them. |
+| `review` | `question_cap` (default 8) and `approve_every_document` (default on). |
+
+### How a value is decided
+
+Two independent readers look at each document. A value both agree on, and
+that passes your checks, is accepted. Anything else is put to a person, who
+picks a reading or types the value. Handwritten values are shown for a
+person to confirm. Nothing counts until a person approves the record.
+
+### Hooks
+
+All run on your server and are never sent to a client.
+
+- `onApproved({ record, user })` — a person approved a record, or a later
+  version of it. Turn it into your own data here.
+- `onDocument({ document, change, user })` — a document changed state
+  (`read`, `values`, `approved`, `discarded`, `failed`). Use it to keep your
+  own pages in step.
+- `onReady(handle)` — called once at startup with a handle to list the
+  app's documents or approve one on a person's behalf.
+- `pending({ user, abilities })` — on the app itself; overrides the count
+  shown on the app's card.
+
+### Who can do what
+
+A `document-encoding` app defines three abilities: `capture`, `review` and
+`approve`. An organization's admins grant them per role and per app in
+ToolPlex. ToolPlex checks them and tells this server which ones the caller
+has; the server enforces them on every route.
+
+### What is kept, and where
+
+Everything stays on your server, under `files.dir` (default
+`~/.toolplex-app-files`) in `apps/<app id>/`: the untouched original of
+every upload, the images that were read, every version of every record with
+who changed it and when, and the names the app has learned from approved
+records. `context`, `notes`, `recognise` and field `hint`s go to the readers
+and are never served to a client.
+
+An upload needs `@fastify/multipart` installed, as file attachments do.
+Types are exported: `DocumentEncodingApp`, `DocumentEncodingConfig`,
+`EncodingDocumentType`, `EncodingField`, `EncodingCheck`, `EncodingRecord`,
+`EncodingHandle`.
 
 ## Validation
 
