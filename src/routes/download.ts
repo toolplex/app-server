@@ -86,15 +86,6 @@ export function registerDownloadRoutes(
       // Ignore parse errors — we'll discover columns from data
     }
 
-    // Set response headers for CSV download
-    const filename = `${resource}_${new Date().toISOString().slice(0, 10)}.csv`;
-    reply.raw.writeHead(200, {
-      "Content-Type": "text/csv; charset=utf-8",
-      "Content-Disposition": `attachment; filename="${filename}"`,
-      "Transfer-Encoding": "chunked",
-      "Cache-Control": "no-cache",
-    });
-
     // Fetch page 1 to discover total and (if needed) column keys.
     // The handler receives both filters AND columnFilters and is responsible
     // for returning a correctly filtered + counted page.
@@ -111,102 +102,125 @@ export function registerDownloadRoutes(
       user,
     };
 
+    // Fetched BEFORE any header is sent. A handler that fails here (its
+    // database is down, a filter it cannot read) is then an ordinary error
+    // response. With the headers already out, the same failure had nowhere
+    // to go: Fastify tried to send an error on a started response, that
+    // threw outside any handler, and the whole server process exited.
     const firstPage = await definition.fetch(firstReq);
     validateFetchResponse(resource, firstPage);
 
-    // Resolve columns — prefer explicit spec, fall back to keys from first row
-    if (!columns || columns.length === 0) {
-      if (firstPage.rows.length > 0) {
-        columns = Object.keys(firstPage.rows[0]).map((k) => ({ key: k, label: k }));
+    // Set response headers for CSV download
+    const filename = `${resource}_${new Date().toISOString().slice(0, 10)}.csv`;
+    reply.raw.writeHead(200, {
+      "Content-Type": "text/csv; charset=utf-8",
+      "Content-Disposition": `attachment; filename="${filename}"`,
+      "Transfer-Encoding": "chunked",
+      "Cache-Control": "no-cache",
+    });
+
+    // From here the response has started, so nothing may throw out of this
+    // handler. A failure on a later chunk breaks the connection instead: the
+    // person's download fails visibly, where ending it normally would hand
+    // them a file that looks complete and is missing rows.
+    try {
+      // Resolve columns — prefer explicit spec, fall back to keys from first row
+      if (!columns || columns.length === 0) {
+        if (firstPage.rows.length > 0) {
+          columns = Object.keys(firstPage.rows[0]).map((k) => ({ key: k, label: k }));
+        } else {
+          // Empty dataset — still emit BOM so Excel auto-detects UTF-8 if a
+          // user opens the file.
+          reply.raw.end("﻿");
+          return reply;
+        }
+      }
+
+      const keys = columns.map((c) => c.key);
+
+      // UTF-8 BOM. Without it, Excel on Windows reads CSVs as the system
+      // codepage (CP1252 on most installs) and non-ASCII characters get
+      // mojibake'd — e.g. Ñ (UTF-8 C3 91) is interpreted as Ã‘. The
+      // Content-Type charset=utf-8 header is correct but Excel ignores it
+      // for CSV imports; the BOM is the only reliable hint.
+      reply.raw.write("﻿");
+
+      // Write CSV header
+      reply.raw.write(csvRow(columns.map((c) => c.label)));
+
+      // Write first page rows
+      let rowsWritten = 0;
+      for (const row of firstPage.rows) {
+        if (rowsWritten >= MAX_DOWNLOAD_ROWS) break;
+        reply.raw.write(csvRow(keys.map((k) => row[k])));
+        rowsWritten++;
+      }
+
+      // Two loop modes — pick based on whether the handler advertises cursor
+      // pagination support by returning a nextCursor on chunk 1.
+      //
+      // CURSOR MODE (preferred for large exports):
+      //   The handler returned a non-null nextCursor on chunk 1, signalling
+      //   support for keyset pagination. We pass that cursor back on each
+      //   subsequent call. The handler uses it to seek directly to the next
+      //   chunk via WHERE (sort_cols) > (cursor_vals) — O(1) per chunk
+      //   regardless of position. Loop ends when nextCursor is null/absent.
+      //
+      // PAGE MODE (legacy fallback):
+      //   The handler omitted nextCursor entirely. We loop with page numbers
+      //   2..N as before, using firstPage.total to compute the page count.
+      //   This works for any handler but pays OFFSET cost on later chunks.
+
+      if (firstPage.nextCursor !== undefined && firstPage.nextCursor !== null) {
+        // CURSOR MODE
+        let cursor: string | null = firstPage.nextCursor;
+        while (cursor !== null && rowsWritten < MAX_DOWNLOAD_ROWS) {
+          const req: FetchRequest = {
+            page: 1, // ignored when cursor is set
+            pageSize: DOWNLOAD_CHUNK_SIZE,
+            sort: baseParams.sort,
+            filters: baseParams.filters,
+            columnFilters: baseParams.columnFilters,
+            cursor,
+            skipTotal: true,
+            user,
+          };
+          const result = await definition.fetch(req);
+          for (const row of result.rows) {
+            if (rowsWritten >= MAX_DOWNLOAD_ROWS) break;
+            reply.raw.write(csvRow(keys.map((k) => row[k])));
+            rowsWritten++;
+          }
+          cursor = result.nextCursor ?? null;
+        }
       } else {
-        // Empty dataset — still emit BOM so Excel auto-detects UTF-8 if a
-        // user opens the file.
-        reply.raw.end("﻿");
-        return reply;
-      }
-    }
-
-    const keys = columns.map((c) => c.key);
-
-    // UTF-8 BOM. Without it, Excel on Windows reads CSVs as the system
-    // codepage (CP1252 on most installs) and non-ASCII characters get
-    // mojibake'd — e.g. Ñ (UTF-8 C3 91) is interpreted as Ã‘. The
-    // Content-Type charset=utf-8 header is correct but Excel ignores it
-    // for CSV imports; the BOM is the only reliable hint.
-    reply.raw.write("﻿");
-
-    // Write CSV header
-    reply.raw.write(csvRow(columns.map((c) => c.label)));
-
-    // Write first page rows
-    let rowsWritten = 0;
-    for (const row of firstPage.rows) {
-      if (rowsWritten >= MAX_DOWNLOAD_ROWS) break;
-      reply.raw.write(csvRow(keys.map((k) => row[k])));
-      rowsWritten++;
-    }
-
-    // Two loop modes — pick based on whether the handler advertises cursor
-    // pagination support by returning a nextCursor on chunk 1.
-    //
-    // CURSOR MODE (preferred for large exports):
-    //   The handler returned a non-null nextCursor on chunk 1, signalling
-    //   support for keyset pagination. We pass that cursor back on each
-    //   subsequent call. The handler uses it to seek directly to the next
-    //   chunk via WHERE (sort_cols) > (cursor_vals) — O(1) per chunk
-    //   regardless of position. Loop ends when nextCursor is null/absent.
-    //
-    // PAGE MODE (legacy fallback):
-    //   The handler omitted nextCursor entirely. We loop with page numbers
-    //   2..N as before, using firstPage.total to compute the page count.
-    //   This works for any handler but pays OFFSET cost on later chunks.
-
-    if (firstPage.nextCursor !== undefined && firstPage.nextCursor !== null) {
-      // CURSOR MODE
-      let cursor: string | null = firstPage.nextCursor;
-      while (cursor !== null && rowsWritten < MAX_DOWNLOAD_ROWS) {
-        const req: FetchRequest = {
-          page: 1, // ignored when cursor is set
-          pageSize: DOWNLOAD_CHUNK_SIZE,
-          sort: baseParams.sort,
-          filters: baseParams.filters,
-          columnFilters: baseParams.columnFilters,
-          cursor,
-          skipTotal: true,
-          user,
-        };
-        const result = await definition.fetch(req);
-        for (const row of result.rows) {
-          if (rowsWritten >= MAX_DOWNLOAD_ROWS) break;
-          reply.raw.write(csvRow(keys.map((k) => row[k])));
-          rowsWritten++;
-        }
-        cursor = result.nextCursor ?? null;
-      }
-    } else {
-      // PAGE MODE (legacy)
-      const total = Math.min(firstPage.total, MAX_DOWNLOAD_ROWS);
-      const totalPages = Math.ceil(total / DOWNLOAD_CHUNK_SIZE);
-      for (let page = 2; page <= totalPages; page++) {
-        const req: FetchRequest = {
-          page,
-          pageSize: DOWNLOAD_CHUNK_SIZE,
-          sort: baseParams.sort,
-          filters: baseParams.filters,
-          columnFilters: baseParams.columnFilters,
-          skipTotal: true,
-          user,
-        };
-        const result = await definition.fetch(req);
-        for (const row of result.rows) {
-          if (rowsWritten >= MAX_DOWNLOAD_ROWS) break;
-          reply.raw.write(csvRow(keys.map((k) => row[k])));
-          rowsWritten++;
+        // PAGE MODE (legacy)
+        const total = Math.min(firstPage.total, MAX_DOWNLOAD_ROWS);
+        const totalPages = Math.ceil(total / DOWNLOAD_CHUNK_SIZE);
+        for (let page = 2; page <= totalPages; page++) {
+          const req: FetchRequest = {
+            page,
+            pageSize: DOWNLOAD_CHUNK_SIZE,
+            sort: baseParams.sort,
+            filters: baseParams.filters,
+            columnFilters: baseParams.columnFilters,
+            skipTotal: true,
+            user,
+          };
+          const result = await definition.fetch(req);
+          for (const row of result.rows) {
+            if (rowsWritten >= MAX_DOWNLOAD_ROWS) break;
+            reply.raw.write(csvRow(keys.map((k) => row[k])));
+            rowsWritten++;
+          }
         }
       }
-    }
 
-    reply.raw.end();
+      reply.raw.end();
+    } catch (err) {
+      request.log.error({ err, resource }, "download failed after the response had started");
+      reply.raw.destroy(err instanceof Error ? err : new Error("download failed"));
+    }
     return reply;
   });
 }

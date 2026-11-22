@@ -67,6 +67,9 @@ const MAX_PAGES_PER_UPLOAD = 200;
 /** A name joins a list once this many approved records carry it: one or two could be the same slip. */
 const LEARN_AFTER = 3;
 /** How long a client's own hook may take before the app stops waiting for it. */
+/** Set on the reply to a request that changed what an app holds. */
+export const APP_CHANGED_HEADER = "x-toolplex-app-changed";
+
 const HOOK_TIMEOUT_MS = 30_000;
 
 /** Wait for a client's hook, but not for ever: one that never returns must not hold up everyone's documents. */
@@ -205,15 +208,35 @@ export async function registerEncodingApp(
   };
 
   /** Tell the client's own code a document changed. Never fails the change itself. */
-  const emit = async (id: string, change: EncodingChange, user?: UserIdentity): Promise<void> => {
-    if (!cfg.onDocument) return;
-    const doc = await store.load(id);
-    if (!doc) return;
-    try {
-      await within(cfg.onDocument({ document: snapshot(doc), change, ...(user ? { user } : {}) }), "onDocument");
-    } catch (err) {
-      fastify.log.error({ err, appId, id, change }, "document-encoding: onDocument failed");
-    }
+  /**
+   * Tell the client's own code a document changed.
+   *
+   * Notices for one document are delivered one after another, in the order
+   * the changes happened. The client typically keeps its own view in step by
+   * applying each notice; two of them running at once for the same document
+   * (a slow "sent to be read again" finishing after the "read" that followed
+   * it) would leave that view on the older state for good. Other documents
+   * are not held up, and neither is the work itself: callers that must not
+   * wait (the reading queue) simply do not await the result.
+   */
+  const told = new Map<string, Promise<void>>();
+  const emit = (id: string, change: EncodingChange, user?: UserIdentity): Promise<void> => {
+    if (!cfg.onDocument) return Promise.resolve();
+    const hook = cfg.onDocument;
+    const next = (told.get(id) ?? Promise.resolve()).then(async () => {
+      const doc = await store.load(id);
+      if (!doc) return;
+      try {
+        await within(hook({ document: snapshot(doc), change, ...(user ? { user } : {}) }), "onDocument");
+      } catch (err) {
+        fastify.log.error({ err, appId, id, change }, "document-encoding: onDocument failed");
+      }
+    });
+    told.set(id, next);
+    void next.finally(() => {
+      if (told.get(id) === next) told.delete(id);
+    });
+    return next;
   };
 
   // ── The reading queue ────────────────────────────────────────────────────
@@ -595,6 +618,24 @@ export async function registerEncodingApp(
     }
   });
 
+  // Say so when a request changed what the app holds. ToolPlex passes the
+  // header on as a live "this app changed" to everyone in the organization
+  // who has it open, so a queue two people share stays the same on both
+  // screens. Decided here because only the kind knows which of its requests
+  // change anything: the assistant's tools are all POSTs, and all but one of
+  // them only look.
+  //
+  // Told from the route that matched, never from the address as typed: the
+  // router decodes an address before matching it (%5F is an underscore to
+  // it), so a rule written against the raw text can be walked around.
+  fastify.addHook("onSend", async (request, reply) => {
+    if (request.method !== "POST" || reply.statusCode >= 300) return;
+    const route = request.routeOptions?.url ?? "";
+    if (!route.startsWith(`${prefix}/`)) return;
+    if (route === `${prefix}/agent/:tool` && (request.params as { tool?: string } | undefined)?.tool !== "add_attachments") return;
+    void reply.header(APP_CHANGED_HEADER, "1");
+  });
+
   // ── Intake ───────────────────────────────────────────────────────────────
 
   /** Uploads being turned into documents right now, by upload id. */
@@ -914,7 +955,14 @@ export async function registerEncodingApp(
       doc.status = "queued";
       note(doc, user, "reread", type ? `as ${cfg.documents[type].title}` : undefined);
     });
+    // Said before the new reading arrives. A record that was approved is not
+    // approved any more from this moment, and the client's own pages must not
+    // go on showing it as such for the minute the reading takes. The read is
+    // queued first, so a slow hook cannot delay it; the notice for the
+    // reading that follows still arrives after this one (see emit).
+    const noticed = emit(request.params.id, "reading", user);
     enqueue(request.params.id);
+    await noticed;
     return { ok: true };
   });
 
@@ -955,8 +1003,12 @@ export async function registerEncodingApp(
       });
     joining = run;
     const { first, rest } = await run;
-    for (const other of rest) await emit(other.id, "discarded", user);
+    // The joined document is read again as one, exactly as on "read again":
+    // what the client's code knew of its first sheet no longer stands.
+    const noticed = emit(first.id, "reading", user);
     enqueue(first.id);
+    await noticed;
+    for (const other of rest) await emit(other.id, "discarded", user);
     return { ok: true, id: first.id };
   });
 

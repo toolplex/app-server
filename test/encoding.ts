@@ -48,6 +48,8 @@ const readDocument = async (req: ReadDocumentRequest): Promise<Reading> => {
 
 const approved: EncodingRecord[] = [];
 const events: string[] = [];
+const notices: { id: string; change: string; at: number }[] = [];
+let slowReading = 0;
 let handle: EncodingHandle | null = null;
 const app: DocumentEncodingApp = {
   kind: "document-encoding",
@@ -71,7 +73,12 @@ const app: DocumentEncodingApp = {
     },
     lists: { customers: () => ["North Market"] },
     onApproved: ({ record }) => void approved.push(record),
-    onDocument: ({ document, change }) => void events.push(`${change}:${document.status}:${document.open.ask}`),
+    onDocument: async ({ document, change }) => {
+      // A client whose own bookkeeping is slow on "sent to be read again".
+      if (change === "reading" && slowReading > 0) await new Promise((r) => setTimeout(r, slowReading));
+      events.push(`${change}:${document.status}:${document.open.ask}`);
+      notices.push({ id: document.id, change, at: Date.now() });
+    },
     onReady: (h) => void (handle = h),
   },
 };
@@ -120,11 +127,17 @@ const settle = async (id: string) => {
 
 try {
   // 1. Abilities: capture is needed to bring documents in.
-  assert.equal((await upload(["page one"], { upload_id: "x0" }, as("review"))).statusCode, 403);
+  const refused = await upload(["page one"], { upload_id: "x0" }, as("review"));
+  assert.equal(refused.statusCode, 403);
+  // A request that changed nothing does not say it did.
+  assert.equal(refused.headers["x-toolplex-app-changed"], undefined);
 
   // 2. A two-page PDF: one original stored once, one document per page.
   const first = await upload(["page one", "page two total-365"], { upload_id: "up-1", batch: "b1" }, auth, "%PDF original bytes");
   assert.equal(first.statusCode, 200);
+  // A request that changed what the app holds says so, for everyone who has it open.
+  assert.equal(first.headers["x-toolplex-app-changed"], "1");
+  assert.equal((await server.inject({ url: `${base}/summary`, headers: auth })).headers["x-toolplex-app-changed"], undefined);
   const docs = first.json().documents;
   assert.equal(docs.length, 2);
   assert.equal(docs[0].name, "scan.pdf, sheet 1");
@@ -201,15 +214,35 @@ try {
   const odd = (await upload(["mystery page"], { upload_id: "up-2" })).json().documents[0];
   const unplaced = await settle(odd.id);
   assert.equal(unplaced.document_type, null);
-  assert.equal((await post(`/documents/${odd.id}/reread`, { document_type: "delivery-receipt" })).statusCode, 200);
+  // The client's code is told it was sent to be read again, and that notice
+  // comes before the one for the reading itself, however slow the client is.
+  // The read does not wait for the client: it is under way long before the
+  // slow notice has finished.
+  slowReading = 250;
+  notices.length = 0;
+  const readsBefore = seen.length;
+  const asked = Date.now();
+  const rereading = post(`/documents/${odd.id}/reread`, { document_type: "delivery-receipt" });
+  await new Promise((r) => setTimeout(r, 80));
+  assert.equal(seen.length, readsBefore + 1, "the read started while the client was still being told");
+  assert.equal((await rereading).statusCode, 200);
+  assert.ok(Date.now() - asked >= 240, "the request still answers only once the client has been told");
+  slowReading = 0;
   assert.equal((await settle(odd.id)).document_type, "delivery-receipt");
   assert.equal(seen.at(-1)!.document_type, "delivery-receipt");
+  for (let i = 0; i < 100 && notices.filter((n) => n.id === odd.id).length < 2; i++) await new Promise((r) => setTimeout(r, 10));
+  assert.deepEqual(notices.filter((n) => n.id === odd.id).map((n) => n.change), ["reading", "read"]);
 
   // 9. A failed read is visible and counts as waiting; joining pages re-reads them as one document.
   const bad = (await upload(["unreadable"], { upload_id: "up-3" })).json().documents[0];
   assert.equal((await settle(bad.id)).status, "failed");
+  notices.length = 0;
   assert.equal((await post("/documents/merge", { ids: [b.id, odd.id] })).statusCode, 200);
   const joined = await settle(b.id);
+  // Joining re-reads the first sheet as part of something larger, and says so.
+  for (let i = 0; i < 100 && notices.filter((n) => n.id === b.id).length < 2; i++) await new Promise((r) => setTimeout(r, 10));
+  assert.deepEqual(notices.filter((n) => n.id === b.id).map((n) => n.change), ["reading", "read"]);
+  assert.deepEqual(notices.filter((n) => n.id === odd.id).map((n) => n.change), ["discarded"]);
   assert.equal(joined.pages, 2);
   assert.equal(seen.at(-1)!.pages.length, 2);
   assert.equal((await get(`/documents/${odd.id}`)).status, "discarded");

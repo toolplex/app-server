@@ -296,7 +296,7 @@ export interface DocumentEncodingConfig {
   onApproved?: (req: { record: EncodingRecord; user?: UserIdentity }) => Promise<void> | void;
   /**
    * Called whenever a document changes state: read, values changed, approved,
-   * discarded, failed. This is how the client's own pages and data follow the
+   * discarded, failed, or sent to be read again. This is how the client's own pages and data follow the
    * app (a "Received documents" page, a reconciliation). Server-side only; a
    * failure here is logged and never undoes the change.
    */
@@ -309,7 +309,15 @@ export interface DocumentEncodingConfig {
   onReady?: (handle: EncodingHandle) => Promise<void> | void;
 }
 
-export type EncodingChange = "read" | "failed" | "values" | "approved" | "discarded";
+export type EncodingChange =
+  /** A reading arrived. */
+  | "read"
+  | "failed"
+  | "values"
+  | "approved"
+  | "discarded"
+  /** Sent to be read again: its values, and any approval, no longer stand. */
+  | "reading";
 
 /** A document as the client's own code sees it. Paths are on this server. */
 export interface EncodingDocumentSnapshot {

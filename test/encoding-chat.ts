@@ -49,7 +49,17 @@ try {
   const photo = await attach("slip.jpg", "image/jpeg", "photo bytes");
   const pdf = await attach("scan.pdf", "application/pdf", "%PDF-1.4 not really");
 
-  const first = (await tool("add_attachments", { file_ids: [photo, pdf, "0000000000000000"] })).json();
+  const brought = await tool("add_attachments", { file_ids: [photo, pdf, "0000000000000000"] });
+  // Bringing files in changes the app; the assistant's other tools only look.
+  assert.equal(brought.headers["x-toolplex-app-changed"], "1");
+  assert.equal((await tool("overview", {})).headers["x-toolplex-app-changed"], undefined);
+  // The same tool reached by a differently spelled address is the same tool:
+  // the router reads %5F as an underscore, and so does the rule.
+  const spelled = await server.inject({ method: "POST", url: "/apps/receiving/document-encoding/agent/add%5Fattachments", headers: ana, payload: { file_ids: [photo] } });
+  assert.equal(spelled.statusCode, 200);
+  assert.equal(spelled.headers["x-toolplex-app-changed"], "1");
+  assert.equal((await server.inject({ method: "POST", url: "/apps/receiving/document-encoding/agent/over%76iew", headers: ana, payload: {} })).headers["x-toolplex-app-changed"], undefined);
+  const first = brought.json();
   assert.equal(first.brought_in.length, 1);
   assert.equal(first.brought_in[0].name, "slip.jpg");
   assert.equal(first.skipped.length, 2);
