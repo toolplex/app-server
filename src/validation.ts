@@ -4,6 +4,8 @@ import type {
   FetchResponse,
   ActionResponse,
 } from "./types.js";
+import { APP_PLACES, APP_SECTION_LIMITS } from "./apps/types.js";
+import type { AppKind } from "./apps/types.js";
 
 // ---------------------------------------------------------------------------
 // Startup validation — fail fast with descriptive errors
@@ -229,7 +231,52 @@ function validateApps(config: AppServerConfig, errors: string[]): void {
       errors.push(`${at}: unknown kind "${String((app as { kind?: unknown }).kind)}"`);
       continue;
     }
+    validateSections(at, app.kind, app.sections, errors);
     validateDocumentEncoding(at, app.config, errors);
+  }
+}
+
+/**
+ * A section in a place the kind does not have would never be shown, and
+ * nobody would know why; one that is too long would not be read. Both are
+ * said at startup.
+ */
+function validateSections(at: string, kind: AppKind, sections: unknown, errors: string[]): void {
+  if (sections === undefined) return;
+  const places = APP_PLACES[kind];
+  if (!sections || typeof sections !== "object" || Array.isArray(sections)) {
+    errors.push(`${at}: sections must be an object keyed by place (${places.join(", ")})`);
+    return;
+  }
+  for (const [place, blocks] of Object.entries(sections as Record<string, unknown>)) {
+    const where = `${at}, sections "${place}"`;
+    if (!places.includes(place)) {
+      errors.push(`${where}: not a place in a ${kind} app (${places.join(", ")})`);
+      continue;
+    }
+    if (!Array.isArray(blocks)) {
+      errors.push(`${where}: must be a list of sections`);
+      continue;
+    }
+    if (blocks.length > APP_SECTION_LIMITS.perPlace) {
+      errors.push(`${where}: has ${blocks.length} sections; keep it to ${APP_SECTION_LIMITS.perPlace}, or people stop reading`);
+    }
+    blocks.forEach((raw, i) => {
+      const n = `${where}, section ${i + 1}`;
+      const b = raw as { type?: unknown; title?: unknown; text?: unknown } | null;
+      if (!b || typeof b !== "object" || b.type !== "text") {
+        errors.push(`${n}: type must be "text"`);
+        return;
+      }
+      if (typeof b.text !== "string" || b.text.trim() === "") {
+        errors.push(`${n}: text is empty`);
+      } else if (b.text.length > APP_SECTION_LIMITS.text) {
+        errors.push(`${n}: text is ${b.text.length} characters; keep it to ${APP_SECTION_LIMITS.text.toLocaleString("en-US")}`);
+      }
+      if (b.title !== undefined && (typeof b.title !== "string" || b.title.length > APP_SECTION_LIMITS.title)) {
+        errors.push(`${n}: title must be text of at most ${APP_SECTION_LIMITS.title} characters`);
+      }
+    });
   }
 }
 

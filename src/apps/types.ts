@@ -42,7 +42,7 @@ export type AppClient = "desktop" | "mobile";
  * kind (receiving, delivery receipts, invoices); each has its own id,
  * configuration and permissions.
  */
-export interface AppBase<Kind extends string, Config, Ability extends string> {
+export interface AppBase<Kind extends string, Config, Ability extends string, Place extends string = string> {
   kind: Kind;
   title: string;
   description?: string;
@@ -61,6 +61,17 @@ export interface AppBase<Kind extends string, Config, Ability extends string> {
    * "Update required" instead of opening it.
    */
   min_desktop_version?: string;
+  /**
+   * Words for the people using the app, written by the client: what belongs
+   * here, how their own paperwork is handled, who to ask. Keyed by where it
+   * is shown; each kind names its places (APP_PLACES). The kind's interface
+   * decides how each place presents them. The app works the same with none.
+   *
+   * Kept here and not in `config` on purpose. `config` is what shapes a
+   * record, and every record keeps a fingerprint of it; wording is not part
+   * of that, so correcting a sentence never changes `config_version`.
+   */
+  sections?: Partial<Record<Place, AppSection[]>>;
   /** Everything particular to the kind. */
   config: Config;
   /**
@@ -69,6 +80,35 @@ export interface AppBase<Kind extends string, Config, Ability extends string> {
    */
   pending?: (req: { user?: UserIdentity; abilities: Ability[] }) => Promise<number> | number;
 }
+
+// ---------------------------------------------------------------------------
+// Sections — what a client may put in front of the people using an app.
+//
+// Text only, today. It has no data behind it and fetches nothing, which is
+// what makes it safe to allow in every kind: anything with data or actions
+// is a page, and anything a person works through is the kind itself.
+// ---------------------------------------------------------------------------
+
+/** A block of prose. The same shape as a text section on a page. */
+export interface AppTextSection {
+  type: "text";
+  /** A short heading above the text. */
+  title?: string;
+  /** Light markdown: paragraphs, bold, lists and links. */
+  text: string;
+}
+
+export type AppSection = AppTextSection;
+
+/** Bounds on what is shown: instructions longer than this are not read. */
+export const APP_SECTION_LIMITS = {
+  /** Blocks in one place. */
+  perPlace: 6,
+  /** Characters in one block's text. */
+  text: 2000,
+  /** Characters in a heading. */
+  title: 80,
+} as const;
 
 // ---------------------------------------------------------------------------
 // kind: "document-encoding" — paper documents into records
@@ -194,6 +234,17 @@ export type EncodingAbility =
 
 export const ENCODING_ABILITIES: readonly EncodingAbility[] = ["capture", "review", "approve"];
 
+/** Where a document-encoding app shows a client's sections: its three tabs. */
+export type EncodingPlace =
+  /** Where documents are brought in. Seen by people who may capture. */
+  | "capture"
+  /** Where questions are answered and records approved. */
+  | "review"
+  /** Where approved records are kept. */
+  | "records";
+
+export const ENCODING_PLACES: readonly EncodingPlace[] = ["capture", "review", "records"];
+
 export interface DocumentEncodingConfig {
   /**
    * Background for the readers about this client's documents as a whole:
@@ -300,7 +351,7 @@ export interface EncodingHandle {
   approve(id: string, user: UserIdentity): Promise<void>;
 }
 
-export type DocumentEncodingApp = AppBase<"document-encoding", DocumentEncodingConfig, EncodingAbility>;
+export type DocumentEncodingApp = AppBase<"document-encoding", DocumentEncodingConfig, EncodingAbility, EncodingPlace>;
 
 /** Every app kind the platform can run. */
 export type AppDefinition = DocumentEncodingApp;
@@ -310,6 +361,11 @@ export type AppKind = AppDefinition["kind"];
 /** The abilities each kind defines. A role is granted a subset per app. */
 export const APP_ABILITIES: Record<AppKind, readonly string[]> = {
   "document-encoding": ENCODING_ABILITIES,
+};
+
+/** The places each kind has for a client's sections. */
+export const APP_PLACES: Record<AppKind, readonly string[]> = {
+  "document-encoding": ENCODING_PLACES,
 };
 
 /** What a client learns about an app: the definition without its server-side functions. */
@@ -323,9 +379,11 @@ export interface SerializableApp {
   min_desktop_version?: string;
   /** Everything a person could be allowed to do in this app. */
   abilities: string[];
+  /** The client's own words for the people using the app, by place. */
+  sections?: Record<string, AppSection[]>;
   /**
-   * Fingerprint of `config` as served. Changes whenever the configuration
-   * does; every record keeps the one it was created under.
+   * Fingerprint of `config`. Changes whenever the configuration does; every
+   * record keeps the one it was created under. `sections` are not part of it.
    */
   config_version: string;
   /** The kind's configuration, with its server-side functions removed. */

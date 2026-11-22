@@ -341,6 +341,39 @@ await server.register(registerAppPages, {
 | `expected` | Values you already hold for a document, so the readers confirm the paper against them. |
 | `review` | `question_cap` (default 8) and `approve_every_document` (default on). |
 
+### Instructions for the people using it
+
+An app can carry your own words for the people who work in it: what belongs
+here, how your paperwork is handled, who to ask. They are declared beside
+`config`, by the place they are shown. A `document-encoding` app has three
+places, one per tab: `capture`, `review` and `records`.
+
+```typescript
+receiving: {
+  kind: 'document-encoding',
+  title: 'Receiving documents',
+  sections: {
+    capture: [
+      { type: 'text', title: 'Before you scan', text: '- One slip per sheet\n- The whole sheet must show, stamps included' },
+    ],
+    review: [
+      { type: 'text', text: 'Type what the paper says, **even if it looks wrong**.' },
+    ],
+  },
+  config: { /* ... */ },
+},
+```
+
+- A section is `{ type: 'text', title?, text }`, the same shape as a text
+  section on a page. `text` takes light markdown: paragraphs, bold, lists,
+  links.
+- Keep it short. At most 6 sections in a place and 2,000 characters in one;
+  a place the kind does not have fails at startup.
+- Changing the wording never changes `config_version`: sections are not part
+  of what a record was read under.
+- The assistant is told the same instructions (the first 1,500 characters),
+  so "how do I scan these?" in chat gets your answer.
+
 ### How a value is decided
 
 Two independent readers look at each document. A value both agree on, and
@@ -381,7 +414,7 @@ and are never served to a client.
 An upload needs `@fastify/multipart` installed, as file attachments do.
 Types are exported: `DocumentEncodingApp`, `DocumentEncodingConfig`,
 `EncodingDocumentType`, `EncodingField`, `EncodingCheck`, `EncodingRecord`,
-`EncodingHandle`.
+`EncodingHandle`, `AppSection`.
 
 ## Validation
 

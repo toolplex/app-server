@@ -28,6 +28,9 @@ export type {
   EncodingRecord,
   EncodingTable,
   SerializableApp,
+  AppSection,
+  AppTextSection,
+  EncodingPlace,
 } from "./apps/types.js";
 
 export type {

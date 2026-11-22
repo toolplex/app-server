@@ -92,7 +92,7 @@ export function configVersion(value: unknown): string {
 function buildSerializableApps(apps: Record<string, AppDefinition>): SerializableApp[] {
   return Object.entries(apps)
     .map(([id, app]): SerializableApp => {
-      const { pending: _pending, config, ...rest } = app;
+      const { pending: _pending, config, sections, ...rest } = app;
       // The version covers everything that shapes a reading, including what
       // is kept on this server; what is served leaves the private parts out.
       const full = withoutFunctions(config);
@@ -101,11 +101,23 @@ function buildSerializableApps(apps: Record<string, AppDefinition>): Serializabl
         id,
         ...rest,
         abilities: [...APP_ABILITIES[app.kind]],
+        // Only what a section is defined to hold, and only places that have
+        // something in them. Outside the version: wording is not configuration.
+        ...(servedSections(sections) ? { sections: servedSections(sections) } : {}),
         config_version: configVersion(full),
         config: served,
       };
     })
     .sort((a, b) => (a.nav_order ?? 0) - (b.nav_order ?? 0));
+}
+
+function servedSections(sections: AppDefinition["sections"]): SerializableApp["sections"] | undefined {
+  const out: NonNullable<SerializableApp["sections"]> = {};
+  for (const [place, blocks] of Object.entries(sections ?? {})) {
+    const kept = (blocks ?? []).map((b) => ({ type: b.type, ...(b.title ? { title: b.title } : {}), text: b.text }));
+    if (kept.length > 0) out[place] = kept;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /**

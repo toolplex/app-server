@@ -81,6 +81,39 @@ function fail(statusCode: number, message: string): never {
   throw Object.assign(new Error(message), { statusCode });
 }
 
+/** Room for the organization's instructions in what the assistant is told about the app. */
+const TOLD_MAX_CHARS = 1500;
+
+/**
+ * The organization's own instructions, as the assistant should know them: one
+ * line, so it sits inside the sentence about the app. Someone who asks "how
+ * do I scan these?" in chat gets the answer the app itself shows, not a guess.
+ * Capped, because it rides along with every conversation in the organization.
+ */
+export function toldInApp(sections: DocumentEncodingApp["sections"], shown: (place: string) => boolean): string {
+  const parts: string[] = [];
+  for (const [place, blocks] of Object.entries(sections ?? {})) {
+    if (!shown(place)) continue;
+    for (const b of blocks ?? []) {
+      // Plain sentences: list markers and bold are for the screen.
+      const lines = b.text
+        .split(/\r?\n/)
+        .map((l) => l.replace(/^\s*(?:[-*+]|\d+[.)])\s+/, "").replace(/\*\*|__/g, "").trim())
+        .filter(Boolean);
+      if (lines.length === 0) continue;
+      const said = lines.map((l, i) => (i === lines.length - 1 || /[.!?:;]$/.test(l) ? l : `${l};`)).join(" ");
+      parts.push(`[${place}${b.title ? `: ${b.title.trim()}` : ""}] ${said}`);
+    }
+  }
+  if (parts.length === 0) return "";
+  const all = parts.join(" ");
+  const body = all.length > TOLD_MAX_CHARS ? `${all.slice(0, TOLD_MAX_CHARS).replace(/\s+\S*$/, "")} …` : all;
+  return (
+    "The organization shows these instructions to the people using the app, by tab. " +
+    `They are its own rules for this work; answer from them when asked how something is done here: ${body}`
+  );
+}
+
 export function registerEncodingAgentTools(fastify: FastifyInstance, ctx: EncodingAgentContext): void {
   const { store, app, summarise, questionsOf } = ctx;
   const forms = Object.entries(app.config.documents).map(([id, d]) => `${id} (${d.title})`).join(", ");
@@ -165,8 +198,10 @@ export function registerEncodingAgentTools(fastify: FastifyInstance, ctx: Encodi
 
   fastify.get(`${ctx.prefix}/agent`, async (request) => {
     const abilities = readAbilities<EncodingAbility>(request, app);
+    // The Capture tab, and so what it says, is only for people who may capture.
+    const told = toldInApp(app.sections, (place) => place !== "capture" || abilities.includes("capture"));
     return {
-      about,
+      about: told ? `${about} ${told}` : about,
       // A tool the person could not use is not offered at all.
       tools: tools.filter((t) => t.name !== "add_attachments" || abilities.includes("capture")),
     };
