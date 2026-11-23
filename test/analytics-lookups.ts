@@ -95,6 +95,46 @@ assert.match(((await a.latest({ table: "monthly", columns: [] })) as any).error,
   assert.deepEqual(((await throws.latest({ table: "monthly", columns: ["sale_date"] })) as any).latest, ["2026-07-21"]);
 }
 
+// the latest period value is kept in memory: a configured period is loaded at start, one asked about
+// is kept after its first answer, and neither reads the table again while fresh
+{
+  const reads: string[] = [];
+  const lp = createAnalytics({ ...cfg, warmPeriods: [{ table: "MONTHLY", columns: ["sale_date"] }], query: (sql, params) => { reads.push(sql); return query(sql, params); } });
+  const stop = lp.startWarming();
+  await new Promise((r) => setTimeout(r, 30));
+  reads.length = 0;
+  assert.deepEqual(((await lp.latest({ table: "monthly", columns: ["sale_date"] })) as any).latest, ["2026-07-21"]);
+  assert.ok(!reads.some((q) => /ORDER BY/.test(q)), "configured period answered from memory");
+  await lp.latest({ table: "monthly", columns: ["year", "month"] });
+  reads.length = 0;
+  assert.deepEqual(((await lp.latest({ table: "monthly", columns: ["year", "month"] })) as any).latest, ["2026", "7"]);
+  assert.ok(!reads.some((q) => /ORDER BY/.test(q)), "a period asked about once is answered from memory");
+  stop();
+}
+// a value with no rows where it was asked, but present in the column's reference table: said, with no closest values
+{
+  db.exec(`CREATE TABLE stock_master (stock_num TEXT, active INTEGER); INSERT INTO stock_master VALUES ('142',1),('0222',1),('NEWSKU',1),('PM',1);`);
+  const ref = createAnalytics({ ...cfg, valueReferences: [{ column: "stock_num", table: "stock_master" }] });
+  const d = await ref.distinct({ table: "fact_sales", column: "stock_num", values: ["142", "NEWSKU", "14"] }) as any;
+  assert.deepEqual(d.matches.map((m: any) => m.value), ["142"]);
+  assert.deepEqual(d.missing.find((m: any) => m.value === "NEWSKU"), { value: "NEWSKU", closest: [], in_reference: { table: "stock_master", column: "stock_num" } });
+  const typo = d.missing.find((m: any) => m.value === "14");
+  assert.equal(typo.in_reference, undefined); // not in the reference either: a typo keeps its closest values
+  // from memory too, once the reference column is loaded at start
+  const reads: string[] = [];
+  const warm = createAnalytics({ ...cfg, valueReferences: [{ column: "stock_num", table: "stock_master" }], query: (sql, params) => { reads.push(sql); return query(sql, params); } });
+  const stop = warm.startWarming();
+  await new Promise((r) => setTimeout(r, 30));
+  reads.length = 0;
+  assert.deepEqual(((await warm.distinct({ table: "fact_sales", column: "stock_num", values: ["NEWSKU"] })) as any).missing[0].in_reference, { table: "stock_master", column: "stock_num" });
+  assert.ok(!reads.some((q) => /FROM "stock_master"/.test(q)), "reference answered from memory");
+  // the reference table itself, and a column with no reference, are answered as before
+  assert.equal(((await ref.distinct({ table: "stock_master", column: "stock_num", values: ["NOPE"] })) as any).missing[0].in_reference, undefined);
+  assert.equal(((await ref.distinct({ table: "dim_sku", column: "brand", values: ["Pumas"] })) as any).missing[0].in_reference, undefined);
+  stop();
+  db.exec(`DROP TABLE stock_master`);
+}
+
 // a view over a denied table shows its rows under another name: it is hidden too, and so is a view over that view
 db.exec(`
   CREATE VIEW v_secrets AS SELECT k FROM secrets;

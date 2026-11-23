@@ -47,7 +47,7 @@ export interface AnalyticsConfig {
    * time it is asked about.
    */
   warmColumns?: Array<{ table: string; column: string }>;
-  /** How often a column's values in memory are re-read, in minutes (default 60). An older list is not used. */
+  /** How often values in memory are re-read, in minutes (default 60). One not refreshed for two intervals is not used. */
   warmRefreshMinutes?: number;
   /**
    * How far a table's data is complete, when the client knows. Data often keeps arriving after a period
@@ -57,6 +57,18 @@ export interface AnalyticsConfig {
    * null when not known.
    */
   completeThrough?: (table: string, columns: string[]) => Promise<CompleteThrough | null> | CompleteThrough | null;
+  /**
+   * Period columns whose latest value is read into memory when the server starts and kept fresh, so
+   * the period check's first question is answered without scanning a large table or view (a view that
+   * aggregates rebuilds itself to find its greatest date). Any other period asked about joins them.
+   */
+  warmPeriods?: Array<{ table: string; columns: string[] }>;
+  /**
+   * Columns whose values are defined in another table: a stock number in the stock master. When a value
+   * has no rows where it was asked about but is in the reference, the distinct answer says so
+   * (`in_reference`) and offers no closest values, which would read as "you mistyped it".
+   */
+  valueReferences?: Array<{ column: string; table: string; refColumn?: string }>;
 }
 
 export interface CompleteThrough { through: string; rule?: string }
@@ -82,6 +94,12 @@ interface ValueList { at: number; byUpper: Map<string, { value: string; count: n
 export function createAnalytics(deps: AnalyticsConfig) {
   let cached: { at: number; tables: AnalyticsTable[] } | null = null;
   const refreshMs = Math.max(5, Number(deps.warmRefreshMinutes) || 60) * 60_000;
+  /**
+   * An answer in memory is used for two refresh intervals: the refresh re-reads it every interval and
+   * the old answer is used while the new one loads. It is no longer trusted only when refreshes have
+   * stopped working.
+   */
+  const trustMs = 2 * refreshMs;
   /** table\0column -> its values in memory */
   const lists = new Map<string, ValueList>();
   /** Columns with too many values to keep. */
@@ -92,6 +110,10 @@ export function createAnalytics(deps: AnalyticsConfig) {
   /** One load at a time: a refresh must not stack scans on the client's database. */
   let loadQueue: Promise<void> = Promise.resolve();
   let timer: ReturnType<typeof setInterval> | null = null;
+  /** table\0columns -> the latest value(s) in memory */
+  const latestMem = new Map<string, { at: number; latest: string[] | null }>();
+  /** Periods to keep fresh: the configured ones and those asked about. */
+  const latestKept = new Map<string, { table: string; columns: string[] }>();
   const denied = new Set((deps.deniedTables ?? []).map((t) => t.toLowerCase().replace(/"/g, "").replace(/^public\./, "")));
   /** Is a listed table (`name`, or `schema.name` outside public) on the deny list, however the list spells it? */
   const isDenied = (name: string) => { const n = name.toLowerCase(); return denied.has(n) || denied.has(n.slice(n.lastIndexOf(".") + 1)); };
@@ -229,6 +251,37 @@ export function createAnalytics(deps: AnalyticsConfig) {
     return loadQueue;
   }
 
+  /** The greatest value(s) of the period column(s); the one statement both the lookup and the memory use. */
+  async function readLatest(table: string, columns: string[]): Promise<string[] | null> {
+    const rows = await deps.query(
+      `SELECT ${columns.map((c, i) => `CAST(${quoteIdent(c)} AS TEXT) AS c${i + 1}`).join(", ")} FROM ${quoteIdent(table)}` +
+        ` WHERE ${columns.map((c) => `${quoteIdent(c)} IS NOT NULL`).join(" AND ")}` +
+        ` ORDER BY ${columns.map((c) => `${quoteIdent(c)} DESC`).join(", ")} LIMIT 1`,
+      [],
+    );
+    return rows[0] ? columns.map((_, i) => String(rows[0][`c${i + 1}`])) : null;
+  }
+
+  /** Read a period's latest value into memory, behind any load already running. */
+  function loadLatest(table: string, columns: string[]): Promise<void> {
+    const key = listKey(table, columns.join(","));
+    if (loading.has(`latest\u0000${key}`)) return loadQueue;
+    loading.add(`latest\u0000${key}`);
+    loadQueue = loadQueue.then(async () => {
+      try { latestMem.set(key, { at: Date.now(), latest: await readLatest(table, columns) }); }
+      catch { /* stays unknown: the next question reads the table */ }
+      finally { loading.delete(`latest\u0000${key}`); }
+    });
+    return loadQueue;
+  }
+
+  function keepLatest(table: string, columns: string[], learned: boolean) {
+    const key = listKey(table, columns.join(","));
+    if (latestKept.has(key)) return;
+    if (learned && latestKept.size >= MAX_LEARNED_COLUMNS + (deps.warmPeriods?.length ?? 0)) return;
+    latestKept.set(key, { table, columns });
+  }
+
   /** Keep a column fresh from now on (a configured one, or one just asked about). */
   function keep(table: string, column: string, learned: boolean) {
     const key = listKey(table, column);
@@ -244,13 +297,33 @@ export function createAnalytics(deps: AnalyticsConfig) {
    */
   function startWarming(): () => void {
     void (async () => {
+      // periods first: one answer each, and the period check has no other way to know
+      for (const w of deps.warmPeriods ?? []) {
+        const cols: string[] = [];
+        let table = "";
+        for (const c of w.columns ?? []) {
+          const r = await resolve(w.table, c).catch(() => null);
+          if (!r || "error" in r) { cols.length = 0; break; }
+          table = r.table;
+          cols.push(r.column);
+        }
+        if (cols.length && cols.length <= MAX_LATEST_COLUMNS) { keepLatest(table, cols, false); void loadLatest(table, cols); }
+      }
       for (const w of deps.warmColumns ?? []) {
         const r = await resolve(w.table, w.column).catch(() => null);
         if (r && !("error" in r)) keep(r.table, r.column, false);
       }
+      // a reference column is asked about whenever a value is missing elsewhere: keep it too
+      for (const ref of deps.valueReferences ?? []) {
+        const r = await resolve(ref.table, ref.refColumn ?? ref.column).catch(() => null);
+        if (r && !("error" in r)) keep(r.table, r.column, false);
+      }
     })();
     if (!timer) {
-      timer = setInterval(() => { for (const k of kept.values()) void loadList(k.table, k.column); }, refreshMs);
+      timer = setInterval(() => {
+        for (const k of latestKept.values()) void loadLatest(k.table, k.columns);
+        for (const k of kept.values()) void loadList(k.table, k.column);
+      }, refreshMs);
       timer.unref?.();
     }
     return () => { if (timer) clearInterval(timer); timer = null; };
@@ -259,7 +332,7 @@ export function createAnalytics(deps: AnalyticsConfig) {
   /** The distinct answer from a column's values in memory: the same matches and closest values as the SQL below. */
   function distinctFromMemory(list: ValueList, table: string, column: string, values: string[], limit: number) {
     const matches: { value: string; count: number }[] = [];
-    const missing: { value: string; closest: { value: string; count: number }[] }[] = [];
+    const missing: { value: string; closest: { value: string; count: number }[]; in_reference?: { table: string; column: string } }[] = [];
     for (const v of values) {
       const hit = list.byUpper.get(v.toUpperCase());
       if (hit) { matches.push(...hit); continue; }
@@ -301,7 +374,7 @@ export function createAnalytics(deps: AnalyticsConfig) {
 
     const key = listKey(r.table, r.column);
     const list = lists.get(key);
-    if (list && Date.now() - list.at < refreshMs) return distinctFromMemory(list, r.table, r.column, values, limit);
+    if (list && Date.now() - list.at < trustMs) return withReferences(distinctFromMemory(list, r.table, r.column, values, limit));
     if (typeFamily(r.type) === "text") keep(r.table, r.column, true);
 
     const matches: { value: string; count: number }[] = [];
@@ -314,7 +387,7 @@ export function createAnalytics(deps: AnalyticsConfig) {
       for (const row of rows) matches.push({ value: String(row.v), count: Number(row.n) });
     }
     const found = new Set(matches.map((m) => m.value.toUpperCase()));
-    const missing: { value: string; closest: { value: string; count: number }[] }[] = [];
+    const missing: { value: string; closest: { value: string; count: number }[]; in_reference?: { table: string; column: string } }[] = [];
     let lookups = 0;
     for (const v of values) {
       if (found.has(v.toUpperCase())) continue;
@@ -335,7 +408,32 @@ export function createAnalytics(deps: AnalyticsConfig) {
       missing.push({ value: v, closest });
     }
 
-    return { table: r.table, column: r.column, matches, missing };
+    return withReferences({ table: r.table, column: r.column, matches, missing });
+  }
+
+  /**
+   * A missing value that is in the column's reference table (valueReferences) is a real value with no
+   * rows here yet: say so, and drop the closest values. Never fails the answer: a reference that cannot
+   * be read leaves the value as missing.
+   */
+  async function withReferences<T extends { table: string; column: string; missing: { value: string; closest: { value: string; count: number }[]; in_reference?: { table: string; column: string } }[] }>(answer: T): Promise<T> {
+    const ref = (deps.valueReferences ?? []).find((x) => x.column.toLowerCase() === answer.column.toLowerCase());
+    if (!ref || !answer.missing.length) return answer;
+    const rr = await resolve(ref.table, ref.refColumn ?? ref.column).catch(() => null);
+    if (!rr || "error" in rr || rr.table === answer.table) return answer;
+    const list = lists.get(listKey(rr.table, rr.column));
+    for (const m of answer.missing) {
+      let found = false;
+      if (list && Date.now() - list.at < trustMs) found = list.byUpper.has(m.value.toUpperCase());
+      else {
+        try {
+          const c = `CAST(${quoteIdent(rr.column)} AS TEXT)`;
+          found = (await deps.query(`SELECT 1 AS x FROM ${quoteIdent(rr.table)} WHERE UPPER(${c}) = UPPER(${ph(1)}) LIMIT 1`, [m.value])).length > 0;
+        } catch { found = false; }
+      }
+      if (found) { m.in_reference = { table: rr.table, column: rr.column }; m.closest = []; }
+    }
+    return answer;
   }
 
   /**
@@ -430,13 +528,17 @@ export function createAnalytics(deps: AnalyticsConfig) {
       table = r.table;
       resolved.push(r.column);
     }
-    const rows = await deps.query(
-      `SELECT ${resolved.map((c, i) => `CAST(${quoteIdent(c)} AS TEXT) AS c${i + 1}`).join(", ")} FROM ${quoteIdent(table)}` +
-        ` WHERE ${resolved.map((c) => `${quoteIdent(c)} IS NOT NULL`).join(" AND ")}` +
-        ` ORDER BY ${resolved.map((c) => `${quoteIdent(c)} DESC`).join(", ")} LIMIT 1`,
-      [],
-    );
-    const out = { table, columns: resolved, latest: rows[0] ? resolved.map((_, i) => String(rows[0][`c${i + 1}`])) : null };
+    // from memory when a fresh answer is held; otherwise from the table, kept for the next question
+    const key = listKey(table, resolved.join(","));
+    const mem = latestMem.get(key);
+    let latestValue: string[] | null;
+    if (mem && Date.now() - mem.at < trustMs) latestValue = mem.latest;
+    else {
+      latestValue = await readLatest(table, resolved);
+      latestMem.set(key, { at: Date.now(), latest: latestValue });
+      keepLatest(table, resolved, true);
+    }
+    const out = { table, columns: resolved, latest: latestValue };
     // Where the complete data ends, when the client knows: said beside the latest row, never instead of it.
     let complete: CompleteThrough | null = null;
     try { complete = deps.completeThrough ? await deps.completeThrough(table, resolved) : null; } catch { complete = null; }
