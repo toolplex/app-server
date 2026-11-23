@@ -59,7 +59,7 @@ export function registerDownloadRoutes(
     Querystring: Record<string, string>;
   }>("/download/:resource", async (request, reply) => {
     const { resource } = request.params;
-    const definition = config.resources[resource];
+    const definition = Object.hasOwn(config.resources, resource) ? config.resources[resource] : undefined;
 
     if (!definition) {
       return reply.code(404).send({ error: `Resource "${resource}" not found` });

@@ -94,6 +94,9 @@ const MAX_SHEET_COLUMNS = 2000;
 // Query-instance sandbox: read-only + no host filesystem access + config
 // locked so the agent's SQL can't re-enable any of it. Verified to block
 // read_csv on arbitrary paths, ATTACH, COPY, glob, and SET.
+/** A column type a caller may name: letters, digits and the punctuation of DECIMAL(18, 2) or VARCHAR[]. Never anything that could end the statement. */
+const SQL_TYPE_NAME = /^[A-Z][A-Z0-9_ (),[\]]{0,60}$/;
+
 const QUERY_INSTANCE_CONFIG = {
   access_mode: "READ_ONLY",
   enable_external_access: "false",
@@ -157,7 +160,15 @@ export class FileStore {
   /** Uploads in flight by client-chosen id; a retry awaits the first instead of ingesting twice. */
   private readonly inflight = new Map<string, Promise<FileManifest>>();
 
-  constructor(config: FilesConfig) {
+  /**
+   * The zone days are counted in when a file is queried (an alert's check
+   * over a page's snapshot): the organization's, when the server was given
+   * one. Without it the database's own default stands, as it always has.
+   */
+  private readonly timezone: string | null;
+
+  constructor(config: FilesConfig, options: { timezone?: string } = {}) {
+    this.timezone = options.timezone ?? null;
     this.cfg = {
       // One persistent, app-controlled store for everything (attachments AND
       // durable artifacts). Never the OS temp dir — the OS must not delete our
@@ -221,10 +232,18 @@ export class FileStore {
     try {
       // Bounds first: options are applied in order, and `lock_configuration`
       // in the sandbox config must come last or the bounds after it are refused.
-      const inst = await DuckDBInstance.create(dbPath, { ...this.boundsConfig(), ...(opts.config ?? QUERY_INSTANCE_CONFIG) });
+      const wanted: Record<string, string> = { ...(opts.config ?? QUERY_INSTANCE_CONFIG) };
+      // A zone can only be set on an open database, and not once its
+      // configuration is locked: so with a zone to set, the lock is applied
+      // by hand straight after it, before any caller's SQL can run.
+      const lockAfterZone = this.timezone !== null && wanted.lock_configuration === "true";
+      if (lockAfterZone) delete wanted.lock_configuration;
+      const inst = await DuckDBInstance.create(dbPath, { ...this.boundsConfig(), ...wanted });
       try {
         const conn = await inst.connect();
         try {
+          if (this.timezone !== null) await conn.run(`SET GLOBAL TimeZone = ${sqlString(this.timezone)}`);
+          if (lockAfterZone) await conn.run("SET GLOBAL lock_configuration = true");
           const ms = opts.timeoutMs ?? this.cfg.queryTimeoutMs;
           const bounded = <R,>(p: Promise<R>) => withTimeout(p, ms, () => conn.interrupt());
           return await fn(conn, bounded);
@@ -252,6 +271,19 @@ export class FileStore {
   }
 
   async init(): Promise<void> {
+    if (this.timezone !== null) {
+      // Found out now, not by every query failing later.
+      const probe = await DuckDBInstance.create(":memory:");
+      try {
+        const conn = await probe.connect();
+        await conn.run(`SET GLOBAL TimeZone = ${sqlString(this.timezone)}`);
+        conn.disconnectSync();
+      } catch {
+        throw new Error(`[app-server] timezone "${this.timezone}" is not a time zone the file store knows; use a name such as "Europe/Paris"`);
+      } finally {
+        probe.closeSync();
+      }
+    }
     // The store must never live under the OS temp dir: macOS clears $TMPDIR on
     // reboot and prunes it after ~3 days, which would silently delete our data
     // (both durable artifacts and in-use attachments) even though the TTL sweep
@@ -940,7 +972,7 @@ export class FileStore {
             if (cols.length === 0) continue;
             const typeOf = (c: string) => {
               const t = ds.columnTypes[c];
-              return typeof t === "string" && /^[A-Z][A-Z0-9_ (),\[\]]{0,60}$/.test(t) ? t : "VARCHAR";
+              return typeof t === "string" && SQL_TYPE_NAME.test(t) ? t : "VARCHAR";
             };
             await conn.run(`CREATE TABLE ${ds.safe} (${cols.map((c) => `"${c}" ${typeOf(c)}`).join(", ")})`);
             const table = await this.describeTable(conn, ds.safe);
@@ -965,6 +997,21 @@ export class FileStore {
           }
           if (await loadJsonTable(conn, ds.safe, tmp, ds.columns)) {
             notes.push(`Some columns of "${ds.requested || ds.safe}" mix numbers and text; they are stored as text.`);
+          }
+          // Types the caller declared win over what the rows suggested: a
+          // page of one record whose total is empty must still have a
+          // numeric total, or the first sum over it is an error.
+          const actual = new Map((await conn.runAndReadAll(`SELECT column_name, column_type FROM (DESCRIBE ${ds.safe})`)).getRowObjects().map((r) => [String(r.column_name), String(r.column_type)]));
+          for (const [name, type] of Object.entries(ds.columnTypes)) {
+            if (typeof type !== "string" || !SQL_TYPE_NAME.test(type) || !actual.has(name) || actual.get(name) === type) continue;
+            const col = quoteIdent(name);
+            // A moment arrives as ISO text ending in Z. Read as a timestamp
+            // with no zone, it is that many hours UTC, not that many hours
+            // wherever this machine is: say so, or every moment in the
+            // snapshot is off by the machine's distance from UTC.
+            const naive = type === "TIMESTAMP WITH TIME ZONE" && /^TIMESTAMP(_S|_MS|_NS)?$/.test(actual.get(name)!);
+            const using = naive ? `timezone('UTC', CAST(${col} AS TIMESTAMP))` : `TRY_CAST(${col} AS ${type})`;
+            await conn.run(`ALTER TABLE ${ds.safe} ALTER COLUMN ${col} SET DATA TYPE ${type} USING ${using}`);
           }
           const table = await this.describeTable(conn, ds.safe);
           // Carry the caller's label when it differs from the SQL-safe name,
@@ -2284,7 +2331,7 @@ function normalizeRow(
  * SQL rendering ("2026-01-02", "3.14"), so we stringify wrappers and fall
  * back to a BigInt-safe JSON for anything without a useful toString.
  */
-function normalizeValue(v: unknown, maxStringLen?: number): unknown {
+export function normalizeValue(v: unknown, maxStringLen?: number): unknown {
   if (v === null || v === undefined) return null;
   const t = typeof v;
   if (t === "bigint") {

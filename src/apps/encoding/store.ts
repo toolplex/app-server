@@ -8,6 +8,8 @@
 //   pages/<docId>-<n>         the working copy of each page (what is read)
 //   docs/<docId>.json         the record: reading, values, answers, versions
 //   uploads/<uploadId>.json   which documents an upload produced (retries)
+//   store.json                this store's id, made once and kept for good
+//   configs/<version>.json    each configuration records were approved under
 //
 // Plain files on purpose: the nightly backup already mirrors this directory
 // tree, a record can be opened and read by a person, and there is no native
@@ -27,6 +29,16 @@
 // storage later touches nothing else.
 //
 // Originals are never modified or deleted by anything here.
+//
+// CHANGE STAMPS. Some of what a record holds counts outside the app (an
+// approved version feeds the app's tables, and any copy kept elsewhere). The
+// kind says what counts as one piece of text (`counted`); whenever storing a
+// record changes that text, the record is stamped with a number larger than
+// any before it and the time. The stamp is written in the record's own file,
+// in the same write as the change, so there is no second list that a crash
+// could leave disagreeing with the records. "What changed since number N" is
+// then a question the index answers, and each record appears once, as it
+// stands now.
 // ---------------------------------------------------------------------------
 
 import { createHash, randomUUID } from "node:crypto";
@@ -114,6 +126,11 @@ export interface StoredDocument {
   history: { at: string; by: string | null; action: string; detail?: string }[];
   /** The names this record's approval added to the learned lists, so a correction can take them back. */
   learned?: { list: string; value: string }[];
+  /**
+   * The number and time of the last change to what this record counts for
+   * outside the app (see "change stamps" above). Absent while it never has.
+   */
+  counted?: { seq: number; at: string };
 }
 
 /** A file already written under this store's directory (an upload received to disk). */
@@ -153,6 +170,10 @@ export interface IndexEntry {
   version: number;
   approvedAt: string | null;
   approvedBy: string | null;
+  /** When it was first approved. Corrections approved later do not move it. */
+  firstApprovedAt: string | null;
+  /** The form its last approved version was approved as; a later re-read may have changed `documentType`. */
+  approvedForm: string | null;
   /** The header values (not the table lines). */
   values: Record<string, Scalar | null>;
   /** Number of lines in each table. */
@@ -161,8 +182,15 @@ export interface IndexEntry {
   text: string;
   /** This document's share of the calibration counts, once approved. */
   cal: number[] | null;
-  /** Modification time of the record file this entry was made from. */
+  /** What of this record counts right now, as the kind puts it; null when nothing does. */
+  sig: string | null;
+  /** The number of the last change to that; null while it has never counted. */
+  seq: number | null;
+  /** When that change was. */
+  countedAt: string | null;
+  /** Modification time and size of the record file this entry was made from. */
   mtime: number;
+  size?: number;
 }
 
 /** What only the app's configuration can say about a record. */
@@ -174,10 +202,29 @@ export interface StoreOptions {
   version?: string;
   /** Full records kept in memory. */
   cacheSize?: number;
-  log?: (message: string) => void;
+  log?: (message: string, level?: "info" | "error") => void;
+  /**
+   * Called with every record once it is stored. This is how anything built
+   * from the records (the query database) follows them: there is one place a
+   * record is written, so there is one place to be told. It must not throw;
+   * the record is already stored when it runs.
+   */
+  onSaved?: (doc: StoredDocument) => Promise<void> | void;
+  /**
+   * What of a record counts outside the app, as one piece of text; null when
+   * nothing does. A record is stamped whenever storing it changes this.
+   */
+  counted?: (doc: StoredDocument) => string | null;
+  /**
+   * Applied to every record as it is read from its file, before anything
+   * else sees it. For what the app's configuration says about records written
+   * before it changed (a field that was renamed). It changes the record in
+   * hand only; the file is rewritten the next time the record is stored.
+   */
+  migrate?: (doc: StoredDocument) => void;
 }
 
-const INDEX_FORMAT = 2;
+const INDEX_FORMAT = 4;
 const TEXT_CAP = 4000;
 
 const ID = /^[a-z0-9-]{1,64}$/i;
@@ -193,7 +240,28 @@ export class EncodingStore {
   private readonly describe: Describe;
   private readonly version: string;
   private readonly cacheSize: number;
-  private readonly log: (message: string) => void;
+  private readonly log: (message: string, level?: "info" | "error") => void;
+  private readonly onSaved: (doc: StoredDocument) => Promise<void> | void;
+  private readonly migrate: (doc: StoredDocument) => void;
+  private readonly counted: (doc: StoredDocument) => string | null;
+  /** The highest change number given so far. */
+  private seq = 0;
+  /** The highest number carried by a record that is safely stored (never one still being written). */
+  private storedMax = 0;
+  /**
+   * Every time the records were opened: an id for that run, and the highest
+   * stamp there was when it began. Kept in store.json. It is how a place in
+   * the list of changes is recognised as one this store really handed out.
+   */
+  private runs: { id: string; from: number }[] = [];
+  private run = "";
+  /** Numbers given to records that are still being written. Nothing at or above the lowest is handed out as a change yet. */
+  private stamping = new Set<number>();
+  private lastCounted = "";
+  private id = "";
+  private created = "";
+  /** Stamped entries by number, made when first asked for and dropped when a stamp is given. */
+  private stamped: IndexEntry[] | null = null;
 
   constructor(
     readonly dir: string,
@@ -204,6 +272,15 @@ export class EncodingStore {
     this.version = `${INDEX_FORMAT}:${options.version ?? ""}`;
     this.cacheSize = options.cacheSize ?? 200;
     this.log = options.log ?? (() => {});
+    this.onSaved = options.onSaved ?? (() => {});
+    this.migrate = options.migrate ?? (() => {});
+    this.counted = options.counted ?? (() => null);
+  }
+
+  private parse(text: string): StoredDocument {
+    const doc = JSON.parse(text) as StoredDocument;
+    this.migrate(doc);
+    return doc;
   }
 
   private path(...parts: string[]): string {
@@ -214,44 +291,225 @@ export class EncodingStore {
     for (const sub of ["originals", "pages", "docs", "uploads"]) {
       await mkdir(this.path(sub), { recursive: true });
     }
+    await this.readIdentity();
     // Uploads that never finished leave their part-files behind.
     for (const file of await readdir(this.path("uploads"))) {
       if (file.endsWith(".part")) await rm(this.path("uploads", file), { force: true });
     }
-    const kept = await this.readIndexFile();
+    const { kept, known } = await this.readIndexFile();
+    // A record being written when the server was stopped dead leaves its
+    // half-written file behind; the record itself is as it was before. Only
+    // files this store names that way are removed, and only files.
+    const leftover = /\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/;
+    for (const sub of ["docs", "originals", "uploads", "configs", "."]) {
+      for (const file of await readdir(this.path(sub), { withFileTypes: true }).catch(() => [])) {
+        if (file.isFile() && leftover.test(file.name)) await rm(this.path(sub, file.name), { force: true }).catch(() => {});
+      }
+    }
     const files = (await readdir(this.path("docs"))).filter((f) => f.endsWith(".json"));
+    const present = new Set(files.map((f) => f.slice(0, -5)));
     let reread = 0;
     const started = Date.now();
     await inParallel(files, 32, async (file) => {
       const id = file.slice(0, -5);
       const path = this.path("docs", file);
       let mtime: number;
+      let size: number;
       try {
-        mtime = (await stat(path)).mtimeMs;
+        const at = await stat(path);
+        mtime = at.mtimeMs;
+        size = at.size;
       } catch {
         return;
       }
       const entry = kept?.get(id);
-      if (entry && entry.mtime === mtime) {
+      if (entry && entry.mtime === mtime && entry.size === size) {
         this.index.set(id, entry);
         return;
       }
       try {
-        const doc = JSON.parse(await readFile(path, "utf8")) as StoredDocument;
-        if (doc?.id === id) this.index.set(id, this.entryOf(doc, mtime));
-      } catch {
+        const doc = this.parse(await readFile(path, "utf8"));
+        if (doc?.id === id) this.index.set(id, this.entryOf(doc, mtime, size));
+        else this.log(`record file docs/${file} does not hold the record its name says; it is left out until that is put right`, "error");
+      } catch (err) {
         // A record that will not parse is left on disk for a person to look
-        // at; it must not stop every other record from loading.
+        // at; it must not stop every other record from loading. It is said
+        // loudly: until it is put right the record is missing from every
+        // list, total and table.
+        this.log(`record file docs/${file} cannot be read (${err instanceof Error ? err.message.split("\n")[0] : String(err)}); the record is left out until that is put right`, "error");
       }
       if (++reread % 5000 === 0) this.log(`indexing records: ${reread} read`);
     });
     if (reread > 0) this.log(`indexed ${reread} record${reread === 1 ? "" : "s"} from disk in ${Date.now() - started} ms`);
+    for (const e of this.index.values()) {
+      if (e.seq !== null && e.seq > this.seq) this.seq = e.seq;
+      if (e.countedAt && e.countedAt > this.lastCounted) this.lastCounted = e.countedAt;
+    }
+    this.storedMax = this.seq;
+
+    // Whether whoever copied these records can carry on from where they
+    // were. They cannot when what they were told no longer matches what is
+    // here, and nothing in the list of changes would ever tell them:
+    //   - a record that had counted is gone (nothing here removes a record's
+    //     file, so it was lost or taken away by hand);
+    //   - a record is back that the last run did not have (its file was put
+    //     back, or could not be read then and can now), carrying an old
+    //     stamp that every copy has long gone past;
+    //   - there is no index from the last run to compare with at all.
+    // In each case the store takes a new id, and every copy starts again.
+    const stamped = [...this.index.values()].filter((e) => e.seq !== null);
+    let startAgain: string | null = null;
+    if (!known) {
+      if (stamped.length > 0 && this.runs.length > 0) startAgain = "the index of the last run is missing, so what changed since cannot be vouched for";
+    } else {
+      const lost = [...known].filter(([id]) => !present.has(id));
+      for (const [id] of lost.slice(0, 20)) this.log(`record file docs/${id}.json is gone; the record is left out of every list, total and table`, "error");
+      if (lost.length > 20) this.log(`${lost.length - 20} more record files are gone`, "error");
+      if (lost.some(([, seq]) => seq !== null)) startAgain = "a record that had counted is gone";
+      // A record the last run did not have. One made in the last run's final
+      // moments (stored, the server stopped before the index heard of it)
+      // carries a stamp from that run and is simply new. One whose stamp is
+      // from before that run began was here once and is back.
+      const lastRunBegan = this.runs.at(-1)?.from;
+      const back = lastRunBegan === undefined ? [] : stamped.filter((e) => !known.has(e.id) && e.seq! <= lastRunBegan);
+      for (const e of back.slice(0, 20)) this.log(`record ${e.id} ("${e.name}") is back: the last run did not have it`, "info");
+      if (back.length > 0) startAgain ??= "a record is back that the last run did not have";
+    }
+    if (startAgain) {
+      this.log(`${startAgain}: every copy kept of these records starts again`, "error");
+      this.id = randomUUID();
+      this.runs = [];
+    }
+    this.run = randomUUID().slice(0, 8);
+    this.runs.push({ id: this.run, from: this.storedMax });
+    this.runs = this.runs.slice(-2000);
+    // The verdict first, the tidied index after: the old index is the only
+    // witness to what the last run had, and must not be replaced before
+    // what was concluded from it is safely written.
+    await this.writeJson(this.path("store.json"), { id: this.id, created: this.created, runs: this.runs });
     if (!kept || reread > 0 || kept.size !== this.index.size || this.indexLines > this.index.size) await this.compact();
+  }
+
+  /** This store's id: made the first time it is opened, and kept. */
+  private async readIdentity(): Promise<void> {
+    const path = this.path("store.json");
+    try {
+      const kept = JSON.parse(await readFile(path, "utf8")) as { id?: unknown; created?: unknown; runs?: unknown };
+      if (typeof kept.id === "string" && kept.id && typeof kept.created === "string") {
+        this.id = kept.id;
+        this.created = kept.created;
+        this.runs = Array.isArray(kept.runs)
+          ? (kept.runs as { id?: unknown; from?: unknown }[]).filter((r) => typeof r?.id === "string" && typeof r?.from === "number").map((r) => ({ id: r.id as string, from: r.from as number }))
+          : [];
+        return;
+      }
+    } catch {
+      // not made yet, or unreadable: a new one is made, and every copy starts again
+    }
+    // Written at the end of init, with this run in it.
+    this.id = randomUUID();
+    this.created = new Date().toISOString();
+    this.runs = [];
+  }
+
+  /**
+   * Keep a configuration under its version, once. Every approved version of
+   * a record says which configuration it was approved under; with the
+   * configuration itself kept, what a key meant then can always be looked up,
+   * however the app's forms have changed since.
+   */
+  async keepConfig(version: string, config: unknown): Promise<void> {
+    if (!/^[0-9a-f]{8,64}$/.test(version)) return;
+    await mkdir(this.path("configs"), { recursive: true });
+    const path = this.path("configs", `${version}.json`);
+    try {
+      await stat(path);
+    } catch {
+      await this.writeJson(path, { version, first_used: new Date().toISOString(), config });
+    }
+  }
+
+  /** An id kept with these records for as long as they exist. */
+  identity(): string {
+    return this.id;
+  }
+
+  /** When what the records count for last changed; the store's own beginning while nothing has. */
+  changedAt(): string {
+    return this.lastCounted > this.created ? this.lastCounted : this.created;
+  }
+
+  /**
+   * Where this store stands right now: this run, and the highest stamp that
+   * is safely stored. Handed out with every page of changes, and handed back
+   * with the next request, so the store can tell whether what the asker was
+   * told still holds.
+   */
+  mark(): { run: string; high: number } {
+    return { run: this.run, high: this.storedMax };
+  }
+
+  /**
+   * Whether someone who was told the changes up to `mark` can carry on from
+   * there. They can when that mark is one this store gave and still stands
+   * by: it names a run this store remembers, and a stamp that run really
+   * reached. When the records are put back from an older copy, the runs
+   * since that copy are not in it, and the run that was going when it was
+   * taken never reached the later stamps: either way the mark is not one
+   * this store knows, and the asker starts again. No clock is consulted.
+   */
+  continues(mark: { run: string; high: number }): boolean {
+    if (!Number.isSafeInteger(mark.high) || mark.high < 0) return false;
+    const at = this.runs.findIndex((r) => r.id === mark.run);
+    if (at < 0) return false;
+    // A run reached no further than where the next one began.
+    return mark.high <= (at === this.runs.length - 1 ? this.storedMax : this.runs[at + 1].from);
+  }
+
+  /**
+   * Records whose stamp comes after `after`, oldest change first; records
+   * stamped in the same instant follow each other by id, so a place in the
+   * list is a number and an id. Each record once, as it stands. A record
+   * still being written is not handed out, nor anything stamped after it:
+   * whoever follows this list remembers the last place it was given, and
+   * must never be given an earlier one later.
+   */
+  changes(after: { seq: number; id: string } | null, limit: number): { seq: number; at: string; id: string; removed: boolean }[] {
+    this.stamped ??= [...this.index.values()].filter((e) => e.seq !== null).sort((a, b) => a.seq! - b.seq! || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    let horizon = Infinity;
+    for (const n of this.stamping) if (n < horizon) horizon = n;
+    const seq = after?.seq ?? 0;
+    const id = after?.id ?? "";
+    const out: { seq: number; at: string; id: string; removed: boolean }[] = [];
+    // The place to start is found by halving: the list is in order.
+    let lo = 0;
+    let hi = this.stamped.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      const e = this.stamped[mid];
+      if (e.seq! < seq || (e.seq === seq && e.id <= id)) lo = mid + 1;
+      else hi = mid;
+    }
+    for (let i = lo; i < this.stamped.length && out.length < limit; i++) {
+      const e = this.stamped[i];
+      if (e.seq! >= horizon) break;
+      out.push({ seq: e.seq!, at: e.countedAt ?? this.created, id: e.id, removed: e.sig === null });
+    }
+    return out;
+  }
+
+  /** What of a record counts, by the kind's own rule. A record the rule cannot make sense of counts for nothing. */
+  private sigOf(doc: StoredDocument): string | null {
+    try {
+      return this.counted(doc);
+    } catch {
+      return null;
+    }
   }
 
   // ── The index ────────────────────────────────────────────────────────────
 
-  private entryOf(doc: StoredDocument, mtime: number): IndexEntry {
+  private entryOf(doc: StoredDocument, mtime: number, fileSize?: number): IndexEntry {
     let described: ReturnType<Describe> = { ask: 0, confirm: 0, cal: null };
     try {
       described = this.describe(doc);
@@ -275,6 +533,11 @@ export class EncodingStore {
       }
     }
     const last = doc.versions?.at(-1);
+    const sig = this.sigOf(doc);
+    // A record from before stamps were kept gets one from what it already
+    // says: the same one every time it is read, until it is next stored.
+    const sinceAt = sig !== null ? last?.at : (doc.versions?.length ?? 0) > 0 ? (doc.history?.at(-1)?.at ?? last?.at) : undefined;
+    const stamp = doc.counted ?? (sinceAt && Number.isFinite(Date.parse(sinceAt)) ? { seq: Date.parse(sinceAt), at: sinceAt } : null);
     return {
       id: doc.id,
       name: doc.name,
@@ -292,41 +555,59 @@ export class EncodingStore {
       version: doc.versions?.length ?? 0,
       approvedAt: last?.at ?? null,
       approvedBy: last?.by ?? null,
+      firstApprovedAt: doc.versions?.[0]?.at ?? null,
+      approvedForm: last?.documentType ?? null,
       values,
       lines: Object.fromEntries(Object.entries(tables).map(([k, rows]) => [k, rows?.length ?? 0])),
       text: parts.join("\n").toLowerCase().slice(0, TEXT_CAP),
       cal: described.cal,
+      sig,
+      seq: stamp?.seq ?? null,
+      countedAt: stamp?.at ?? null,
       mtime,
+      ...(fileSize !== undefined ? { size: fileSize } : {}),
     };
   }
 
-  /** The index as last written, or null when it is missing or was made under another configuration. */
-  private async readIndexFile(): Promise<Map<string, IndexEntry> | null> {
+  /**
+   * The index as last written. `kept` is null when it is missing or was made
+   * under another configuration, and every record is then read again.
+   * `known` is which records the last run had and the stamp each carried,
+   * whatever configuration it ran under; null only when there is no index
+   * file to say.
+   */
+  private async readIndexFile(): Promise<{ kept: Map<string, IndexEntry> | null; known: Map<string, number | null> | null }> {
     let raw: string;
     try {
       raw = await readFile(this.path("index.jsonl"), "utf8");
     } catch {
-      return null;
+      return { kept: null, known: null };
     }
     const lines = raw.split("\n");
+    let usable = false;
     try {
-      if ((JSON.parse(lines[0]) as { index?: string }).index !== this.version) return null;
+      usable = (JSON.parse(lines[0]) as { index?: string }).index === this.version;
     } catch {
-      return null;
+      return { kept: null, known: null };
     }
     const kept = new Map<string, IndexEntry>();
+    const known = new Map<string, number | null>();
     for (let i = 1; i < lines.length; i++) {
       if (!lines[i]) continue;
       try {
         const entry = JSON.parse(lines[i]) as IndexEntry;
         // Later lines win: each change to a record appends one.
-        if (entry?.id) kept.set(entry.id, entry);
+        if (entry?.id) {
+          kept.set(entry.id, entry);
+          known.set(entry.id, typeof entry.seq === "number" ? entry.seq : null);
+        }
         this.indexLines++;
       } catch {
         // A line cut short by a crash; that record's file time will not match and it is read again.
       }
     }
-    return kept;
+    if (!usable) this.indexLines = 0;
+    return { kept: usable ? kept : null, known };
   }
 
   /** Rewrite the index file with one line per document. */
@@ -479,7 +760,7 @@ export class EncodingStore {
       return cached;
     }
     try {
-      const doc = JSON.parse(await readFile(this.path("docs", `${id}.json`), "utf8")) as StoredDocument;
+      const doc = this.parse(await readFile(this.path("docs", `${id}.json`), "utf8"));
       // Someone may have stored a newer one while this was being read.
       const newer = this.cache.get(id);
       if (newer) return newer;
@@ -492,11 +773,60 @@ export class EncodingStore {
 
   async save(doc: StoredDocument): Promise<void> {
     const path = this.path("docs", `${doc.id}.json`);
-    await this.writeJson(path, doc);
-    const entry = this.entryOf(doc, (await stat(path)).mtimeMs);
-    this.index.set(doc.id, entry);
+    // Stamped when what it counts for changes, in the same write as the
+    // change itself (see "change stamps" at the top).
+    const before = this.index.get(doc.id);
+    const previous = doc.counted;
+    let stamp: number | null = null;
+    // A record handed over without the stamp it is known to carry keeps it.
+    if (!previous && before && before.seq !== null && before.countedAt) doc.counted = { seq: before.seq, at: before.countedAt };
+    if (this.sigOf(doc) !== (before?.sig ?? null)) {
+      stamp = this.seq = Math.max(this.seq + 1, Date.now());
+      this.stamping.add(stamp);
+      doc.counted = { seq: stamp, at: new Date().toISOString() };
+    }
+    let entry: IndexEntry;
+    try {
+      await this.writeJson(path, doc);
+      const written = await stat(path);
+      entry = this.entryOf(doc, written.mtimeMs, written.size);
+      this.index.set(doc.id, entry);
+      if (stamp !== null) {
+        this.stamped = null;
+        if (stamp > this.storedMax) this.storedMax = stamp;
+        if (doc.counted!.at > this.lastCounted) this.lastCounted = doc.counted!.at;
+      }
+    } catch (err) {
+      // Not stored, so not stamped: the record in hand goes back to what it said.
+      if (stamp !== null) {
+        if (previous) doc.counted = previous;
+        else delete doc.counted;
+      }
+      throw err;
+    } finally {
+      if (stamp !== null) this.stamping.delete(stamp);
+    }
     this.remember(doc);
     await this.noteInIndex(entry);
+    try {
+      await this.onSaved(doc);
+    } catch (err) {
+      this.log(`onSaved failed for ${doc.id}: ${err instanceof Error ? err.message : String(err)}`, "error");
+    }
+  }
+
+  /**
+   * One full record straight from its file, without touching the few kept in
+   * memory. For work that walks every record (rebuilding what is derived from
+   * them): going through `load` would push out the records people have open.
+   * Throws when the file cannot be read, so a failed read is never mistaken
+   * for an empty record.
+   */
+  async read(id: string): Promise<StoredDocument | null> {
+    if (!this.index.has(id)) return null;
+    const cached = this.cache.get(id);
+    if (cached) return cached;
+    return this.parse(await readFile(this.path("docs", `${id}.json`), "utf8"));
   }
 
   /**

@@ -28,6 +28,10 @@ import type {
 } from "../types.js";
 import type { FileStore } from "../../files/store.js";
 import { registerEncodingAgentTools } from "./agent.js";
+import { countedSignature, encodingRecordsSource, orphanedKeys, renameKeys, type EncodingRecordsOptions } from "./records.js";
+import { isRecordsQuery, recordRelation } from "../records/kinds.js";
+import type { RunningRecords } from "../records/resource.js";
+import { openRecords, type RecordsRuntime } from "../records/runtime.js";
 import { readAbilities, configVersion, withoutFunctions } from "../../routes/apps.js";
 import { readOrgHeader, readUserHeaders } from "../../user.js";
 import { EncodingStore, type IndexEntry, type Reading, type ReceivedFile, type Scalar, type StoredDocument } from "./store.js";
@@ -142,11 +146,15 @@ export async function registerEncodingApp(
   app: DocumentEncodingApp,
   /** The file store chat attachments live in, once it exists. */
   fileStore: () => FileStore | null,
-): Promise<{ pending: (abilities: EncodingAbility[]) => number }> {
+  /** What the rest of the server's configuration says about this app's records. */
+  recordsOptions: { timezone: string; views: Record<string, { sql: string; label: string }> } = { timezone: "UTC", views: {} },
+): Promise<{ pending: (abilities: EncodingAbility[]) => number; records: RunningRecords | null }> {
   const cfg = app.config;
   // What a client was served; records keep this to stay interpretable.
   const version = configVersion(withoutFunctions(cfg));
   const root = resolve(config.files?.dir ?? join(homedir(), ".toolplex-app-files"), "apps", appId);
+  // Set below, once the store it is built from exists.
+  let runtime: RecordsRuntime | null = null;
   const store = new EncodingStore(root, appId, {
     // What the index keeps per document that only this configuration can say.
     describe: (doc) => {
@@ -158,16 +166,62 @@ export async function registerEncodingApp(
       };
     },
     version,
-    log: (message) => fastify.log.info({ appId }, `document-encoding: ${message}`),
+    log: (message, level) => fastify.log[level ?? "info"]({ appId }, `document-encoding: ${message}`),
+    // The query database follows every record as it is stored (below).
+    // A field that was renamed takes its value with it (`was`).
+    migrate: (doc) => renameKeys(doc, app),
+    // What of a record counts outside the app. The store stamps a record
+    // whenever this changes; the tables and any copy elsewhere follow the stamps.
+    counted: (doc) => countedSignature(app, doc),
+    // Told, not awaited: storing a record never waits for the tables.
+    onSaved: (doc) => runtime?.touch(doc.id),
   });
   // Reading the index is quick; rebuilding it (first start after an upgrade,
   // a restore) can take a while with years of documents. Either way the
   // server starts at once and this app's requests wait for it.
   let isReady = false;
-  const ready = store.init().then(() => {
+  const ready = store.init().then(async () => {
+    // The configuration records are approved under from now on, kept beside
+    // them: each approved version names its configuration, and what a key
+    // meant then must stay knowable however the forms change later.
+    await store.keepConfig(version, withoutFunctions(cfg)).catch((err: unknown) => fastify.log.error({ err, appId }, "document-encoding: could not keep this configuration beside the records"));
     isReady = true;
   });
   ready.catch((err) => fastify.log.error({ err, appId }, "document-encoding: could not open the document store"));
+  // A rename nobody declared leaves values no screen or page shows. Said once, at startup.
+  void ready
+    .then(() => {
+      for (const o of orphanedKeys(app, store.entries()).slice(0, 20)) {
+        fastify.log.warn(
+          { appId, form: o.form, key: o.key, records: o.records },
+          `document-encoding: ${o.records} record${o.records === 1 ? "" : "s"} of form "${o.form}" hold a value under "${o.key}", which the form no longer has. If the field was renamed, add was: ["${o.key}"] to it.`,
+        );
+      }
+    })
+    .catch(() => {});
+
+  // The app's records for everything outside the app: the tables (when the
+  // client asked for them with `records: true`), queries over them, and the
+  // list of changes a copy elsewhere follows. The tables are laid out now, so
+  // a mistake in them stops the server from starting; they are filled in the
+  // background once the records can be listed.
+  try {
+    runtime = await openRecords({
+      appId,
+      title: app.title,
+      dir: root,
+      source: encodingRecordsSource(app, store),
+      database: app.records === true,
+      timezone: recordsOptions.timezone,
+      views: recordsOptions.views,
+      after: ready,
+      log: (level, message) => fastify.log[level]({ appId }, `document-encoding: ${message}`),
+    });
+  } catch (err) {
+    throw new Error(`@toolplex/app-server: app "${appId}": ${err instanceof Error ? err.message : String(err)}`);
+  }
+  const records = runtime;
+  const recordsNoun = encodingRecordsSource(app, store).noun;
   const summaryOf = (id: string) => summary(store.entry(id)!, cfg);
   const mates = (id: string, group: string | null, statuses?: string[]) =>
     group ? store.entries().filter((o) => o.id !== id && o.group === group && (statuses ? statuses.includes(o.status) : o.status !== "discarded")) : [];
@@ -426,6 +480,8 @@ export async function registerEncodingApp(
   fastify.addHook("onClose", async () => {
     closing = true;
     await Promise.race([Promise.allSettled([...reads]), new Promise((r) => setTimeout(r, 10_000).unref())]);
+    // After the reads: one that finishes now still has its rows written.
+    await records.close();
   });
 
   function enqueue(id: string): void {
@@ -983,6 +1039,12 @@ export async function registerEncodingApp(
         for (const d of docs) if (d.status === "reading" || d.status === "discarded" || d.status === "approved") {
           fail(409, `"${d.name}" cannot be joined right now`);
         }
+        // Joining throws one record away and reads the other afresh. A record
+        // that has been approved is counted somewhere; it is corrected or
+        // discarded on its own, by someone who may, never folded into another.
+        for (const d of docs) if ((d.versions?.length ?? 0) > 0) {
+          fail(409, `"${d.name}" has been approved and cannot be joined with another. Correct it, or discard it and bring the sheets in again.`);
+        }
         const [first, ...rest] = docs;
         await store.update(first.id, (doc) => {
           for (const other of rest) {
@@ -1019,6 +1081,12 @@ export async function registerEncodingApp(
     if (!reason) fail(400, "Say why this document is being discarded");
     await store.update(request.params.id, (doc) => {
       if (doc.status === "approved") fail(409, "An approved record cannot be discarded");
+      // A record that has been approved goes on counting while it is being
+      // corrected. Discarding it is the one thing that takes it out of every
+      // total, so it is for the people who could have approved it.
+      if ((doc.versions?.length ?? 0) > 0 && !readAbilities<EncodingAbility>(request, app).includes("approve")) {
+        fail(403, "This record has been approved. Discarding it takes it out of every total, which needs the right to approve");
+      }
       doc.status = "discarded";
       note(doc, user, "discarded", reason);
     });
@@ -1043,6 +1111,7 @@ export async function registerEncodingApp(
     ready,
     questionsOf: (doc) => openQuestions(doc, specOf(doc)),
     addFiles,
+    records: records.tool(),
   });
 
   // ── For the client's own code ────────────────────────────────────────────
@@ -1068,6 +1137,10 @@ export async function registerEncodingApp(
     approve: async (id, user) => {
       await approveDocument(id, user);
     },
+    changes: (options) => records.changes(options),
+    changedAt: () => records.changedAt(),
+    record: (id) => records.record(id),
+    query: (sql, params) => records.query(sql, params),
   };
   // After the store is open, and without holding up the server's start.
   void ready
@@ -1075,6 +1148,15 @@ export async function registerEncodingApp(
     .catch((err) => fastify.log.error({ err, appId }, "document-encoding: onReady failed"));
 
   return {
+    /** The app's query database, for pages built on its records (appRecords). Null when it keeps none. */
+    records: records.database
+      ? {
+          title: app.title,
+          noun: recordsNoun,
+          runtime: records,
+          relation: (options) => (isRecordsQuery(options) ? { error: "a query of the client's own is read by its resource's name" } : recordRelation(app, options as EncodingRecordsOptions)),
+        }
+      : null,
     /** Documents waiting on someone who may act on them. */
     pending: (abilities) => {
       if (!abilities.includes("review") && !abilities.includes("approve")) return 0;

@@ -1098,6 +1098,15 @@ export type PageContextHandler = (
 export interface ResourceDefinition {
   fetch: FetchHandler;
   context?: ContextHandler;
+  /**
+   * The database type of each column (DuckDB names: VARCHAR, DOUBLE, BIGINT,
+   * BOOLEAN, DATE, TIMESTAMP WITH TIME ZONE), when the resource knows them.
+   * A snapshot of the page (what alerts read) is then made with these types
+   * instead of guessing them from whichever rows are there, so a number
+   * column is a number even when the page is empty. Optional; most resources
+   * leave it out.
+   */
+  columnTypes?: () => Record<string, string> | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -1106,6 +1115,15 @@ export interface ResourceDefinition {
 
 export interface AppServerConfig {
   authToken: string;
+  /**
+   * The organization's time zone, as an IANA name ("Asia/Singapore"). It is the
+   * zone in which an app's records are counted by day and by month: which
+   * day an approval falls on, what "today" means to a query over the tables
+   * or over an alert's snapshot of a page. Required when any app has
+   * `records: true`: the machine's own zone is never assumed, since the same
+   * configuration would then count differently on two machines.
+   */
+  timezone?: string;
   pages: Record<string, Omit<PageDefinition, "id">>;
   resources: Record<string, ResourceDefinition>;
   actions: Record<string, ActionHandler>;

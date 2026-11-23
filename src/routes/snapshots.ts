@@ -169,7 +169,7 @@ export function registerSnapshotRoutes(fastify: FastifyInstance, config: AppServ
     if (!page) return reply.code(404).send({ error: `Page "${pageId}" not found.` });
     const user = readUserHeaders(request);
     const wanted = Array.isArray(body.resources) && body.resources.length > 0 ? body.resources : pageResources(config, pageId);
-    const resources = wanted.filter((r) => config.resources[r]);
+    const resources = wanted.filter((r) => Object.hasOwn(config.resources, r) && config.resources[r]);
     const filters = body.filters && typeof body.filters === "object" ? body.filters : undefined;
     const columnFilters = readColumnFilters(body.columnFilters);
     const totals: Record<string, number | null> = {};
@@ -199,7 +199,7 @@ export function registerSnapshotRoutes(fastify: FastifyInstance, config: AppServ
     const user = readUserHeaders(request);
     const requester: Requester = { userId: user?.id, orgId: user?.orgId ?? readOrgHeader(request) };
     const wanted = Array.isArray(body.resources) && body.resources.length > 0 ? body.resources : pageResources(config, pageId);
-    const resources = wanted.filter((r) => config.resources[r]);
+    const resources = wanted.filter((r) => Object.hasOwn(config.resources, r) && config.resources[r]);
     if (resources.length === 0) return reply.code(400).send({ error: "This page reads no resources." });
     const maxRows = Math.min(HARD_MAX_ROWS, Math.max(1, Number(body.maxRows) || HARD_MAX_ROWS));
     const filters = body.filters && typeof body.filters === "object" ? body.filters : undefined;
@@ -258,8 +258,11 @@ export function registerSnapshotRoutes(fastify: FastifyInstance, config: AppServ
         await appendFile(path, projected.map((r) => JSON.stringify(r)).join("\n") + "\n", "utf8");
       });
       budget -= count;
+      // What the resource says its columns are, when it knows (an app's
+      // records do): used as they are, never guessed from the rows.
+      const known = config.resources[resource].columnTypes?.();
       if (count > 0) {
-        datasets.push({ name: resource, sourcePath: path, rowCount: count });
+        datasets.push({ name: resource, sourcePath: path, rowCount: count, ...(known ? { columnTypes: known } : {}) });
         columns[resource] = (firstKeys ?? []).slice().sort();
       } else {
         await rm(path, { force: true }).catch(() => {});
@@ -270,7 +273,7 @@ export function registerSnapshotRoutes(fastify: FastifyInstance, config: AppServ
         // healthy state of an exceptions sheet, not an error.
         const declaredAll = declaredColumns(config, pageId, resource);
         const declared = keep ? declaredAll.filter((c) => keep.has(c)) : declaredAll;
-        datasets.push({ name: resource, rows: [], columns: declared, columnTypes: previousTypes[resource] });
+        datasets.push({ name: resource, rows: [], columns: declared, columnTypes: known ?? previousTypes[resource] });
         columns[resource] = declared;
       }
       rowCounts[resource] = count;

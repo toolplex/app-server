@@ -13,6 +13,7 @@ const MAX_PAGE = 10_000;
 export function parseFetchParams(
   query: Record<string, string | undefined>,
 ): FetchRequest {
+  query = single(query);
   const page = clampInt(query.page, DEFAULT_PAGE, 1, MAX_PAGE);
   const pageSize = clampInt(query.pageSize, DEFAULT_PAGE_SIZE, 1, MAX_PAGE_SIZE);
   const sort = parseSort(query.sort);
@@ -48,6 +49,7 @@ function stripColumnFilterKeys(
 export function parseContextParams(
   query: Record<string, string | undefined>,
 ): ContextRequest {
+  query = single(query);
   const rawFilters = parseFilters(query);
   return {
     filters: stripColumnFilterKeys(rawFilters),
@@ -59,6 +61,19 @@ export function parseContextParams(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * A key sent twice (`?sort=a&sort=b`) arrives as a list, which nothing that
+ * reads a filter expects. The last one sent is the one meant.
+ */
+function single(query: Record<string, unknown>): Record<string, string | undefined> {
+  const out: Record<string, string | undefined> = {};
+  for (const [key, value] of Object.entries(query ?? {})) {
+    const one = Array.isArray(value) ? value[value.length - 1] : value;
+    out[key] = typeof one === "string" ? one : undefined;
+  }
+  return out;
+}
 
 function clampInt(
   raw: string | undefined,

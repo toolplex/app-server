@@ -72,6 +72,18 @@ export interface AppBase<Kind extends string, Config, Ability extends string, Pl
    * of that, so correcting a sentence never changes `config_version`.
    */
   sections?: Partial<Record<Place, AppSection[]>>;
+  /**
+   * Keep a query database of this app's records.
+   *
+   * An app's records are the truth and live in its own store. With this on,
+   * the server also keeps a database built from them (in memory, built anew
+   * each time the server starts and kept level from then on), so the records
+   * can be used like any other data: pages and their alerts read them with
+   * `appRecords`, the assistant can query them, and your own code can with
+   * `handle.query`. Off by default; nothing is created and `appRecords`
+   * refuses an app that has it off.
+   */
+  records?: boolean;
   /** Everything particular to the kind. */
   config: Config;
   /**
@@ -132,6 +144,14 @@ export interface EncodingField {
   type: EncodingFieldType;
   /** A document missing this value cannot be approved. */
   required?: boolean;
+  /**
+   * Keys this value was stored under before it was renamed. A field's key is
+   * its identity: records approved under an old key are found through this,
+   * so a rename does not empty the column on every record that came before.
+   * An old key must not be one that is in use now, and no two may claim the
+   * same one; both are refused at startup.
+   */
+  was?: string[];
   /** Told to the reader: where the value sits or how it is written on this form. */
   hint?: string;
   /**
@@ -146,6 +166,8 @@ export interface EncodingField {
 export interface EncodingTable {
   key: string;
   label: string;
+  /** Keys this table was stored under before it was renamed (see EncodingField.was). */
+  was?: string[];
   columns: EncodingField[];
 }
 
@@ -162,6 +184,11 @@ export type EncodingCheck =
 
 export interface EncodingDocumentType {
   title: string;
+  /**
+   * Keys this form was stored under before it was renamed. Records approved
+   * as the old form are found through this, in the app and in its tables.
+   */
+  was?: string[];
   /** How to recognise this form, told to the reader that sorts incoming pages. */
   recognise: string;
   /**
@@ -357,6 +384,57 @@ export interface EncodingHandle {
    * same rule applies as in the app: refused while any value is undecided.
    */
   approve(id: string, user: UserIdentity): Promise<void>;
+  /**
+   * One read-only SQL query over the app's approved records (needs
+   * `records: true` on the app), for what your own code works out from them.
+   * The tables are the ones `appRecords` reads: one per form named after its
+   * key (`delivery_receipt`), one per table of a form
+   * (`delivery_receipt_items`), and `records` for every record.
+   *
+   * Values that vary go in `params` and are written `$1`, `$2` in the SQL,
+   * never pasted into it. At most 5,000 rows come back and `truncated` says
+   * when there were more: add up or filter in the query. Moments are ISO
+   * text, days are "YYYY-MM-DD".
+   *
+   * For a total, a card or a chart on a page, declare the query as a
+   * resource instead (`appRecords(app, { sql })`): it then reports its
+   * freshness and feeds alerts like any table.
+   */
+  query(sql: string, params?: (string | number | boolean | null)[]): Promise<{ columns: string[]; rows: Record<string, unknown>[]; truncated: boolean }>;
+  /**
+   * What changed in the app's approved records since you last asked. For
+   * keeping a copy of them somewhere of your own, such as a database you
+   * join them in.
+   *
+   * Hand back the `cursor` you were given as `after`; leave it out the first
+   * time. Each record that changed is there once, as it stands now: with its
+   * rows by table (the same tables and typed values `appRecords` reads), or
+   * `removed` when it no longer counts. Replace what your copy holds for
+   * that `record_id`. When `reset` is true the cursor could not be continued
+   * from (the tables changed shape, or the records were restored): empty
+   * your copy first; the changes then start from the beginning. Ask again
+   * while `more` is true.
+   *
+   * Nothing is missed however long you were away, and a change is never
+   * handed out before it is safely stored. Works whether or not the app has
+   * `records: true`.
+   */
+  changes(options?: { after?: string | null; limit?: number }): Promise<{
+    changes: ({ record_id: string; at: string; removed: true } | { record_id: string; at: string; removed: false; rows: Record<string, Record<string, string | number | boolean | null>[]> })[];
+    cursor: string;
+    reset: boolean;
+    more: boolean;
+  }>;
+  /**
+   * When what the app's approved records count for last changed (an ISO
+   * time). For a page whose data you work out yourself from `query`: report
+   * it as `lastSync` from the page's own `context` handler, and alerts on
+   * the page are checked when something is approved. (A page's freshness
+   * comes from the page's handler, not from a resource's.)
+   */
+  changedAt(): Promise<string>;
+  /** One record's rows by table, as `changes` gives them; null when it does not count (never approved, or discarded). */
+  record(id: string): Promise<{ record_id: string; rows: Record<string, Record<string, string | number | boolean | null>[]> } | null>;
 }
 
 export type DocumentEncodingApp = AppBase<"document-encoding", DocumentEncodingConfig, EncodingAbility, EncodingPlace>;
@@ -389,6 +467,8 @@ export interface SerializableApp {
   abilities: string[];
   /** The client's own words for the people using the app, by place. */
   sections?: Record<string, AppSection[]>;
+  /** A query database of this app's records is kept (see AppBase.records). */
+  records?: boolean;
   /**
    * Fingerprint of `config`. Changes whenever the configuration does; every
    * record keeps the one it was created under. `sections` are not part of it.

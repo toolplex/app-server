@@ -6,9 +6,11 @@ import { createAuthHook } from "./auth.js";
 import { registerPageRoutes } from "./routes/pages.js";
 import { registerDataRoutes } from "./routes/data.js";
 import { registerActionRoutes } from "./routes/actions.js";
-import { registerContextRoutes } from "./routes/context.js";
+import { aggregateContext, registerContextRoutes } from "./routes/context.js";
 import { registerDownloadRoutes } from "./routes/download.js";
 import { registerAnalyticsRoutes } from "./analytics/lookups.js";
+import { appRecordsOf, bindAppRecords, checkQueryPages, recordSourcesByPage, withRecordFreshness, type RunningRecords } from "./apps/records/resource.js";
+import { isRecordsQuery } from "./apps/records/kinds.js";
 import { registerAppRoutes } from "./routes/apps.js";
 import type { FileStore } from "./files/store.js";
 import { createRequire } from "node:module";
@@ -45,6 +47,35 @@ async function appServerPlugin(
   // Validate everything at startup — fail fast on misconfiguration
   validateConfig(config);
 
+  // Resources that read an app's records (appRecords) are given the running
+  // app's query database, looked up per request so apps may start after the
+  // routes. Pages that show such records report when the records changed.
+  const running = new Map<string, RunningRecords>();
+  const declared = config;
+  const resources = bindAppRecords(config.resources, (appId) => running.get(appId));
+  const changedAt = async (resource: string): Promise<string | null> => {
+    const made = appRecordsOf(resources[resource]);
+    const app = made ? running.get(made.appId) : undefined;
+    return app ? app.runtime.changedAt() : null;
+  };
+  // A page with no context handler of its own still says what its sources say.
+  const bound = { ...config, resources };
+  config = { ...bound, pages: withRecordFreshness(config.pages, resources, changedAt, (sources, req) => aggregateContext(bound, sources, req)) };
+  // The zone an app's records are counted by day in. Checked at startup: a
+  // server with an app that keeps tables always has one (see validation).
+  const timezone = declared.timezone ?? "UTC";
+  /** The client's own queries over one app's records, by resource name (each becomes a view of that name). */
+  const viewsOf = (appId: string): Record<string, { sql: string; label: string }> => {
+    const views: Record<string, { sql: string; label: string }> = {};
+    for (const [name, resource] of Object.entries(declared.resources)) {
+      const made = appRecordsOf(resource);
+      if (made && made.appId === appId && isRecordsQuery(made.options)) {
+        views[name] = { sql: made.options.sql, label: made.options.label ?? `"${name}", a query of the client's own over these tables` };
+      }
+    }
+    return views;
+  };
+
   // Apply bearer token auth to all routes in this plugin scope
   const authHook = createAuthHook(config.authToken);
   fastify.addHook("onRequest", authHook);
@@ -75,7 +106,7 @@ async function appServerPlugin(
   }
 
   // Register route groups
-  registerPageRoutes(fastify, config);
+  registerPageRoutes(fastify, config, () => recordSourcesByPage(declared, (appId) => running.get(appId)));
   registerDataRoutes(fastify, config);
   registerActionRoutes(fastify, config);
   registerContextRoutes(fastify, config);
@@ -93,10 +124,15 @@ async function appServerPlugin(
   for (const [appId, app] of Object.entries(config.apps ?? {})) {
     if (app.kind === "document-encoding") {
       const { registerEncodingApp } = await import("./apps/encoding/routes.js");
-      const runtime = await registerEncodingApp(fastify, config, appId, app, () => storeForStats);
+      const runtime = await registerEncodingApp(fastify, config, appId, app, () => storeForStats, { timezone, views: viewsOf(appId) });
       kindPending[appId] = (abilities) => runtime.pending(abilities as never);
+      if (runtime.records) running.set(appId, runtime.records);
     }
   }
+  // What could only be checked with the apps running: that the tables on a
+  // page ask a client's own query for columns it returns.
+  const wrong = checkQueryPages(declared, (appId) => running.get(appId));
+  if (wrong.length > 0) throw new Error(`@toolplex/app-server configuration errors:\n  - ${wrong.join("\n  - ")}`);
   registerAppRoutes(fastify, config, kindPending);
 
   // File handling — ingest CSV/XLSX/documents into an isolated, read-only
@@ -115,6 +151,9 @@ async function appServerPlugin(
   fastify.get("/capabilities", async () => ({
     version: PKG_VERSION,
     capabilities,
+    // The zone this server counts days in, when it was told one: so ToolPlex
+    // can compare it with the organization's own.
+    ...(declared.timezone ? { timezone: declared.timezone } : {}),
     ...(storeForStats
       ? {
           storage: await storeForStats.storage(),
@@ -138,7 +177,7 @@ async function appServerPlugin(
       import("./routes/files.js"),
       import("./routes/snapshots.js"),
     ]);
-    const store = new FileStore(config.files ?? {});
+    const store = new FileStore(config.files ?? {}, { timezone: declared.timezone });
     await store.init();
     storeForStats = store;
     await fastify.register(async (filesScope) => {

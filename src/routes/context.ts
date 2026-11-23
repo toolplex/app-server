@@ -13,7 +13,7 @@ export function registerContextRoutes(
     Querystring: Record<string, string>;
   }>("/context/:resource", async (request, reply) => {
     const { resource } = request.params;
-    const definition = config.resources[resource];
+    const definition = Object.hasOwn(config.resources, resource) ? config.resources[resource] : undefined;
 
     if (!definition?.context) {
       return reply
@@ -82,7 +82,7 @@ function uniqueSources(sections: (Section | Section[])[]): string[] {
   return [...sources];
 }
 
-async function aggregateContext(
+export async function aggregateContext(
   config: AppServerConfig,
   sources: string[],
   params: {
@@ -96,7 +96,7 @@ async function aggregateContext(
   const suggestions: string[] = [];
 
   for (const source of sources) {
-    const handler = config.resources[source]?.context;
+    const handler = Object.hasOwn(config.resources, source) ? config.resources[source]?.context : undefined;
     if (!handler) continue;
 
     const result = await handler(params);

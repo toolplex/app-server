@@ -374,6 +374,244 @@ receiving: {
 - The assistant is told the same instructions (the first 1,500 characters),
   so "how do I scan these?" in chat gets your answer.
 
+### An app's records as data
+
+An app's approved records are the truth, and they live in the app's own
+store on your server. Turn on `records` and the server also keeps a
+**query database** built from them: ordinary tables that pages, alerts, the
+assistant and your own code can read. It is always a copy. It is held in
+memory, built from the records each time the server starts (a few seconds
+for fifty thousand records) and kept level with them from then on. The
+server starts at once; a page asked for while the tables are being built
+waits for them, and after twenty seconds is told how far the build has got.
+There is nothing of it to back up, repair or migrate.
+
+```typescript
+import { appRecords, registerAppPages } from '@toolplex/app-server';
+
+await server.register(registerAppPages, {
+  // The organization's zone: which day an approval falls on. Required with
+  // `records: true`; the machine's own zone is never assumed.
+  timezone: 'Asia/Singapore',
+  apps: {
+    receiving: { kind: 'document-encoding', records: true, /* ... */ },
+  },
+  resources: {
+    // One row per approved delivery receipt, its fields as columns.
+    receipts: appRecords('receiving', { form: 'delivery-receipt' }),
+    // One row per line item, each with its receipt's columns beside it.
+    receipt_lines: appRecords('receiving', { form: 'delivery-receipt', lines: 'items' }),
+    // A query of your own over the same tables, read like any table.
+    by_customer: appRecords('receiving', {
+      sql: 'select customer, sum(total_qty) as quantity, count(*) as receipts from delivery_receipt group by customer',
+    }),
+  },
+  pages: {
+    receipts: {
+      title: 'Delivery receipts',
+      sections: [
+        { type: 'table', source: 'receipts', rowKey: 'record_id', columns: [
+          { key: 'dr_no', label: 'D.R. number' },
+          { key: 'customer', label: 'Customer' },
+          { key: 'total_qty', label: 'Quantity', format: 'integer' },
+          { key: 'record_first_approved_at', label: 'Approved', format: 'date' },
+        ]},
+        { type: 'table', source: 'by_customer', rowKey: 'customer', columns: [
+          { key: 'customer', label: 'Customer' },
+          { key: 'quantity', label: 'Quantity', format: 'integer' },
+        ]},
+      ],
+    },
+  },
+});
+```
+
+**What counts.** A record counts from its first approval until it is
+discarded, with the values of its last approved version. While someone is
+correcting it, it goes on counting with what was approved and
+`record_correcting` is true; the correction counts once it is approved.
+Discarding a record that has been approved takes it out of every total, so
+it needs the right to approve, and such a record cannot be joined into
+another.
+
+**Tables.** For a `document-encoding` app:
+
+| Table | Rows | `appRecords` |
+|---|---|---|
+| `records` | every record, any form | `appRecords(app)` |
+| `<form>` (`delivery_receipt`) | one per record of the form, fields as columns | `{ form }` |
+| `<form>_<table>` (`delivery_receipt_items`) | one per line | |
+| `<form>_<table>_with_record` | the same lines, each with its record's columns | `{ form, lines }` |
+| the resource's own name | whatever your query returns | `{ sql }` |
+
+**Columns.** Your field keys, as you declared them, plus the same columns on
+every record: `record_id`, `record_name`, `record_group`, `record_version`,
+`record_first_approved_at`, `record_approved_at`, `record_captured_at`,
+`record_correcting` (and `record_form`, `record_form_title` in `records`;
+`line_id`, `line_no` on a line).
+
+- A `number` field is a number and a `date` field is a date. The readers are
+  asked for digits and for year-month-day; a value someone keyed another way
+  ("12 pcs", "Nov 5") is left empty in its column, so it is **out of every
+  total**. That is never silent: the table `unfit_values` lists each such
+  value as written (record, table, column, line), a page's context and the
+  assistant say how many records are affected, and the server counts them
+  per column at startup. Corrected in the app, the value counts again. The
+  record keeps what was typed.
+- The `record_*_at` columns are moments. Which day one falls on is decided
+  by `timezone`: for a page's filters, for `current_date`, `::date` and
+  `date_trunc` in a query, and for an alert's check over a snapshot of the
+  page. Count a month by `record_first_approved_at` (a correction approved
+  later does not move a record) or by a date field of your own. A total can
+  change after the fact: a correction replaces the values it counted, and a
+  discard removes them.
+- The key of a field or of a table's column must be lower case letters,
+  digits and underscores; must not start with `record_` or `line_`; must
+  not be a word SQL will not take as a bare name (`order`, `group`, `from`,
+  `left`, `by`) or something a page sends (`page`, `sort`, `q`); a table's
+  column cannot share a key with one of the form's fields; and `x` and
+  `x_from` cannot both exist. A form's key and a table's key may have
+  hyphens (they become underscores in the table's name), and must not make
+  a reserved word or the same name twice. All of it is checked at startup,
+  for every app, whether or not it has `records` on, so a server that
+  started on an earlier version may be asked to rename a key by this one.
+
+**On a page.** Sorting, the table's column filters, the page's filters and
+what is selected are run by the database over every row. A page filter whose
+key is a column must equal it; `<column>_from` and `<column>_to` bound it
+(what the date-range and month-range filters send; a day or a month means
+all of it); `q` searches your own values, the file name and the record's
+group. What a filter's
+value cannot mean for its column matches nothing. The page reports when its
+records last changed, so alerts on it are checked when something is
+approved, and an alert's snapshot has the tables' own column types. A page
+that also shows data copied from elsewhere, and reports that data's own
+`lastSync`, keeps reporting it. A download or snapshot of many rows is read
+from one view of the data, so approvals made while it runs are neither
+skipped nor repeated.
+
+**A query of your own** (`{ sql }`) is one SELECT statement over the tables.
+It is kept as a view named after the resource, so it sorts, filters, pages
+and feeds alerts like any table, and the assistant can read it by that
+name. One query may read another. Its columns are given as text, numbers,
+whole numbers, true or false, dates or moments, whatever the query made
+them. A query that does not run, or a page that asks it for a column it
+does not return, stops the server from starting, with the reason. One of
+these is read at a time, and a read that takes more than thirty seconds
+is stopped, so a slow one cannot hold up the tables beside it.
+
+**Who sees them.** Putting records on a page shows them to everyone who may
+see that page, whether or not their role can open the app. That is the only
+way they are shown: an `appRecords` resource that is on no page is refused
+at startup. The same care is yours to take with a resource of your own that
+calls `handle.query`: put it on a page.
+
+**For the assistant.** With `records` on, the app offers the assistant a
+read-only query tool over the same tables, so "how much did we receive last
+week?" is answered from approved records. It is offered to whoever may open
+the app, the same people who can read every record in it. Only a single
+reading statement ever runs: the database itself splits and classifies what
+it is given, in a transaction that cannot write, with no access to files, a
+time limit, and caps on rows, columns and text. What a query reads and
+calls is checked against the database's own reading of it, before any of
+it is worked out: rows come from this app's tables and a few row-making
+functions (not from the database's catalogue, settings or log), and a
+function that does more than compute (waits, logs, switches something on
+for the whole database) is refused, however the call is written. PRAGMA is
+not available. Long text is cut inside the database; lists, structures and
+binary values are not returned unless the query casts them to text. Two run at a time. A query is
+answered at its limit whether or not it could be stopped; the rare one that
+cannot be (a single enormous calculation) keeps its turn until it ends, and
+is said in the server's log.
+
+What none of this can do is make a database that runs inside the server
+safe from a query written to break it. A statement built for the purpose
+(a pattern or a document nested tens of thousands deep, a value of
+hundreds of megabytes) can exhaust the server's memory or stop its
+process, as it can through any SQL tool that runs in the same process.
+Nothing is lost when that happens: the records are files, and the tables
+are rebuilt when the server starts again. Run the server under a process
+manager that restarts it.
+
+**For your own code.** The handle given to `onReady` can query the tables,
+with values handed over as parameters and never pasted into the SQL:
+
+```typescript
+let receiving: EncodingHandle;
+// in the app's config: onReady: (handle) => { receiving = handle; }
+
+const { rows, truncated } = await receiving.query(
+  'select dr_no, total_qty from delivery_receipt where customer = $1 and record_first_approved_at >= $2',
+  [customer, '2026-11-01'],
+);
+```
+
+A page whose data you work out yourself from `query` reports
+`lastSync: await receiving.changedAt()` from the page's own `context`
+handler, and alerts on it are then checked when something is approved.
+
+**Keeping a copy elsewhere.** To have the records in a database of your own
+(to join them with your other data), follow the app's changes. This needs
+no `records: true`; it reads the records themselves.
+
+```typescript
+let cursor = await loadCursor();              // null the first time
+for (;;) {
+  const page = await receiving.changes({ after: cursor });
+  await inOneTransaction(async () => {
+    if (page.reset) await emptyMyCopy();      // start again from nothing
+    for (const change of page.changes) {
+      await deleteMyRowsOf(change.record_id); // every table
+      if (!change.removed) await insert(change.rows); // { table: rows }
+    }
+    await saveCursor(page.cursor);
+  });
+  cursor = page.cursor;
+  if (!page.more) break;
+}
+```
+
+Each record that changed is there once, as it stands now, with its rows by
+table and the same typed values the tables hold. Nothing is missed however
+long you were away: every change is stamped inside the record itself, in
+the same write that made it. `reset` is true when the cursor cannot be
+continued from: the tables changed shape (a field added, a rename declared,
+a form's title reworded), a record's file was lost or put back by hand, or
+the records were put back from an older copy, so that what you were told
+since no longer holds. The store recognises each of these itself: it
+remembers every time it was opened, and a cursor from a time it does not
+remember, or from further than that time got, is not continued. Empty the
+copy and apply what follows; if others read your copy while it is rebuilt,
+build the new one aside and swap it in. `handle.record(id)` gives one
+record the same way.
+
+One thing it cannot recognise is a restore that is not a clean one: a
+backup taken while the server was writing, or one copied over the directory
+without emptying it first, is a mixture of two moments. After any restore,
+stop the server, put the backup into an empty directory, and delete
+`store.json` from it before starting: every copy then starts again.
+
+**Renaming.** A key is an identity. To rename a field, a table, one of its
+columns or a whole form, say what it was, and every record approved under
+the old key is found under the new one, in the app and in the tables:
+
+```typescript
+{ key: 'buyer', label: 'Buyer', type: 'name', was: ['customer'] }
+```
+
+An old name must not be a key in use now, and no two may claim the same
+one; both are refused at startup. `was` stays for as long as the records
+do: approved versions are never rewritten, so they are read through it for
+good, and taking it away later blanks them again. A rename that is not
+declared loses nothing, but the old values stop being shown; the server
+says so at startup, with the key and how many records. Do not give a new
+field the key a removed one had: values approved under the old meaning
+would show as the new field's.
+
+**One server per directory.** An app's records belong to one running
+server. Two processes on the same `files.dir` would each keep their own
+idea of them.
+
 ### How a value is decided
 
 Two independent readers look at each document. A value both agree on, and
@@ -400,21 +638,28 @@ All run on your server and are never sent to a client.
 A `document-encoding` app defines three abilities: `capture`, `review` and
 `approve`. An organization's admins grant them per role and per app in
 ToolPlex. ToolPlex checks them and tells this server which ones the caller
-has; the server enforces them on every route.
+has; the server enforces them on every route. Looking needs none of them:
+whoever may open the app can read its records. Discarding a record that has
+been approved, and reading one again, need `approve`.
 
 ### What is kept, and where
 
 Everything stays on your server, under `files.dir` (default
 `~/.toolplex-app-files`) in `apps/<app id>/`: the untouched original of
 every upload, the images that were read, every version of every record with
-who changed it and when, and the names the app has learned from approved
-records. `context`, `notes`, `recognise` and field `hint`s go to the readers
-and are never served to a client.
+who changed it and when, the names the app has learned from approved
+records, and each configuration records were approved under
+(`configs/<version>.json`, so what a key meant at the time stays knowable).
+That directory is all there is to back up: the query database of an app
+with `records` on is rebuilt from it at every start (`.records-tmp` in it
+is scratch space for that, emptied at each start).
+`context`, `notes`, `recognise` and field `hint`s go to the
+readers and are never served to a client.
 
 An upload needs `@fastify/multipart` installed, as file attachments do.
 Types are exported: `DocumentEncodingApp`, `DocumentEncodingConfig`,
 `EncodingDocumentType`, `EncodingField`, `EncodingCheck`, `EncodingRecord`,
-`EncodingHandle`, `AppSection`.
+`EncodingHandle`, `AppSection`, `AppRecordsOptions`.
 
 ## Validation
 

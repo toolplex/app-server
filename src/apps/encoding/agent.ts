@@ -21,6 +21,8 @@ import type { FastifyInstance, FastifyRequest } from "fastify";
 import type { DocumentEncodingApp, EncodingAbility } from "../types.js";
 import { readAbilities } from "../../routes/apps.js";
 import type { EncodingStore, IndexEntry, StoredDocument } from "./store.js";
+import { RecordsError } from "../records/database.js";
+import type { RecordsTool } from "../records/runtime.js";
 import { calibration, type Question } from "./logic.js";
 
 export interface AgentToolDefinition {
@@ -66,6 +68,8 @@ export interface EncodingAgentContext {
   ready: Promise<void>;
   questionsOf: (doc: StoredDocument) => Question[];
   addFiles: (request: FastifyRequest, fileIds: string[]) => Promise<{ documents: Summary[]; skipped: { file_id: string; reason: string }[] }>;
+  /** The tool that queries the app's records as tables, when it keeps them. */
+  records?: RecordsTool | null;
 }
 
 const STATUS_WORDS: Record<string, string> = {
@@ -189,6 +193,19 @@ export function registerEncodingAgentTools(fastify: FastifyInstance, ctx: Encodi
       },
     },
   ];
+
+  // The approved records as tables, when the app keeps them. The tool lists
+  // the tables by name; the columns of one are a DESCRIBE away, so the list
+  // rides along with every conversation at a few lines instead of a page.
+  // Like everything else here it only looks, and it is offered to whoever
+  // may open the app: the same people who can read every record in it.
+  if (ctx.records) {
+    tools.push({
+      name: ctx.records.name,
+      description: `${ctx.records.description} For one document and its scan use get_document instead.`,
+      input_schema: ctx.records.input_schema,
+    });
+  }
 
   const about =
     `"${app.title}" is an app where people bring in scanned documents, answer the questions the readers could not settle, and approve the records. ` +
@@ -318,6 +335,16 @@ export function registerEncodingAgentTools(fastify: FastifyInstance, ctx: Encodi
           same_group: docs.filter((o) => o.id !== doc.id && doc.group && o.group === doc.group && o.status !== "discarded").map((o) => ({ id: o.id, name: o.name, form: summarise(o).document_type_title, status: STATUS_WORDS[o.status] ?? o.status })),
           cards: [{ title: doc.name, subtitle: line(s), open: { tab: tabFor(doc.status), document_id: doc.id } } satisfies AgentCard],
         };
+      }
+
+      case "query_records": {
+        if (!ctx.records) fail(404, "Unknown tool");
+        try {
+          return await ctx.records!.run(input);
+        } catch (err) {
+          if (err instanceof RecordsError) fail(err.statusCode, err.message);
+          throw err;
+        }
       }
 
       case "show_document": {

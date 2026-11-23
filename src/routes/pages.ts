@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import type { PageDefinition, AppServerConfig } from "../types.js";
 import { readUserHeaders } from "../user.js";
+import type { RecordSourceInfo } from "../apps/records/resource.js";
 
 /**
  * Serves page definitions. Context handlers are stripped since they're
@@ -9,11 +10,18 @@ import { readUserHeaders } from "../user.js";
 export function registerPageRoutes(
   fastify: FastifyInstance,
   config: AppServerConfig,
+  /**
+   * Per page, which of its sources read an app's records (see
+   * apps/records/resource.ts). Asked for when the first request arrives:
+   * what a client's own query returns is only known once its app is running.
+   */
+  recordSources: () => Record<string, Record<string, RecordSourceInfo>> = () => ({}),
 ): void {
-  const serialized = buildSerializablePages(config);
+  let built: SerializablePage[] | null = null;
+  const pages = (): SerializablePage[] => (built ??= buildSerializablePages(config, recordSources()));
 
   fastify.get("/pages", async (_request, reply) => {
-    return reply.send(serialized);
+    return reply.send(pages());
   });
 
   /**
@@ -67,7 +75,7 @@ export function registerPageRoutes(
   fastify.get<{ Params: { pageId: string } }>(
     "/pages/:pageId",
     async (request, reply) => {
-      const page = serialized.find((p) => p.id === request.params.pageId);
+      const page = pages().find((p) => p.id === request.params.pageId);
       if (!page) {
         return reply.code(404).send({ error: "Page not found" });
       }
@@ -80,13 +88,17 @@ export function registerPageRoutes(
 // Strip non-serializable fields and inject the id from the config key
 // ---------------------------------------------------------------------------
 
-type SerializablePage = Omit<PageDefinition, "context">;
+type SerializablePage = Omit<PageDefinition, "context"> & {
+  /** Sources of this page that read an app's records, by resource name. Absent when it has none. */
+  record_sources?: Record<string, RecordSourceInfo>;
+};
 
 function buildSerializablePages(
   config: AppServerConfig,
+  recordSources: Record<string, Record<string, RecordSourceInfo>>,
 ): SerializablePage[] {
   return Object.entries(config.pages).map(([id, page]) => {
     const { context: _context, ...rest } = page;
-    return { id, ...rest };
+    return { id, ...rest, ...(recordSources[id] ? { record_sources: recordSources[id] } : {}) };
   });
 }

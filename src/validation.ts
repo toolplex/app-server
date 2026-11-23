@@ -6,6 +6,10 @@ import type {
 } from "./types.js";
 import { APP_PLACES, APP_SECTION_LIMITS } from "./apps/types.js";
 import type { AppKind } from "./apps/types.js";
+import { validateEncodingKeys } from "./apps/encoding/records.js";
+import { isRecordsQuery, recordRelation } from "./apps/records/kinds.js";
+import { FIELD_KEY, RESERVED_WORDS } from "./apps/records/types.js";
+import { appRecordsOf, sectionsOf } from "./apps/records/resource.js";
 
 // ---------------------------------------------------------------------------
 // Startup validation — fail fast with descriptive errors
@@ -74,7 +78,25 @@ export function validateConfig(config: AppServerConfig): void {
     }
   }
 
+  if (config.timezone !== undefined) {
+    try {
+      // A name, as the database knows zones: "+08:00" is an offset, not a
+      // zone, and has no summer time or history to it.
+      if (typeof config.timezone !== "string" || !/^[A-Za-z][A-Za-z0-9_+-]*(\/[A-Za-z0-9_+-]+)*$/.test(config.timezone)) throw new Error("not a name");
+      new Intl.DateTimeFormat("en-US", { timeZone: config.timezone });
+    } catch {
+      errors.push(`timezone: "${String(config.timezone)}" is not a time zone; use an IANA name such as "Asia/Singapore"`);
+    }
+  }
+  // Tables of records are counted by day, and a day needs a zone. The
+  // machine's own would do the counting differently on a laptop and on a
+  // server for the same organization, so it is never assumed.
+  const tabled = Object.entries(config.apps ?? {}).filter(([, app]) => app?.records === true).map(([id]) => id);
+  if (tabled.length > 0 && config.timezone === undefined) {
+    errors.push(`timezone: app "${tabled[0]}" keeps tables of its records (records: true), which are counted by day; say which zone the organization's days are in, such as timezone: "Europe/Paris"`);
+  }
   validateApps(config, errors);
+  validateAppRecords(config, errors);
 
   if (errors.length > 0) {
     throw new Error(
@@ -233,6 +255,77 @@ function validateApps(config: AppServerConfig, errors: string[]): void {
     }
     validateSections(at, app.kind, app.sections, errors);
     validateDocumentEncoding(at, app.config, errors);
+    validateEncodingKeys(at, app, errors);
+  }
+}
+
+/**
+ * A resource that reads an app's records (appRecords) must be able to work,
+ * and must be on a page.
+ *
+ * On a page, because that is the grant: records are shown to the people who
+ * may see the page they are on. A records resource on no page would be
+ * readable by name by everyone in the organization, including people whose
+ * role cannot open the app.
+ */
+function validateAppRecords(config: AppServerConfig, errors: string[]): void {
+  const used = new Map<string, { pageId: string; section: Section }[]>();
+  for (const [pageId, page] of Object.entries(config.pages ?? {})) {
+    for (const section of sectionsOf(page.sections ?? [])) {
+      const source = (section as { source?: unknown }).source;
+      if (typeof source !== "string") continue;
+      if (!used.has(source)) used.set(source, []);
+      used.get(source)!.push({ pageId, section });
+    }
+  }
+  for (const [name, resource] of Object.entries(config.resources ?? {})) {
+    const made = appRecordsOf(resource);
+    if (!made) continue;
+    const at = `Resource "${name}"`;
+    const app = Object.hasOwn(config.apps ?? {}, made.appId) ? config.apps![made.appId] : undefined;
+    if (!app) {
+      errors.push(`${at}: reads app "${made.appId}", which this server does not declare`);
+      continue;
+    }
+    if (app.records !== true) {
+      errors.push(`${at}: app "${made.appId}" keeps no query database; add \`records: true\` to the app`);
+      continue;
+    }
+    // Built by appRecords and nothing else: a handler added beside it would
+    // be replaced without a word when the resource is given its app.
+    const extra = Object.keys(resource).filter((k) => k !== "fetch");
+    if (extra.length > 0) {
+      errors.push(`${at}: an appRecords resource cannot carry its own ${extra.join(", ")}; to work the records yourself, query them in a resource of your own (handle.query)`);
+    }
+    const users = used.get(name) ?? [];
+    if (users.length === 0) {
+      errors.push(`${at}: is not shown on any page. Records are shown to the people who may see the page they are on, so one on no page would be open to everyone; put it on a page or remove it`);
+    }
+    if (isRecordsQuery(made.options)) {
+      // A query of the client's own. It is kept as a view named after the
+      // resource; what it returns is checked once the app is running.
+      const extra = Object.keys(made.options).filter((k) => k !== "sql" && k !== "label");
+      if (typeof made.options.sql !== "string" || made.options.sql.trim() === "") errors.push(`${at}: "sql" must be one SELECT statement`);
+      if (extra.length > 0) errors.push(`${at}: a query takes "sql" and "label" only (found ${extra.join(", ")}); to read one of the app's own tables, leave "sql" out`);
+      if (!FIELD_KEY.test(name) || RESERVED_WORDS.has(name)) {
+        errors.push(`${at}: a resource that is a query over an app's records is kept as a view of the same name, so its name must be lower case letters, digits and underscores, starting with a letter, and not a word the query language keeps for itself`);
+      }
+      continue;
+    }
+    const relation = recordRelation(app, made.options);
+    if ("error" in relation) {
+      errors.push(`${at}: ${relation.error}`);
+      continue;
+    }
+    const columns = new Set(relation.columns.map((c) => c.name));
+    for (const { pageId, section } of users) {
+      if (section.type !== "table") continue;
+      const where = `Page "${pageId}", table on "${name}"`;
+      if (section.rowKey !== relation.key) errors.push(`${where}: rowKey must be "${relation.key}", the column that identifies a row of this table`);
+      for (const c of section.columns ?? []) {
+        if (!columns.has(c.key)) errors.push(`${where}: column "${c.key}" is not a column of this table (${[...columns].join(", ")})`);
+      }
+    }
   }
 }
 

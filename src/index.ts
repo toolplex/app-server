@@ -2,6 +2,8 @@
 
 export { registerAppPages } from "./plugin.js";
 export { createAnalytics } from "./analytics/lookups.js";
+export { appRecords } from "./apps/records/resource.js";
+export type { AppRecordsOptions } from "./apps/records/kinds.js";
 export type { AnalyticsConfig, AnalyticsDialect, AnalyticsTable, AnalyticsColumn } from "./analytics/lookups.js";
 
 // In-memory column filter helper for handlers that work with JS arrays
