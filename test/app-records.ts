@@ -13,6 +13,7 @@ import { appRecords, registerAppPages } from "../src/index.js";
 import type { DocumentEncodingApp, EncodingHandle } from "../src/index.js";
 import type { ReadDocumentRequest } from "../src/apps/encoding/routes.js";
 import type { Reading, ReadValue } from "../src/apps/encoding/store.js";
+import { dateOf } from "../src/apps/encoding/logic.js";
 
 // Under the home directory: the file store (used for the snapshot below) refuses the OS temp dir.
 const dir = await mkdtemp(join(homedir(), ".tp-app-records-test-"));
@@ -31,6 +32,14 @@ const readDocument = async (req: ReadDocumentRequest): Promise<Reading> => {
   const done = { checks: [], counts: { accepted: 1, confirm: 0, ask: 0, blank: 0 }, readers: [{ model: "a", ok: true, ms: 1 }, { model: "b", ok: true, ms: 1 }], document_type: form, document_type_agreed: true };
   if (form === "invoice") {
     return { ...done, fields: { reference: v(reference), amount: v(Number(third)) }, tables: { charges: rest.map((c, i) => ({ label: v(`Charge ${i + 1}`), charge: v(Number(c)) })) } };
+  }
+  // A reader that did not write a number or a date the way it was asked to:
+  // in a way that can still only mean one thing, or in a way that cannot be told.
+  if (reference === "LOOSE") {
+    return { ...done, fields: { reference: v(reference), customer: v(third), total_packs: v("1,250"), dated: v("Nov 3, 2026") }, tables: { items: [{ sku: v("Item 1"), packs: v("1,250.0") }] } };
+  }
+  if (reference === "UNCLEAR") {
+    return { ...done, fields: { reference: v(reference), customer: v(third), total_packs: v("about 40"), dated: v("3/11/26") }, tables: { items: [{ sku: v("Item 1"), packs: v(40) }] } };
   }
   return {
     ...done,
@@ -254,11 +263,65 @@ try {
   const b = await bring("receipt|DR-200| east depot |40");
   const c = await bring("receipt|DR-300|North Market|500|10|5");
   const d = await bring("receipt|dr-050|Zenith|7");
-  for (const id of [b, c, d]) await approve(id);
-  // A quantity someone typed with its unit is not a number, and a date typed
-  // the long way is not a date: the columns keep their types.
-  assert.equal((await post(`/documents/${d}/values`, { changes: [{ path: "total_packs", value: "12 pcs" }, { path: "dated", value: "Nov 5, 2026" }] })).statusCode, 200);
+  for (const id of [b, c]) await approve(id);
+  // A quantity typed with its unit is not a number, and two numbers and a
+  // year could be either of two days. A record is not approved with either:
+  // each is a question, with what was probably meant offered when that is plain.
+  assert.equal((await post(`/documents/${d}/values`, { changes: [{ path: "total_packs", value: "12 pcs" }, { path: "dated", value: "11/05/2026" }, { path: "items[0].packs", value: "seven" }] })).statusCode, 200);
+  const blocked = await post(`/documents/${d}/approve`, {});
+  assert.equal(blocked.statusCode, 409, blocked.body);
+  assert.match(blocked.json().error ?? blocked.json().message, /3 values still need a decision/);
+  const asked = (await server.inject({ url: `${appBase}/documents/${d}`, headers: auth })).json().questions as { path: string; kind: string; reason: string; candidates: unknown[] }[];
+  assert.deepEqual(
+    asked.map((q) => [q.path, q.kind, q.reason.split(".")[0], q.candidates]),
+    [
+      ["total_packs", "ask", "Not a number", [12]],
+      ["dated", "ask", "Not a date", []],
+      ["items[0].packs", "ask", "Not a number", []],
+    ],
+  );
+  // Answered: the number alone; and a date written with the month as a word,
+  // which can only mean one day and is kept as that day.
+  assert.equal((await post(`/documents/${d}/values`, { changes: [{ path: "total_packs", value: "7" }, { path: "dated", value: "Nov 1, 2026" }, { path: "items[0].packs", value: "1,007.50" }] })).statusCode, 200);
+  const answered = (await server.inject({ url: `${appBase}/documents/${d}`, headers: auth })).json();
+  assert.deepEqual([answered.questions.length, answered.values.total_packs, answered.values.dated, answered.tables.items[0].packs], [0, 7, "2026-11-01", 1007.5]);
+  assert.equal((await post(`/documents/${d}/values`, { changes: [{ path: "items[0].packs", value: 7 }] })).statusCode, 200);
   await approve(d);
+  // The readers are asked for digits and for year-month-day, and nearly
+  // always give them. When one writes a number or a date some other way that
+  // can only mean one thing, it is taken as what it means and nobody is
+  // asked; when it cannot be told, a person is asked, like any other doubt.
+  const looselyRead = await bring("receipt|LOOSE|Somebody|1");
+  const looseDoc = (await server.inject({ url: `${appBase}/documents/${looselyRead}`, headers: auth })).json();
+  assert.deepEqual([looseDoc.values.total_packs, looseDoc.values.dated, looseDoc.tables.items[0].packs, looseDoc.questions.length], [1250, "2026-11-03", 1250, 0]);
+  const unclear = await bring("receipt|UNCLEAR|Somebody|1");
+  const unclearDoc = (await server.inject({ url: `${appBase}/documents/${unclear}`, headers: auth })).json();
+  assert.deepEqual(
+    unclearDoc.questions.map((q: { path: string; reason: string; candidates: unknown[] }) => [q.path, q.reason.split(".")[0], q.candidates]),
+    [
+      ["total_packs", "Not a number", [40]],
+      ["dated", "Not a date", []],
+    ],
+  );
+  assert.equal((await post(`/documents/${unclear}/approve`, {})).statusCode, 409);
+  for (const id of [looselyRead, unclear]) assert.equal((await post(`/documents/${id}/discard`, { reason: "only here to show how values are taken" })).statusCode, 200);
+  // Which ways of writing a day can only mean one day.
+  assert.deepEqual(
+    ["2026-11-05", "2026/11/5", "2026.11.05", "Nov 5, 2026", "nov. 5 2026", "November 5th, 2026", "5 Nov 2026", "5-Nov-2026", "05 September 2026", "Sept 5, 2026"].map(dateOf),
+    ["2026-11-05", "2026-11-05", "2026-11-05", "2026-11-05", "2026-11-05", "2026-11-05", "2026-11-05", "2026-11-05", "2026-09-05", "2026-09-05"],
+  );
+  assert.deepEqual(["11/05/2026", "05/11/2026", "5/11/26", "Nov 5", "Nov 5, 26", "2026-02-30", "Febtember 5, 2026", "5 2026", "tomorrow", ""].map(dateOf), Array(10).fill(null));
+  // A record approved before that rule existed may still hold such values.
+  // Made here the only way one can be now, by hand in the record's file.
+  // The tables keep their types whatever a record holds.
+  await server.close();
+  {
+    const path = join(dir, "apps", "receiving", "docs", `${d}.json`);
+    const record = JSON.parse(await readFile(path, "utf8"));
+    for (const values of [record.values, record.versions.at(-1).values]) Object.assign(values, { total_packs: "12 pcs", dated: "Nov 5, 2026" });
+    await writeFile(path, JSON.stringify(record));
+  }
+  await start();
   const typed = (await data("receipts", "?reference=dr-050")).rows[0];
   assert.deepEqual([typed.total_packs, typed.dated], [null, null]);
   assert.deepEqual((await data("receipts", "?sort=total_packs,desc")).rows.map((r) => r.total_packs), [515, 360, 40, null]);
@@ -471,6 +534,20 @@ try {
   const looking = await server.inject({ method: "POST", url: `${appBase}/agent/query_records`, headers: { ...auth, "x-toolplex-app-abilities": "" }, payload: { sql: "select '--'; commit; delete from delivery_receipt" } });
   assert.equal(looking.statusCode, 400);
   assert.deepEqual(await everything(), untouched);
+
+  // A statement made of nothing but ordinary functions that brings a database
+  // down. It is run in a process of its own, so that is all it brings down:
+  // it is answered plainly, the pages never notice, the next question is
+  // answered at once, and the same statement is not run a second time.
+  const broke = await ask("select json_structure(repeat('[', 30000) || repeat(']', 30000)) as broken");
+  assert.equal(broke.statusCode, 400, broke.body);
+  assert.match(broke.json().error ?? broke.json().message, /stopped the process it was run in, so it cannot be run/);
+  assert.equal((await data("receipts")).total, 5);
+  assert.deepEqual(await everything(), untouched);
+  const again = await ask("select json_structure(repeat('[', 30000) || repeat(']', 30000)) as broken");
+  assert.equal(again.statusCode, 400, again.body);
+  assert.match(again.json().error ?? again.json().message, /is not run again as it is/);
+  assert.deepEqual((await ask("select count(*) as n from delivery_receipt")).json().rows, [{ n: 5 }]);
 
   // 8. A download gets every row.
   const csv = (await server.inject({ url: "/download/receipt_lines?sort=reference,asc", headers: auth })).body.trim().split("\n");

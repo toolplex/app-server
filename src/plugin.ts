@@ -121,10 +121,26 @@ async function appServerPlugin(
   // Each app's own routes come from its kind. They are registered first so
   // the catalogue can report open work the kind itself counts.
   const kindPending: Record<string, (abilities: string[]) => number> = {};
+  // The processes that run SQL someone else wrote (see sandbox/supervisor.ts):
+  // a few for the whole server, shared by the apps that keep tables and by
+  // the file tool, and made when the first of those is set up.
+  let processes: import("./sandbox/supervisor.js").QueryProcesses | null = null;
+  const queryProcesses = async (wanted: boolean): Promise<typeof processes> => {
+    if (!wanted || declared.isolateQueries === false) return null;
+    if (!processes) {
+      const { QueryProcesses } = await import("./sandbox/supervisor.js");
+      const made = new QueryProcesses({ log: (level, message) => fastify.log[level](message) });
+      processes = made;
+      fastify.addHook("onClose", async () => {
+        await made.close();
+      });
+    }
+    return processes;
+  };
   for (const [appId, app] of Object.entries(config.apps ?? {})) {
     if (app.kind === "document-encoding") {
       const { registerEncodingApp } = await import("./apps/encoding/routes.js");
-      const runtime = await registerEncodingApp(fastify, config, appId, app, () => storeForStats, { timezone, views: viewsOf(appId) });
+      const runtime = await registerEncodingApp(fastify, config, appId, app, () => storeForStats, { timezone, views: viewsOf(appId), processes: await queryProcesses(app.records === true) });
       kindPending[appId] = (abilities) => runtime.pending(abilities as never);
       if (runtime.records) running.set(appId, runtime.records);
     }
@@ -177,7 +193,12 @@ async function appServerPlugin(
       import("./routes/files.js"),
       import("./routes/snapshots.js"),
     ]);
-    const store = new FileStore(config.files ?? {}, { timezone: declared.timezone });
+    const store = new FileStore(config.files ?? {}, {
+      timezone: declared.timezone,
+      isolate: declared.isolateQueries !== false,
+      processes: await queryProcesses(true),
+      log: (level, message) => fastify.log[level](message),
+    });
     await store.init();
     storeForStats = store;
     await fastify.register(async (filesScope) => {
@@ -188,8 +209,13 @@ async function appServerPlugin(
     store.startCleanup((msg) => fastify.log.info(msg));
     fastify.addHook("onClose", async () => {
       store.stopCleanup();
+      await store.close();
     });
   }
+
+  // One started now, so the first query does not wait for it, and a host
+  // that cannot start one is known, and said, as the server starts.
+  (processes as import("./sandbox/supervisor.js").QueryProcesses | null)?.warm();
 
   // Catch handler errors and return structured responses
   fastify.setErrorHandler(async (error: Error & { statusCode?: number }, _request, reply) => {

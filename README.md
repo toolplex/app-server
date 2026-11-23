@@ -246,6 +246,57 @@ and non-`SELECT` leading keywords before the SQL reaches DuckDB. Results are
 capped by row count and serialized byte size; queries have a wall-clock
 timeout.
 
+**A process of its own.** None of that can make a database safe from a
+query written to break it: ordinary functions can take all the memory there
+is, run without end, or stop the process they run in. So SQL the assistant
+wrote is not run in your server. It is run in a child process the server
+starts for the purpose, one query to a process at a time. A process is
+handed the path of a database file to open read-only and the statement to
+run, and keeps nothing afterwards. This covers queries over an uploaded
+file, over a page's snapshots (what alerts are checked with), and over an
+app's records.
+
+What becomes of a query that misbehaves:
+
+- one that has not answered a little after its time limit has its process
+  stopped, and is told it took too long;
+- one whose process holds more memory than it may is stopped the same way;
+- one that brings its process down is told it cannot be run, and the same
+  statement over the same file or app is refused without being run for the
+  next ten minutes;
+- a process stopped by something else (the system short of memory, the
+  server being restarted) answers "try again", and is not counted against
+  the query.
+
+Each is said in the server's log, with whose query it was and how it
+began. The server goes on answering throughout, and the next query starts
+another process, which takes about a tenth of a second. A small machine
+runs one such query at a time and a large one up to four. A file made from
+a query, which may take minutes, takes a turn apart from those (one on a
+small machine, two on a large one), so questions are answered meanwhile. A
+process with nothing to do is let go after a minute.
+
+A query's answer is all of its rows or a refusal with the reason. A
+statement that fails on a late row (a value that will not convert) never
+comes back as the rows before it, whether it was asked as a query, saved as
+a file, or read for a download or an alert.
+
+This is there so that a query cannot take your server down. It is not a
+wall around your data: the process runs as the same user as the server,
+on the same disk. It is started with none of the server's environment (no
+tokens, no keys) and none of the flags the server itself was started with.
+
+It is on by default. `isolateQueries: false` turns it off, for a host that
+may not start another process; such queries then run in the server itself.
+On a host where a process cannot be started or cannot load the database
+(it is found out as the server starts), the server says so once in its
+log, at the level of an error, and runs these queries itself rather than
+refuse them. If the package has been bundled into a single file, that is
+what happens: the worker has to be a file of its own beside the server's.
+Once a process has started on a host, a later start that fails is taken
+for a bad moment: the query is refused with "try again", and is not run in
+the server.
+
 ### Manifest shape
 
 ```typescript
@@ -450,14 +501,15 @@ every record: `record_id`, `record_name`, `record_group`, `record_version`,
 `record_correcting` (and `record_form`, `record_form_title` in `records`;
 `line_id`, `line_no` on a line).
 
-- A `number` field is a number and a `date` field is a date. The readers are
-  asked for digits and for year-month-day; a value someone keyed another way
-  ("12 pcs", "Nov 5") is left empty in its column, so it is **out of every
-  total**. That is never silent: the table `unfit_values` lists each such
-  value as written (record, table, column, line), a page's context and the
-  assistant say how many records are affected, and the server counts them
-  per column at startup. Corrected in the app, the value counts again. The
-  record keeps what was typed.
+- A `number` field is a number and a `date` field is a date, and a record
+  cannot be approved while one of them holds anything else (see "How a
+  value is decided"). A record approved before that was so may still hold
+  such a value ("12 pcs", "Nov 5"). It is left empty in its column, so it
+  is **out of every total**, and that is never silent: the table
+  `unfit_values` lists each such value as written (record, table, column,
+  line), a page's context and the assistant say how many records are
+  affected, and the server counts them per column at startup. Corrected in
+  the app, the value counts again.
 - The `record_*_at` columns are moments. Which day one falls on is decided
   by `timezone`: for a page's filters, for `current_date`, `::date` and
   `date_trunc` in a query, and for an alert's check over a snapshot of the
@@ -519,19 +571,26 @@ functions (not from the database's catalogue, settings or log), and a
 function that does more than compute (waits, logs, switches something on
 for the whole database) is refused, however the call is written. PRAGMA is
 not available. Long text is cut inside the database; lists, structures and
-binary values are not returned unless the query casts them to text. Two run at a time. A query is
-answered at its limit whether or not it could be stopped; the rare one that
-cannot be (a single enormous calculation) keeps its turn until it ends, and
-is said in the server's log.
+binary values are not returned unless the query casts them to text.
 
-What none of this can do is make a database that runs inside the server
-safe from a query written to break it. A statement built for the purpose
-(a pattern or a document nested tens of thousands deep, a value of
-hundreds of megabytes) can exhaust the server's memory or stop its
-process, as it can through any SQL tool that runs in the same process.
-Nothing is lost when that happens: the records are files, and the tables
-are rebuilt when the server starts again. Run the server under a process
-manager that restarts it.
+None of this makes a database safe from a query written to break it (a
+pattern or a document nested tens of thousands deep, a value of hundreds of
+megabytes), and nothing could. So these queries are not run in your server.
+The server writes its tables to a file that nothing will change, one copy
+for every query until a record changes, and a process of its own opens
+that file read-only and runs the statement, under every rule above. The
+copy holds everything stored when the question was asked, as a page does.
+A query that breaks that process, outruns its time limit or takes too much
+memory costs that process and nothing else: your server's own tables, and
+the pages read from them, are no part of it. See "A process of its own"
+under File Attachments.
+
+The copies live in `.records-frozen` under the app's directory and are
+removed as they are replaced and when the server stops; the server's own
+database can reach that one directory and no other file. With fifty
+thousand records, a question asked right after a record changed waits
+about a fifth of a second for a new copy, and one asked with nothing
+changed about a thirtieth.
 
 **For your own code.** The handle given to `onReady` can query the tables,
 with values handed over as parameters and never pasted into the SQL:
@@ -545,6 +604,12 @@ const { rows, truncated } = await receiving.query(
   [customer, '2026-11-01'],
 );
 ```
+
+This is your server's code, so it reads the server's own tables, as your
+pages do, under the same rules as the assistant's tool: one reading
+statement, no files, fifteen seconds. Two run at a time. Never hand it SQL
+that someone else wrote: what the assistant asks goes through its own tool,
+which is the one run in a process apart.
 
 A page whose data you work out yourself from `query` reports
 `lastSync: await receiving.changedAt()` from the page's own `context`
@@ -618,6 +683,14 @@ Two independent readers look at each document. A value both agree on, and
 that passes your checks, is accepted. Anything else is put to a person, who
 picks a reading or types the value. Handwritten values are shown for a
 person to confirm. Nothing counts until a person approves the record.
+
+A `number` field holds a number and a `date` field holds a day, written
+year-month-day. The readers are asked for exactly that. A value written
+some other way that can only mean one thing ("1,250", "Nov 5, 2026") is
+taken as what it means, whoever wrote it, a reader or a person. A value
+that is neither ("60 pcs", "about 40", "11/05/2026", which could be either
+of two days) is a question like any other, with the number offered when the
+text holds exactly one; and a record is not approved while one stands.
 
 ### Hooks
 

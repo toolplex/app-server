@@ -128,7 +128,7 @@ export interface RecordsSource {
   /** An id kept with the records for as long as they exist. A different id means a different set of records. */
   identity(): string;
   /** Every record that contributes, with the signature of its contribution, without opening one. */
-  expected(): { id: string; signature: string }[];
+  expected(): { id: string; signature: string }[] | Promise<{ id: string; signature: string }[]>;
   /** One record's signature as of now, without opening it. Empty when it contributes nothing. */
   signature(id: string): string;
   /** One record's contribution, read from the record itself. Null when the record no longer exists. */

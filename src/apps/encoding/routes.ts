@@ -32,6 +32,7 @@ import { countedSignature, encodingRecordsSource, orphanedKeys, renameKeys, type
 import { isRecordsQuery, recordRelation } from "../records/kinds.js";
 import type { RunningRecords } from "../records/resource.js";
 import { openRecords, type RecordsRuntime } from "../records/runtime.js";
+import type { QueryProcesses } from "../../sandbox/supervisor.js";
 import { readAbilities, configVersion, withoutFunctions } from "../../routes/apps.js";
 import { readOrgHeader, readUserHeaders } from "../../user.js";
 import { EncodingStore, type IndexEntry, type Reading, type ReceivedFile, type Scalar, type StoredDocument } from "./store.js";
@@ -147,7 +148,7 @@ export async function registerEncodingApp(
   /** The file store chat attachments live in, once it exists. */
   fileStore: () => FileStore | null,
   /** What the rest of the server's configuration says about this app's records. */
-  recordsOptions: { timezone: string; views: Record<string, { sql: string; label: string }> } = { timezone: "UTC", views: {} },
+  recordsOptions: { timezone: string; views: Record<string, { sql: string; label: string }>; processes?: QueryProcesses | null } = { timezone: "UTC", views: {} },
 ): Promise<{ pending: (abilities: EncodingAbility[]) => number; records: RunningRecords | null }> {
   const cfg = app.config;
   // What a client was served; records keep this to stay interpretable.
@@ -214,6 +215,7 @@ export async function registerEncodingApp(
       database: app.records === true,
       timezone: recordsOptions.timezone,
       views: recordsOptions.views,
+      processes: recordsOptions.processes ?? null,
       after: ready,
       log: (level, message) => fastify.log[level]({ appId }, `document-encoding: ${message}`),
     });
@@ -425,7 +427,7 @@ export async function registerEncodingApp(
         d.reading = reading;
         d.documentType = reading.document_type;
         d.configVersion = version;
-        applyReading(d);
+        applyReading(d, specOf(d));
         d.group = groupOf(d, cfg);
         const spec = specOf(d);
         if (spec) {

@@ -21,8 +21,12 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import { readFile, rename, writeFile } from "node:fs/promises";
+import { totalmem } from "node:os";
 import { join } from "node:path";
 import { RecordsDatabase, RecordsError, type QueryResult } from "./database.js";
+import { COPY_UNREADABLE, type FrozenQuery } from "./frozen.js";
+import { queryLimits, tookTooLong } from "./statement.js";
+import { QueryProcessError, type QueryProcesses } from "../../sandbox/supervisor.js";
 import type { ChangePoint, RecordProjection, RecordRow, RecordsSource } from "./types.js";
 import { held } from "./values.js";
 
@@ -40,6 +44,12 @@ export interface RecordsRuntimeOptions {
   views?: Record<string, { sql: string; label: string }>;
   /** Resolves once the records can be listed. */
   after: Promise<void>;
+  /**
+   * The processes that run queries someone else wrote (see ./frozen.ts).
+   * With them, such a query never runs in the server; without (they were
+   * turned off) it runs in the server's own tables.
+   */
+  processes?: QueryProcesses | null;
   log: (level: "info" | "warn" | "error", message: string) => void;
 }
 
@@ -81,6 +91,8 @@ export interface RecordsRuntime {
 }
 
 const firstLine = (err: unknown): string => (err instanceof Error ? err.message.split("\n")[0] : String(err));
+/** The memory one query's database may use in its process: as the server's own tables, less on a small machine. */
+const QUERY_MEMORY_MB = Math.min(512, Math.max(128, Math.floor(totalmem() / 1024 ** 2 / 8)));
 const fingerprint = (value: unknown): string => createHash("sha256").update(JSON.stringify(value)).digest("hex").slice(0, 12);
 
 /**
@@ -94,11 +106,58 @@ export async function openRecords(o: RecordsRuntimeOptions): Promise<RecordsRunt
   const shape = source.tables.map((t) => [t.name, t.columns.map((c) => [c.name, c.type])]);
   /** What a copy was made under: the tables' shape and whatever else decides a record's rows. */
   const schema = fingerprint([source.version, shape]);
-  const database = o.database ? new RecordsDatabase(source, { dir: o.dir, timezone: o.timezone, views: o.views, after: o.after, log: o.log }) : null;
+  const processes = o.database && o.processes ? o.processes : null;
+  const database = o.database ? new RecordsDatabase(source, { dir: o.dir, timezone: o.timezone, views: o.views, after: o.after, log: o.log, freeze: !!processes }) : null;
   if (database) {
     await database.prepare();
     database.open().catch((err: unknown) => o.log("error", `could not build the records tables: ${firstLine(err)}`));
   }
+  // A query someone else wrote (the assistant's) is run in a process of its
+  // own, over a frozen copy of the tables. Whatever it does there, the
+  // server's own tables and the pages read from them are not part of it.
+  let saidUnavailable = false;
+  const ask = async (sql: string, options: { params?: unknown[]; maxRows?: number; maxText?: number; maxResultText?: number }, again = false): Promise<QueryResult> => {
+    const db = needDatabase();
+    if (!processes) return db.query(sql, options);
+    // Refused here when it is not a query at all, before anything is copied for it.
+    const limits = queryLimits(sql, options);
+    const copy = await db.freeze();
+    const bounds = { memory_limit: `${QUERY_MEMORY_MB}MB`, threads: "2", temp_directory: join(o.dir, ".records-tmp", `${process.pid}-${randomUUID()}`), max_temp_directory_size: "2GB" };
+    let unreadable = false;
+    try {
+      const request: FrozenQuery = { path: copy.path, relations: copy.relations, sql, limits, timezone: o.timezone, bounds };
+      return await processes.run<QueryResult>("records.query", request, { timeoutMs: limits.timeoutMs, memoryMb: QUERY_MEMORY_MB, who: `app "${o.appId}"`, sql, scratch: [bounds.temp_directory] });
+    } catch (err) {
+      // The copy itself could not be opened (removed from under the server,
+      // or damaged). It is forgotten and the query asked once more, of a new one.
+      if (!(err instanceof QueryProcessError) && err instanceof Error && err.message.startsWith(COPY_UNREADABLE)) {
+        unreadable = true;
+        o.log("error", `a frozen copy of the tables could not be opened by a query's process${again ? "" : "; another is made"}: ${err.message.slice(COPY_UNREADABLE.length).trim()}`);
+        if (!again) {
+          copy.done(true);
+          return await ask(sql, options, true);
+        }
+        throw new RecordsError(503, COPY_UNREADABLE);
+      }
+      if (err instanceof QueryProcessError) {
+        // A host where no such process can be started at all: the query runs
+        // in the server's own tables, with every rule a query is held to,
+        // and it is said loudly. Not what is wanted, and never a tool that
+        // is down.
+        if (err.failure === "unavailable") {
+          if (!saidUnavailable) o.log("error", `queries over this app's records are running inside the server: ${err.message}`);
+          saidUnavailable = true;
+          return db.query(sql, options);
+        }
+        if (err.failure === "timeout") throw tookTooLong(limits.timeoutMs);
+      }
+      // The app's own kind of error, so routes answer with its status and words.
+      const status = (err as { statusCode?: number })?.statusCode;
+      throw new RecordsError(typeof status === "number" ? status : 500, err instanceof Error ? err.message : String(err));
+    } finally {
+      copy.done(unreadable);
+    }
+  };
 
   // When the shape of what pages are shown last changed. A page is looked at
   // again (its alerts checked) when its data moved; a new column or a client
@@ -137,7 +196,10 @@ export async function openRecords(o: RecordsRuntimeOptions): Promise<RecordsRunt
   return {
     database,
     touch: (id) => database?.touch(id),
-    // The client's own code gets its text whole; the cap on text is for what goes to a model.
+    // The client's own code, reading the server's own tables as its pages
+    // do: it is the server's code, and what it writes is trusted as the
+    // server is. It gets its text whole; the cap on text is for what goes
+    // to a model.
     query: async (sql, params) => needDatabase().query(sql, { params, maxRows: 5000, maxText: 1_000_000, maxResultText: 64_000_000 }),
 
     changes: async (options) => {
@@ -219,7 +281,7 @@ export async function openRecords(o: RecordsRuntimeOptions): Promise<RecordsRunt
         },
         run: async (input) => {
           if (typeof input.sql !== "string" || input.sql.trim() === "") throw new RecordsError(400, "sql is required");
-          const result = await database.query(input.sql, { maxRows: 200 });
+          const result = await ask(input.sql, { maxRows: 200 });
           return {
             columns: result.columns,
             rows: result.rows,

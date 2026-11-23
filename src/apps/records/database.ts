@@ -24,22 +24,16 @@
 // ---------------------------------------------------------------------------
 
 import { randomUUID } from "node:crypto";
-import { mkdir, readdir, rm } from "node:fs/promises";
-import { join } from "node:path";
-import {
-  DuckDBDateValue,
-  DuckDBDecimalValue,
-  DuckDBInstance,
-  DuckDBTimestampTZValue,
-  DuckDBTypeId,
-  StatementType,
-  type DuckDBConnection,
-  type DuckDBResult,
-  type DuckDBValue,
-} from "@duckdb/node-api";
+import { mkdir, readdir, rename, rm } from "node:fs/promises";
+import { join, sep } from "node:path";
+import { DuckDBDateValue, DuckDBInstance, DuckDBTimestampTZValue, StatementType, type DuckDBConnection, type DuckDBResult, type DuckDBValue } from "@duckdb/node-api";
 import type { ColumnFilter, FetchRequest, Selection } from "../../types.js";
 import { UNFIT_TABLE, type RecordColumn, type RecordColumnType, type RecordProjection, type RecordRow, type RecordTable, type RecordsSource } from "./types.js";
+import { RecordsError, cut, firstLine, ownRelations, queryLimits, readStatement, refusedFunctions, tookTooLong, type QueryOptions, type QueryResult } from "./statement.js";
 import { dayOf, daysOf, held, numberOf } from "./values.js";
+import { STOPPED_SHORT, endedWhole, whyItFailed } from "../../whole.js";
+
+export { RecordsError, type QueryResult } from "./statement.js";
 
 /** Records read and written together while building, in one transaction. */
 const BATCH = 500;
@@ -50,6 +44,8 @@ const EXPORT_FROM = 10_000;
 /** An export nobody has asked the next part of for this long is closed. */
 const CURSOR_IDLE_MS = 120_000;
 const MAX_CURSORS = 8;
+/** An export that was read from this recently is being read: it is not given up to make room for another. */
+const CURSOR_SPARE_MS = 60_000;
 /** A record that could not be read or written is tried again after this long. */
 const RETRY_MS = 30_000;
 /** After a failed start, how long before the next one is attempted. */
@@ -59,92 +55,23 @@ const QUERY_SLOTS = 2;
 const QUERY_WAITING = 16;
 /** After its time limit a query is answered this soon, whether or not it could be stopped. */
 const QUERY_GRACE_MS = 1_000;
-const MAX_SQL = 20_000;
 /** Queries of the client's own that may be read at once; a table answers in milliseconds, one of these can be anything. */
 // One, and two for queries someone else wrote: together fewer than the four
 // threads Node gives everything that waits on a disk or a database, so slow
 // work can never take them all.
 const VIEW_SLOTS = 1;
 const VIEW_WAITING = 32;
-/** How much text one query's result may hold in all (characters), for the assistant. */
-const MAX_RESULT_TEXT = 4_000_000;
-/**
- * The kinds of value a query's result may carry as they are. Any other kind
- * (a list, a structure, binary data, a bit string) can be of any size and is
- * costly to turn into text here, so it is not built at all: a fixed sentence
- * stands in for it, and a query that wants it casts it to text, where it
- * counts against the result's limit like any text.
- */
-const PLAIN_TYPES: ReadonlySet<DuckDBTypeId> = new Set([
-  DuckDBTypeId.BOOLEAN,
-  DuckDBTypeId.TINYINT,
-  DuckDBTypeId.SMALLINT,
-  DuckDBTypeId.INTEGER,
-  DuckDBTypeId.BIGINT,
-  DuckDBTypeId.UTINYINT,
-  DuckDBTypeId.USMALLINT,
-  DuckDBTypeId.UINTEGER,
-  DuckDBTypeId.UBIGINT,
-  DuckDBTypeId.HUGEINT,
-  DuckDBTypeId.UHUGEINT,
-  DuckDBTypeId.FLOAT,
-  DuckDBTypeId.DOUBLE,
-  DuckDBTypeId.DECIMAL,
-  DuckDBTypeId.VARCHAR,
-  DuckDBTypeId.ENUM,
-  DuckDBTypeId.UUID,
-  DuckDBTypeId.DATE,
-  DuckDBTypeId.TIME,
-  DuckDBTypeId.TIME_TZ,
-  DuckDBTypeId.TIMESTAMP,
-  DuckDBTypeId.TIMESTAMP_S,
-  DuckDBTypeId.TIMESTAMP_MS,
-  DuckDBTypeId.TIMESTAMP_NS,
-  DuckDBTypeId.TIMESTAMP_TZ,
-  DuckDBTypeId.INTERVAL,
-  DuckDBTypeId.SQLNULL,
-]);
-const OTHER_VALUE = "(a list, a structure or binary data; cast it to text in the query to see it)";
-
-/**
- * What a query may read rows from besides the tables: functions that make
- * rows out of what they are given, and ones that describe the tables. Every
- * other table function is refused. Some switch things on and off for the
- * whole database (a different parser, logging of every statement), which a
- * reading transaction does not prevent; some run SQL they are handed as
- * text, where nothing here could look at it; the rest read files.
- */
-const TABLE_FUNCTIONS: ReadonlySet<string> = new Set([
-  "range",
-  "generate_series",
-  "unnest",
-  "repeat",
-  "repeat_row",
-  "json_each",
-  "json_tree",
-  "duckdb_tables",
-  "duckdb_columns",
-  "duckdb_views",
-  "duckdb_types",
-  "duckdb_keywords",
-  "duckdb_functions",
-  "pragma_table_info",
-]);
-/** Functions that do something besides compute, and that do no harm here. Any other such function is refused, whatever a later version of the database adds. */
-const HARMLESS_EFFECTS: ReadonlySet<string> = new Set(["random", "setseed", "uuid", "gen_random_uuid", "uuidv4", "uuidv7", "current_query", "current_query_id", "current_connection_id", "current_transaction_id", "error", "stats"]);
-/** Refused by name whatever the database says of them: they wait, write, or read the server's surroundings. */
-const NEVER_CALLED = ["sleep_ms", "pg_sleep", "write_log", "getenv", "nextval", "currval", "json_serialize_plan", "json_deserialize_sql", "json_execute_serialized_sql"];
-/** A statement whose tree is larger than this is refused rather than examined: it is not a question anyone asked. */
-const MAX_TREE = 2_000_000;
-/** The most columns a query's result may have. */
-const MAX_COLUMNS = 300;
 const GAVE_UP = Symbol("gave up");
-const MAX_TEXT = 2_000;
 const MAX_SELECTED = 1_000;
 /** How long a page may take to read before it is stopped (a client's own query can be slow). */
 const READ_TIMEOUT_MS = 30_000;
 /** How long a reader waits for the tables to be built before it is told they are still being built. */
 const BUILD_WAIT_MS = 20_000;
+/** Under the app's directory: what does not fit in memory, and frozen copies of the tables. Nothing in either outlives the process. */
+const SPILL_DIR = ".records-tmp";
+const FROZEN_DIR = ".records-frozen";
+/** The directories of those two kinds that databases in this process are using. */
+const IN_USE = new Set<string>();
 /** How much of a value that did not fit its column is kept for showing. */
 const UNFIT_TEXT = 500;
 
@@ -163,7 +90,6 @@ const MOMENT = "TIMESTAMP WITH TIME ZONE";
 const ident = (name: string): string => `"${name.replace(/"/g, '""')}"`;
 const quote = (text: string): string => `'${text.replace(/'/g, "''")}'`;
 const likeText = (s: string): string => `%${s.replace(/[\\%_]/g, "\\$&")}%`;
-const firstLine = (err: unknown): string => (err instanceof Error ? err.message.split("\n")[0] : String(err));
 
 /** A table or view a page, the assistant or a query can read. */
 export interface Relation {
@@ -229,15 +155,6 @@ export function relationsOf(tables: RecordTable[]): Map<string, Relation> {
   return out;
 }
 
-export class RecordsError extends Error {
-  constructor(
-    readonly statusCode: number,
-    message: string,
-  ) {
-    super(message);
-  }
-}
-
 export interface RecordsDatabaseOptions {
   /** A directory this database may use for what does not fit in memory. Nothing in it outlives the process. */
   dir: string;
@@ -259,24 +176,38 @@ export interface RecordsDatabaseOptions {
   readTimeoutMs?: number;
   /** How long a reader waits for the tables to be built before being told they still are. Default 20 s. */
   buildWaitMs?: number;
+  /**
+   * Be able to hand out a frozen copy of the tables as a file (see `freeze`),
+   * for queries that are run in a process of their own. The one directory
+   * those copies are written to is then the only place on disk this database
+   * can reach.
+   */
+  freeze?: boolean;
+}
+
+/** A frozen copy of the tables: where it is, which state of the tables it is of, and how many are reading it. */
+interface Frozen {
+  dir: string;
+  path: string;
+  generation: number;
+  readers: number;
 }
 
 interface OpenCursor {
   conn: DuckDBConnection;
+  /** The statement being read, to ask the database why should it stop short. */
+  sql: string;
+  values: DuckDBValue[];
   result: DuckDBResult;
   rel: Relation;
   names: string[];
   pending: RecordRow[];
+  /** Its rows were read to their end. */
   done: boolean;
+  /** It was let go before that: whoever is still reading it must not take what they have for all there is. */
+  aborted: boolean;
   touched: number;
   busy: boolean;
-}
-
-export interface QueryResult {
-  columns: string[];
-  rows: Record<string, unknown>[];
-  /** More rows matched than were returned. */
-  truncated: boolean;
 }
 
 export class RecordsDatabase {
@@ -308,11 +239,20 @@ export class RecordsDatabase {
   private stuck = new Set<Promise<unknown>>();
   private readonly slots = new Slots(QUERY_SLOTS, QUERY_WAITING);
   private readonly viewSlots = new Slots(VIEW_SLOTS, VIEW_WAITING);
-  /** Functions a query may not call (see NEVER_CALLED); filled in from the database's own list when it is laid out. */
-  private refused = new Set<string>(NEVER_CALLED);
+  /** Functions a query may not call; filled in from the database's own list when it is laid out. */
+  private refused: ReadonlySet<string> = new Set<string>();
+  /** The database's own tables and views, which a query may neither read nor name one of its own after. */
+  private own: ReadonlySet<string> = new Set<string>();
   /** Connections being opened right now. The database is not closed under one. */
   private connecting = 0;
   private readonly spill: string;
+  /** Counted up whenever the tables change: a frozen copy is of one of these. */
+  private generation = 0;
+  private readonly frozenDir: string | null;
+  private frozen: Frozen | null = null;
+  /** Copies that newer ones have replaced and that are still being read, or could not be removed yet. */
+  private melting: Frozen[] = [];
+  private copies = 0;
   private readonly log: (level: "info" | "warn" | "error", message: string) => void;
   private readonly after: Promise<void>;
 
@@ -324,7 +264,10 @@ export class RecordsDatabase {
     this.after = options.after ?? Promise.resolve();
     if (source.tables.some((t) => t.name === UNFIT_TABLE)) throw new Error(`"${UNFIT_TABLE}" is a table every app's records have; a kind cannot have one of its own`);
     this.relations = this.kindRelations();
-    this.spill = join(options.dir, ".records-tmp", `${process.pid}-${randomUUID()}`);
+    this.spill = join(options.dir, SPILL_DIR, `${process.pid}-${randomUUID()}`);
+    this.frozenDir = options.freeze ? join(options.dir, FROZEN_DIR, `${process.pid}-${randomUUID()}`) : null;
+    IN_USE.add(this.spill);
+    if (this.frozenDir) IN_USE.add(this.frozenDir);
   }
 
   /** The kind's tables and views, and the table of values that did not fit. */
@@ -333,8 +276,16 @@ export class RecordsDatabase {
   }
 
   /** How things stand, for whoever watches over the server and for tests. */
-  status(): { built: boolean; records: number; failed: number; queryTurns: { free: number; waiting: number }; viewTurns: { free: number; waiting: number }; stuck: number } {
-    return { built: this.built, records: this.known.size, failed: this.failed.size, queryTurns: this.slots.state(), viewTurns: this.viewSlots.state(), stuck: this.stuck.size };
+  status(): { built: boolean; records: number; failed: number; queryTurns: { free: number; waiting: number }; viewTurns: { free: number; waiting: number }; stuck: number; frozen: number } {
+    return {
+      built: this.built,
+      records: this.known.size,
+      failed: this.failed.size,
+      queryTurns: this.slots.state(),
+      viewTurns: this.viewSlots.state(),
+      stuck: this.stuck.size,
+      frozen: this.melting.length + (this.frozen ? 1 : 0),
+    };
   }
 
   /** Every table and view, for the assistant and for checks at startup. */
@@ -370,8 +321,8 @@ export class RecordsDatabase {
   }
 
   private async lay(): Promise<void> {
-    await mkdir(join(this.options.dir, ".records-tmp"), { recursive: true });
-    await this.clearSpill();
+    await mkdir(join(this.options.dir, SPILL_DIR), { recursive: true });
+    await this.clearLeftovers();
     this.inst = await DuckDBInstance.create(":memory:", {
       memory_limit: "512MB",
       threads: "2",
@@ -384,8 +335,14 @@ export class RecordsDatabase {
     } catch {
       throw new Error(`"${this.options.timezone}" is not a time zone this server knows; use a name such as "Asia/Singapore"`);
     }
-    // From here on the database cannot open, read or write any file, whatever
-    // SQL it is handed, and nothing can turn that back on.
+    // The one place on disk it will be able to reach: where frozen copies of
+    // the tables are written for queries run in a process of their own.
+    if (this.frozenDir) {
+      await mkdir(this.frozenDir, { recursive: true });
+      await conn.run(`SET GLOBAL allowed_directories = [${quote(this.frozenDir + sep)}]`);
+    }
+    // From here on the database cannot open, read or write any other file,
+    // whatever SQL it is handed, and nothing can turn that back on.
     await conn.run("SET GLOBAL enable_external_access = false");
     for (const t of this.source.tables) {
       await conn.run(`CREATE TABLE ${ident(t.name)} (${t.columns.map((c) => `${ident(c.name)} ${SQL_TYPE[c.type]}`).join(", ")})`);
@@ -401,18 +358,10 @@ export class RecordsDatabase {
     // hold a turn for as long as it was told to. A function of our own by the
     // same name stands in front of each, however the call is written.
     for (const waits of ["pg_sleep", "sleep_ms"]) await conn.run(`CREATE MACRO ${waits}(x) AS error('Functions that wait are not available here.')`);
-    // Every function the database itself says does more than compute is
-    // refused to a query, save the few known to do no harm.
-    const effects = (await conn.runAndReadAll("SELECT DISTINCT function_name FROM duckdb_functions() WHERE function_type = 'scalar' AND has_side_effects")).getRowObjects();
-    this.refused = new Set([...NEVER_CALLED, ...effects.map((row) => String(row.function_name).toLowerCase()).filter((name) => !HARMLESS_EFFECTS.has(name))]);
-    // And every shorthand the database has for one of those (pg_sleep is
-    // sleep_ms under another name): a shorthand is refused when what it
-    // stands for names a refused function.
-    const shorthands = (await conn.runAndReadAll("SELECT DISTINCT function_name, macro_definition FROM duckdb_functions() WHERE function_type IN ('macro', 'table_macro') AND macro_definition IS NOT NULL")).getRowObjects();
-    for (const row of shorthands) {
-      const stands = String(row.macro_definition).toLowerCase();
-      if ([...this.refused].some((name) => new RegExp(`(^|[^a-z0-9_])${name}\\s*\\(`).test(stands))) this.refused.add(String(row.function_name).toLowerCase());
-    }
+    // What a query may not call, by this database's own account of its
+    // functions; and the tables and views that are the database's own.
+    this.refused = await refusedFunctions(conn);
+    this.own = await ownRelations(conn);
     await conn.run(`CREATE TABLE ${ident(UNFIT_TABLE)} (${UNFIT_RELATION.columns.map((c) => `${ident(c.name)} ${SQL_TYPE[c.type]}`).join(", ")})`);
     // The client's own queries, each kept as a view. One may read another,
     // in whatever order they were declared: those that cannot be made yet
@@ -468,22 +417,25 @@ export class RecordsDatabase {
     return { name, label: view.label, grain: "query", key: null, columns, order: columns.map((c) => c.name) };
   }
 
-  /** Spill directories left by processes that are gone. */
-  private async clearSpill(): Promise<void> {
-    const parent = join(this.options.dir, ".records-tmp");
-    for (const name of await readdir(parent).catch(() => [] as string[])) {
-      const pid = Number(name.split("-")[0]);
-      let alive = false;
-      try {
-        if (Number.isInteger(pid) && pid > 0) {
-          process.kill(pid, 0);
-          alive = pid !== process.pid;
+  /** Spill directories and frozen copies left by processes that are gone. */
+  private async clearLeftovers(): Promise<void> {
+    for (const parent of [join(this.options.dir, SPILL_DIR), join(this.options.dir, FROZEN_DIR)]) {
+      for (const name of await readdir(parent).catch(() => [] as string[])) {
+        // In use by a database in this process (this one, from an earlier laying out, or another over the same directory).
+        if (IN_USE.has(join(parent, name))) continue;
+        const pid = Number(name.split("-")[0]);
+        let alive = false;
+        try {
+          if (Number.isInteger(pid) && pid > 0) {
+            process.kill(pid, 0);
+            alive = pid !== process.pid;
+          }
+        } catch (err) {
+          // EPERM: it exists and is someone else's. Anything else: it is gone.
+          alive = (err as NodeJS.ErrnoException).code === "EPERM";
         }
-      } catch (err) {
-        // EPERM: it exists and is someone else's. Anything else: it is gone.
-        alive = (err as NodeJS.ErrnoException).code === "EPERM";
+        if (!alive) await rm(join(parent, name), { recursive: true, force: true }).catch(() => {});
       }
-      if (!alive) await rm(join(parent, name), { recursive: true, force: true }).catch(() => {});
     }
   }
 
@@ -505,6 +457,8 @@ export class RecordsDatabase {
     this.laid = null;
     this.built = false;
     this.known.clear();
+    // Whatever was frozen is of tables that are no more.
+    this.generation++;
     // The views a client declared are found again when the tables are laid out.
     this.relations = this.kindRelations();
   }
@@ -539,7 +493,7 @@ export class RecordsDatabase {
   }
 
   private async build(): Promise<void> {
-    const expected = this.source.expected();
+    const expected = await this.source.expected();
     const started = Date.now();
     this.misses = new Map();
     this.unplaced = new Map();
@@ -695,6 +649,7 @@ export class RecordsDatabase {
       await conn.run("ROLLBACK").catch(() => {});
       throw err;
     }
+    this.generation++;
     for (const p of projections) {
       if (p.signature === "") this.known.delete(p.id);
       else this.known.set(p.id, p.signature);
@@ -881,11 +836,13 @@ export class RecordsDatabase {
       throw tooLong();
     }
     await done();
+    // Told to stop, a statement may hand over what it had as if that were all.
+    if (late) throw tooLong();
     return outcome;
   }
 
   /** For an export, whose connection outlives the call: the wait is bounded by telling the statement to stop. */
-  private async bounded<T>(conn: DuckDBConnection, work: Promise<T>): Promise<T> {
+  private async bounded<T>(conn: DuckDBConnection, work: Promise<T>, tooLong?: (ms: number) => RecordsError): Promise<T> {
     const ms = this.options.readTimeoutMs ?? READ_TIMEOUT_MS;
     let late = false;
     let nag: NodeJS.Timeout | undefined;
@@ -903,14 +860,121 @@ export class RecordsDatabase {
       nag = setInterval(stop, 100);
     }, ms);
     try {
-      return await work;
+      const done = await work;
+      // Told to stop, a statement may hand over what it had as if that were all.
+      if (late) throw new Error("stopped at its time limit");
+      return done;
     } catch (err) {
-      if (late) throw new RecordsError(503, `Reading this took longer than ${ms / 1000} seconds and was stopped. If it reads a query of your own, that query needs to do less.`);
+      if (late) throw tooLong ? tooLong(ms) : new RecordsError(503, `Reading this took longer than ${ms / 1000} seconds and was stopped. If it reads a query of your own, that query needs to do less.`);
       throw err;
     } finally {
       clearTimeout(timer);
       clearInterval(nag);
       this.running.delete(conn);
+    }
+  }
+
+  // ── Frozen copies ────────────────────────────────────────────────────────
+
+  /**
+   * The tables as they stand, in a file of their own that nothing will
+   * change: what a query run in another process reads (see ./frozen.ts). It
+   * holds everything stored so far, like any read. One copy serves every
+   * query until the tables change; whoever takes one says when they are done
+   * with it, and a copy that has been replaced and that nobody reads is
+   * removed.
+   */
+  async freeze(): Promise<{ path: string; relations: string[]; done: (unreadable?: boolean) => void }> {
+    if (!this.frozenDir) throw new Error("this database was not asked to keep frozen copies");
+    await this.level();
+    // In line with the writes: the copy is of everything written before it,
+    // and nothing is written while it is made.
+    const copy = await this.enqueue(async () => {
+      if (!this.frozen || this.frozen.generation !== this.generation) await this.copyOut();
+      const now = this.frozen!;
+      now.readers++;
+      return now;
+    });
+    let over = false;
+    return {
+      path: copy.path,
+      relations: [...this.relations.keys()],
+      // `unreadable`: whoever took it could not open it (it was removed from
+      // under the server, or damaged). It is forgotten, and the next to ask
+      // gets a new one.
+      done: (unreadable = false) => {
+        if (over) return;
+        over = true;
+        copy.readers--;
+        if (unreadable && this.frozen === copy) {
+          this.frozen = null;
+          this.melting.push(copy);
+        }
+        this.melt();
+      },
+    };
+  }
+
+  /** Write the tables, the views and the functions of our own to a new file, whole or not at all. */
+  private async copyOut(): Promise<void> {
+    if (this.closed || !this.inst) throw new RecordsError(503, "The server is shutting down.");
+    const generation = this.generation;
+    const n = ++this.copies;
+    const dir = join(this.frozenDir!, String(n));
+    // Named so that the copy goes by the name the tables go by here.
+    const path = join(dir, "memory.duckdb");
+    const tmp = `${path}.tmp`;
+    const started = Date.now();
+    let conn: DuckDBConnection | null = null;
+    try {
+      await mkdir(dir, { recursive: true });
+      const copying = (conn = await this.connect());
+      const as = `frozen_${n}`;
+      await this.bounded(
+        copying,
+        (async () => {
+          await copying.run(`ATTACH ${quote(tmp)} AS ${as}`);
+          try {
+            await copying.run(`COPY FROM DATABASE memory TO ${as}`);
+          } catch (err) {
+            await copying.run(`DETACH ${as}`).catch(() => {});
+            throw err;
+          }
+          // The file is whole once it has been let go of.
+          await copying.run(`DETACH ${as}`);
+        })(),
+        (ms) => new RecordsError(503, `it took longer than ${ms / 1000} seconds`),
+      );
+      await rename(tmp, path);
+    } catch (err) {
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+      if (this.closed) throw new RecordsError(503, "The server is shutting down.");
+      this.log("error", `a copy of the tables could not be made for a query to read (${firstLine(err)})`);
+      throw new RecordsError(503, "This app's records could not be made ready for a query. Check the server log.");
+    } finally {
+      try {
+        conn?.disconnectSync();
+      } catch {
+        /* already gone */
+      }
+    }
+    const took = Date.now() - started;
+    if (took > 5_000) this.log("warn", `a copy of the tables for queries took ${(took / 1000).toFixed(1)} s to make`);
+    if (this.frozen) this.melting.push(this.frozen);
+    this.frozen = { dir, path, generation, readers: 0 };
+    this.melt();
+  }
+
+  /** Remove the copies that have been replaced and that nobody is reading. */
+  private melt(): void {
+    const going = this.melting.filter((f) => f.readers <= 0);
+    if (going.length === 0) return;
+    this.melting = this.melting.filter((f) => f.readers > 0);
+    for (const f of going) {
+      rm(f.dir, { recursive: true, force: true }).catch(() => {
+        // Still held open by a process on its way out: tried again with the next.
+        if (!this.closed) this.melting.push(f);
+      });
     }
   }
 
@@ -987,7 +1051,7 @@ export class RecordsDatabase {
       turn();
       throw err;
     }
-    const cursor: OpenCursor = { conn, result: null as unknown as DuckDBResult, rel, names: rel.columns.map((c) => c.name), pending: [], done: false, touched: Date.now(), busy: true };
+    const cursor: OpenCursor = { conn, sql: listed, values, result: null as unknown as DuckDBResult, rel, names: rel.columns.map((c) => c.name), pending: [], done: false, aborted: false, touched: Date.now(), busy: true };
     try {
       await conn.run("BEGIN TRANSACTION READ ONLY");
       const total = skipTotal ? 0 : Number((await this.bounded(conn, conn.runAndReadAll(counted, values))).getRowObjects()[0]?.n ?? 0);
@@ -997,8 +1061,12 @@ export class RecordsDatabase {
         this.release(cursor);
         return { rows, total, nextCursor: null };
       }
+      // Room is made by letting go of an export nobody has come back to for a
+      // while. One that is being read, or was a moment ago, is never taken
+      // from its reader: the newcomer is told to come back instead.
       while (this.cursors.size >= MAX_CURSORS) {
-        const [oldest] = [...this.cursors].sort((a, b) => a[1].touched - b[1].touched);
+        const [oldest] = [...this.cursors].filter(([, c]) => !c.busy && Date.now() - c.touched >= CURSOR_SPARE_MS).sort((a, b) => a[1].touched - b[1].touched);
+        if (!oldest) throw new RecordsError(503, "Too many exports are being read at once. Try again in a moment.");
         this.release(oldest[1]);
         this.cursors.delete(oldest[0]);
       }
@@ -1043,11 +1111,25 @@ export class RecordsDatabase {
   /** Up to `n` rows from an export, read a piece at a time so nothing else waits on it. */
   private async take(cursor: OpenCursor, n: number): Promise<RecordRow[]> {
     const rows: RecordRow[] = [];
+    const letGo = (): RecordsError => new RecordsError(410, "This export was closed before it ended. Start it again.");
     for (;;) {
+      if (cursor.aborted) throw letGo();
       if (cursor.pending.length === 0 && !cursor.done) {
         const chunk = await cursor.result.fetchChunk();
-        if (!chunk || chunk.rowCount === 0) cursor.done = true;
-        else cursor.pending = chunk.getRowObjects(cursor.names).map((row) => served(cursor.rel, row));
+        // Let go of while this part was being read (the server is closing,
+        // the tables are being laid out again): not the end of its rows.
+        if (cursor.aborted) throw letGo();
+        if (!chunk || chunk.rowCount === 0) {
+          // The rows have stopped coming. Whether that was their end is the
+          // database's to say (see ../../whole.ts): an export that failed on
+          // a late row is refused, never handed over short.
+          if (!(await endedWhole(cursor.conn))) {
+            const why = (await whyItFailed(cursor.conn, cursor.sql, cursor.values)) ?? STOPPED_SHORT;
+            this.log("error", `"${cursor.rel.name}" could not be read to its end: ${why}`);
+            throw new RecordsError(500, `"${cursor.rel.name}" could not be read to its end: ${why}`);
+          }
+          cursor.done = true;
+        } else cursor.pending = chunk.getRowObjects(cursor.names).map((row) => served(cursor.rel, row));
       }
       if (cursor.done || rows.length >= n) break;
       const part = cursor.pending.splice(0, n - rows.length);
@@ -1057,7 +1139,7 @@ export class RecordsDatabase {
   }
 
   private release(cursor: OpenCursor): void {
-    cursor.done = true;
+    if (!cursor.done) cursor.aborted = true;
     try {
       cursor.conn.disconnectSync();
     } catch {
@@ -1116,19 +1198,10 @@ export class RecordsDatabase {
    * that cannot touch a file. Few run at once, each is stopped after a time
    * limit, and only the rows asked for ever leave the database.
    */
-  async query(sql: string, options: { params?: unknown[]; maxRows?: number; timeoutMs?: number; maxText?: number; maxResultText?: number } = {}): Promise<QueryResult> {
-    if (typeof sql !== "string" || sql.trim() === "") throw new RecordsError(400, "The query is empty.");
-    if (sql.length > MAX_SQL) throw new RecordsError(400, `The query is too long (at most ${MAX_SQL.toLocaleString("en-US")} characters).`);
-    const params = options.params ?? [];
-    if (!Array.isArray(params) || !params.every((p) => p === null || ["string", "number", "boolean"].includes(typeof p))) {
-      throw new RecordsError(400, "Query parameters must be a list of text, numbers, true, false or null.");
-    }
-    const maxRows = Math.min(5000, Math.max(1, Math.floor(options.maxRows ?? 200)));
-    const maxText = options.maxText ?? MAX_TEXT;
-    const maxResultText = options.maxResultText ?? MAX_RESULT_TEXT;
-    const timeoutMs = options.timeoutMs ?? 15_000;
+  async query(sql: string, options: QueryOptions = {}): Promise<QueryResult> {
+    const limits = queryLimits(sql, options);
     await this.level();
-    const release = await this.slots.acquire(timeoutMs);
+    const release = await this.slots.acquire(limits.timeoutMs);
     let conn: DuckDBConnection;
     try {
       conn = await this.connect();
@@ -1139,106 +1212,10 @@ export class RecordsDatabase {
     const asking = conn;
     // From the moment it has its turn: the limit covers working out what the
     // statement is as well as running it.
-    const task = (async (): Promise<QueryResult> => {
-      let extracted;
-      try {
-        extracted = await asking.extractStatements(sql);
-      } catch (err) {
-        // DuckDB's own first line is the most useful thing for fixing the SQL.
-        throw new RecordsError(400, `Query failed: ${firstLine(err)}`);
-      }
-      if (extracted.count !== 1) throw new RecordsError(400, "Only a single statement is allowed. Remove the others and the ';' between them.");
-      // What it reads and what it calls, before anything of it is worked
-      // out: even preparing a statement evaluates what a row-making function
-      // is handed.
-      await this.refuseCalls(asking, sql);
-      let prepared;
-      try {
-        prepared = await extracted.prepare(0);
-      } catch (err) {
-        throw new RecordsError(400, `Query failed: ${firstLine(err)}`);
-      }
-      if (prepared.statementType !== StatementType.SELECT) {
-        throw new RecordsError(400, "Only reading statements are allowed (SELECT, DESCRIBE, SHOW, SUMMARIZE). Records are changed in the app, never here.");
-      }
-      const width = prepared.columnCount;
-      if (width > MAX_COLUMNS) throw new RecordsError(400, `The result would have ${width} columns; at most ${MAX_COLUMNS} can be returned. Select the ones that are needed.`);
-      const kinds = Array.from({ length: width }, (_, i) => prepared.columnTypeId(i));
-      const shown = kinds.map((k) => PLAIN_TYPES.has(k));
-      const names = distinctNames(Array.from({ length: width }, (_, i) => prepared.columnName(i)));
-      // The same statement, read through a frame of our own: long text is
-      // cut inside the database, before any of it is turned into a value
-      // here, and what is not shown is not fetched at all. Columns are
-      // taken by position, so two of the same name are still two.
-      let reading = prepared;
-      try {
-        const inner = sql.trim().replace(/;\s*$/, "");
-        const cols = names.map((_, i) => `c${i + 1}`);
-        const picked = cols.map((c, i) => (!shown[i] ? `NULL AS ${c}` : kinds[i] === DuckDBTypeId.VARCHAR ? `left(${c}, ${maxText + 1}) AS ${c}` : c));
-        const framed = await asking.extractStatements(`SELECT ${picked.join(", ")} FROM (\n${inner}\n) AS q(${cols.join(", ")})`);
-        if (framed.count === 1) {
-          const candidate = await framed.prepare(0);
-          if (candidate.statementType === StatementType.SELECT && candidate.columnCount === width) reading = candidate;
-        }
-      } catch {
-        // A statement that cannot be framed is read as it is, with the same limits applied on this side.
-      }
-      try {
-        if (params.length > 0) reading.bind(params as DuckDBValue[]);
-      } catch (err) {
-        throw new RecordsError(400, `Query failed: ${firstLine(err)}`);
-      }
-      await asking.run("BEGIN TRANSACTION READ ONLY");
-      try {
-        // A piece at a time, and of each piece only the rows that will be
-        // returned are turned into values, up to a fixed amount of text in
-        // all, with a pause now and then so nothing else waits on a wide
-        // result.
-        const result = await reading.stream();
-        const rows: Record<string, unknown>[] = [];
-        let truncated = false;
-        let text = 0;
-        let cells = 0;
-        streaming: for (;;) {
-          const chunk = await result.fetchChunk();
-          if (!chunk || chunk.rowCount === 0) break;
-          if (rows.length >= maxRows) {
-            truncated = true;
-            break;
-          }
-          const vectors = shown.map((yes, i) => (yes ? chunk.getColumnVector(i) : null));
-          for (let r = 0; r < chunk.rowCount; r++) {
-            if (rows.length >= maxRows) {
-              truncated = true;
-              break streaming;
-            }
-            const row: [string, unknown][] = [];
-            for (let i = 0; i < width; i++) {
-              const raw = vectors[i] ? (vectors[i]!.getItem(r) as DuckDBValue) : OTHER_VALUE;
-              text += typeof raw === "string" ? raw.length : 8;
-              // Per value, not per row: one row can be as much as any number of rows.
-              if (text > maxResultText) {
-                truncated = true;
-                break streaming;
-              }
-              row.push([names[i], plain(raw, maxText)]);
-            }
-            rows.push(Object.fromEntries(row));
-            cells += width;
-            if (cells >= 5_000) {
-              cells = 0;
-              await new Promise<void>((resolve) => setImmediate(resolve));
-            }
-          }
-        }
-        return { columns: names, rows, truncated };
-      } catch (err) {
-        throw new RecordsError(400, `Query failed: ${firstLine(err)}`);
-      }
-    })();
+    const task = readStatement(asking, sql, limits, { refused: this.refused, own: this.own, has: (name) => this.relations.has(name), catalogs: ["", "memory"] });
     return this.within(
       asking,
-      timeoutMs,
+      limits.timeoutMs,
       task,
       async () => {
         await asking.run("ROLLBACK").catch(() => {});
@@ -1249,76 +1226,8 @@ export class RecordsDatabase {
         }
         release();
       },
-      () => new RecordsError(408, `The query took longer than ${timeoutMs / 1000} seconds and was stopped. Narrow it down or add up in fewer steps.`),
+      () => tookTooLong(limits.timeoutMs),
     );
-  }
-
-  /**
-   * Refuse a statement that calls something it may not. The statement is
-   * looked at as the database's own parser sees it, so it makes no
-   * difference how a call is spelled, qualified, quoted, or tucked inside a
-   * subquery, a lambda or a SUMMARIZE: every call is in the tree, by name.
-   *
-   * Reading rows is allowed from the tables and from a short list of table
-   * functions (TABLE_FUNCTIONS). Calling is allowed for everything that only
-   * computes; a function that does more is refused unless it is known to be
-   * harmless. What the parser will not describe at all (PRAGMA, PIVOT) is
-   * refused too: it cannot be looked at.
-   */
-  private async refuseCalls(conn: DuckDBConnection, sql: string): Promise<void> {
-    let tree: { error?: unknown; statements?: unknown };
-    try {
-      const text = String((await conn.runAndReadAll("SELECT json_serialize_sql(?::VARCHAR) AS tree", [sql])).getRows()[0][0]);
-      if (text.length > MAX_TREE) throw new RecordsError(400, "The query is too large to be examined. Write it more simply.");
-      tree = JSON.parse(text) as typeof tree;
-    } catch (err) {
-      if (err instanceof RecordsError) throw err;
-      throw new RecordsError(400, `Query failed: ${firstLine(err)}`);
-    }
-    if (tree.error || !Array.isArray(tree.statements)) {
-      throw new RecordsError(400, "Only SELECT, DESCRIBE, SHOW and SUMMARIZE can be used here. (PRAGMA cannot: DESCRIBE a table to see its columns.)");
-    }
-    const tables: { catalog: string; schema: string; name: string }[] = [];
-    const named = new Set<string>();
-    // Walked without recursion: a statement can be nested as deep as it is long.
-    const pending: unknown[] = [tree.statements];
-    while (pending.length > 0) {
-      const node = pending.pop();
-      if (Array.isArray(node)) {
-        for (const item of node) pending.push(item);
-        continue;
-      }
-      if (!node || typeof node !== "object") continue;
-      const n = node as Record<string, unknown>;
-      if (n.type === "TABLE_FUNCTION") {
-        const name = String((n.function as Record<string, unknown> | undefined)?.function_name ?? "").toLowerCase();
-        if (!TABLE_FUNCTIONS.has(name)) throw new RecordsError(400, `"${name}" cannot be read from here. Rows come from this app's tables, and from ${[...TABLE_FUNCTIONS].slice(0, 3).join(", ")} and the like.`);
-      } else if (n.type === "BASE_TABLE") {
-        tables.push({ catalog: String(n.catalog_name ?? ""), schema: String(n.schema_name ?? ""), name: String(n.table_name ?? "") });
-      } else if (n.type === "SHOW_REF") {
-        const what = String(n.table_name ?? "").replace(/"/g, "").toLowerCase();
-        if (!["", "tables", "__show_tables_expanded"].includes(what)) throw new RecordsError(400, "SHOW TABLES lists this app's tables, and DESCRIBE shows one's columns. Nothing else can be shown here.");
-      } else if (typeof n.function_name === "string") {
-        const name = n.function_name.toLowerCase();
-        if (this.refused.has(name)) throw new RecordsError(400, `The function "${name}" is not available here.`);
-        // The one setting a query has any use for; the rest say things about the server.
-        if (name === "current_setting") {
-          const given = Array.isArray(n.children) ? (n.children as Record<string, unknown>[]) : [];
-          const which = given.length === 1 && given[0]?.class === "CONSTANT" ? String((given[0].value as Record<string, unknown> | undefined)?.value ?? "") : "";
-          if (which.toLowerCase() !== "timezone") throw new RecordsError(400, "Only current_setting('TimeZone') is available here.");
-        }
-      }
-      // The names a WITH gives to its own queries: reading from one of those is reading from the statement itself.
-      const withs = (n.cte_map as { map?: { key?: unknown }[] } | undefined)?.map;
-      if (Array.isArray(withs)) for (const w of withs) if (typeof w?.key === "string") named.add(w.key.toLowerCase());
-      for (const value of Object.values(n)) if (value && typeof value === "object") pending.push(value);
-    }
-    // Rows are read from this app's tables and views and from nothing else:
-    // not the database's own catalogue, its settings or its log.
-    for (const t of tables) {
-      const ours = ["", "memory"].includes(t.catalog.toLowerCase()) && ["", "main"].includes(t.schema.toLowerCase()) && (this.relations.has(t.name.toLowerCase()) || named.has(t.name.toLowerCase()));
-      if (!ours) throw new RecordsError(400, `"${[t.catalog, t.schema, t.name].filter(Boolean).join(".")}" is not one of this app's tables. SHOW TABLES lists them.`);
-    }
   }
 
   async close(): Promise<void> {
@@ -1348,9 +1257,15 @@ export class RecordsDatabase {
       }
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
+    // Nothing reads a frozen copy from in here; whoever does is stopped with the server.
+    if (this.frozenDir) {
+      await rm(this.frozenDir, { recursive: true, force: true }).catch(() => {});
+      IN_USE.delete(this.frozenDir);
+    }
     if (this.connecting > 0 || this.running.size > 0 || this.stuck.size > 0) return;
     this.teardown();
     await rm(this.spill, { recursive: true, force: true }).catch(() => {});
+    IN_USE.delete(this.spill);
   }
 }
 
@@ -1440,49 +1355,6 @@ function served(rel: Relation, row: Record<string, unknown>): RecordRow {
   }
   return out;
 }
-
-/** Any value a query can return, as JSON would carry it. A moment is ISO text; long text is cut. */
-function plain(v: DuckDBValue, maxText: number): unknown {
-  try {
-    return plainly(v, maxText);
-  } catch {
-    // A value that cannot be said as JSON (a moment at infinity) is said as the database writes it.
-    return cut(String(v), maxText);
-  }
-}
-
-/** Column names as keys of a row: each its own, whatever the query called them. */
-function distinctNames(names: string[]): string[] {
-  const seen = new Set<string>();
-  return names.map((given, i) => {
-    const base = given.trim() === "" ? `column_${i + 1}` : given;
-    let name = base;
-    for (let n = 2; seen.has(name.toLowerCase()); n++) name = `${base}_${n}`;
-    seen.add(name.toLowerCase());
-    return name;
-  });
-}
-
-function plainly(v: DuckDBValue, maxText: number): unknown {
-  if (v === null || v === undefined) return null;
-  if (typeof v === "number" || typeof v === "boolean") return v;
-  if (typeof v === "bigint") return Number.isSafeInteger(Number(v)) ? Number(v) : v.toString();
-  if (typeof v === "string") return cut(v, maxText);
-  if (v instanceof DuckDBTimestampTZValue) return new Date(Number(v.micros / 1000n)).toISOString();
-  if (v instanceof DuckDBDecimalValue) {
-    const n = Number(String(v));
-    return Number.isFinite(n) ? n : String(v);
-  }
-  return cut(String(v), maxText);
-}
-
-const cut = (text: string, most: number): string => {
-  if (text.length <= most) return text.includes("\u0000") ? text.replaceAll("\u0000", "") : text;
-  // Copied out, not sliced: a slice of a long string keeps the whole of it
-  // in memory for as long as the slice lives.
-  const head = Buffer.from(text.slice(0, most), "utf8").toString("utf8");
-  return `${head.includes("\u0000") ? head.replaceAll("\u0000", "") : head}…`;
-};
 
 /** A value that did not fit its column: which record, where, and what was written. */
 interface Unfit {

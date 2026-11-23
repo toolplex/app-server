@@ -12,6 +12,7 @@
 
 import type { DocumentEncodingConfig, EncodingDocumentType, EncodingField } from "../types.js";
 import type { ReadValue, Reading, Scalar, StoredDocument } from "./store.js";
+import { dayOf, numberOf } from "../records/values.js";
 
 export interface Question {
   path: string;
@@ -71,17 +72,95 @@ export function setValueAt(doc: StoredDocument, path: string, value: Scalar | nu
   rows[p.row][p.column] = value;
 }
 
-/** Copy the reading's values into the record. Called once, when a read lands. */
-export function applyReading(doc: StoredDocument): void {
+/**
+ * Copy the reading's values into the record. Called once, when a read lands.
+ *
+ * With the form in hand, a number or a date that the readers wrote in some
+ * other way that can only mean one thing ("1,250" for 1250, "Nov 5, 2026"
+ * for 2026-11-05) is taken as what it means. The readers are asked for one
+ * form and nearly always give it; when they do not, a person should not have
+ * to retype what is not in doubt. The reading itself stays as it was read.
+ */
+export function applyReading(doc: StoredDocument, spec?: EncodingDocumentType): void {
   doc.values = {};
   doc.tables = {};
   doc.resolved = {};
   doc.flags = {};
   if (!doc.reading) return;
-  for (const [k, v] of Object.entries(doc.reading.fields)) doc.values[k] = v.value;
+  const fieldType = new Map((spec?.fields ?? []).map((f) => [f.key, f.type]));
+  const columnType = new Map((spec?.tables ?? []).map((t) => [t.key, new Map(t.columns.map((c) => [c.key, c.type]))]));
+  const taken = (type: EncodingField["type"] | undefined, value: Scalar | null): Scalar | null => (type && value !== null ? (asType(type, value) ?? value) : value);
+  for (const [k, v] of Object.entries(doc.reading.fields)) doc.values[k] = taken(fieldType.get(k), v.value);
   for (const [t, rows] of Object.entries(doc.reading.tables)) {
-    doc.tables[t] = rows.map((r) => Object.fromEntries(Object.entries(r).map(([c, v]) => [c, v.value])));
+    doc.tables[t] = rows.map((r) => Object.fromEntries(Object.entries(r).map(([c, v]) => [c, taken(columnType.get(t)?.get(c), v.value)])));
   }
+}
+
+const MONTHS = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
+const monthNamed = (word: string): number => {
+  const w = word.toLowerCase().replace(/\.$/, "");
+  const at = MONTHS.findIndex((m) => m === w || (w.length >= 3 && m.slice(0, 3) === w) || (w === "sept" && m === "september"));
+  return at + 1;
+};
+
+/**
+ * The day a piece of text names, as year-month-day, when it can only mean
+ * one day: written year first ("2026-11-05", "2026/11/05"), or with the
+ * month as a word ("Nov 5, 2026", "5 November 2026"). Two numbers and a year
+ * ("11/05/2026") could be either of two days, and a year of two digits either
+ * of two centuries: those are not taken, and a person says which.
+ */
+export function dateOf(text: string): string | null {
+  const s = text.trim();
+  const iso = dayOf(s);
+  if (iso) return iso;
+  const day = (y: string, m: number, d: string): string | null => (m >= 1 && m <= 12 ? dayOf(`${y}-${String(m).padStart(2, "0")}-${d.padStart(2, "0")}`) : null);
+  let m = /^(\d{4})[/.](\d{1,2})[/.](\d{1,2})$/.exec(s);
+  if (m) return day(m[1], Number(m[2]), m[3]);
+  m = /^([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})$/.exec(s);
+  if (m) return day(m[3], monthNamed(m[1]), m[2]);
+  m = /^(\d{1,2})(?:st|nd|rd|th)?[\s-]+([A-Za-z]{3,9})\.?,?[\s-]+(\d{4})$/.exec(s);
+  if (m) return day(m[3], monthNamed(m[2]), m[1]);
+  return null;
+}
+
+/**
+ * A value as its field's type holds it: a number for a number field, a day
+ * as year-month-day for a date field. Null when the value is not one, which
+ * is for a person to settle. Fields of other types hold whatever is written.
+ */
+export function asType(type: EncodingField["type"], value: Scalar): Scalar | null {
+  if (type === "number") return typeof value === "number" ? (Number.isFinite(value) ? value : null) : numberOf(value);
+  if (type === "date") return typeof value === "string" ? dateOf(value) : null;
+  return value;
+}
+
+/** What a value that is not a number was most likely meant to be, when the text has exactly one number in it ("60 pcs"). */
+function numberIn(value: Scalar): number | null {
+  const runs = String(value).match(/-?\d[\d,]*(?:\.\d+)?/g);
+  return runs?.length === 1 ? numberOf(runs[0]) : null;
+}
+
+/**
+ * A number or date field that holds something else. Such a value cannot be
+ * added up or put on a calendar, so a record is not approved with one: it is
+ * a question like any other, with what was probably meant offered when that
+ * is plain. Whoever put the value there, a reader or a person.
+ */
+function misfit(path: string, label: string, field: EncodingField, value: Scalar | null, read: ReadValue | null): Question | null {
+  if ((field.type !== "number" && field.type !== "date") || value === null || value === "") return null;
+  if (asType(field.type, value) !== null) return null;
+  const meant = field.type === "number" ? numberIn(value) : null;
+  return {
+    path,
+    label,
+    kind: "ask",
+    reason: field.type === "number" ? "Not a number. Write the number alone, such as 60 or 1250.5" : "Not a date. Write it year-month-day, such as 2026-11-05",
+    value,
+    candidates: meant === null ? [] : [meant],
+    type: field.type,
+    box: read?.box,
+  };
 }
 
 /** What still waits on a person, in form order. */
@@ -92,11 +171,14 @@ export function openQuestions(doc: StoredDocument, spec: EncodingDocumentType | 
     const read = readValueAt(doc, path);
     const flag = doc.flags[path];
     const value = valueAt(doc, path);
+    const wrongKind = misfit(path, label, field, value, read);
     if (doc.resolved[path]) {
-      // A person's decision settles a value, except that a required one cannot be settled as empty.
+      // A person's decision settles a value, with two exceptions: a required
+      // one cannot be settled as empty, and a number or a date cannot be
+      // settled as something that is neither.
       if (field.required && (value === null || value === "")) {
         out.push({ path, label, kind: "ask", reason: "Required, and empty", value: null, candidates: [], type: field.type, box: read?.box });
-      }
+      } else if (wrongKind) out.push(wrongKind);
       continue;
     }
     if (flag) {
@@ -114,7 +196,7 @@ export function openQuestions(doc: StoredDocument, spec: EncodingDocumentType | 
       });
     } else if (field.required && (value === null || value === "")) {
       out.push({ path, label, kind: "ask", reason: "Required, and empty", value: null, candidates: [], type: field.type, box: read?.box });
-    }
+    } else if (wrongKind) out.push(wrongKind);
   }
   return out;
 }
@@ -125,10 +207,10 @@ export function coerce(type: EncodingField["type"], raw: unknown): Scalar | null
   if (typeof raw !== "string") return null;
   const s = raw.trim();
   if (s === "") return null;
-  if (type === "number") {
-    const n = Number(s.replace(/[,\s]/g, ""));
-    return Number.isFinite(n) ? n : s;
-  }
+  // A number or a date is kept as one when what was typed is one, by the
+  // same rule the app's tables hold them to. Anything else is kept as typed,
+  // and stays a question until it is one (see openQuestions).
+  if (type === "number" || type === "date") return asType(type, s) ?? s.slice(0, 2000);
   return s.slice(0, 2000);
 }
 

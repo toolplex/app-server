@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { createReadStream, createWriteStream } from "node:fs";
+import { createReadStream } from "node:fs";
 import { copyFile, mkdir, readFile, readdir, realpath, rename, rm, stat, statfs, writeFile, appendFile } from "node:fs/promises";
 import { cpus, homedir, tmpdir, totalmem } from "node:os";
 import { basename, extname, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
 
-import { DuckDBInstance, type DuckDBConnection, type DuckDBResultReader } from "@duckdb/node-api";
+import { DuckDBInstance, type DuckDBConnection } from "@duckdb/node-api";
 import ExcelJS from "exceljs";
 
 import type {
@@ -16,6 +16,18 @@ import type {
   ResolvedFilesConfig,
 } from "./types.js";
 import { validateReadOnlySql } from "./sqlGuard.js";
+import { FileStoreError, fitBytes, lineWriter, normalizeRow, normalizeValue, sqlString, stripNulls, withTimeout } from "./values.js";
+
+import * as untrusted from "./untrusted.js";
+import { endedWhole } from "../whole.js";
+import { QueryProcessError, QueryProcesses, hostSlots } from "../sandbox/supervisor.js";
+
+export { FileStoreError, normalizeValue };
+
+/** The longest a query whose result becomes a file may take in all (each step has its own, shorter limit). */
+const MATERIALIZE_TOTAL_MS = 5 * 60_000;
+/** How long a query waits for one of the turns at running in the server itself before it is told to come back. */
+const IN_SERVER_WAIT_MS = 15_000;
 import {
   applyOps,
   buildWorkbook,
@@ -28,18 +40,6 @@ import {
 } from "./documents.js";
 import { resolveDocumentMime, extractDocumentText } from "./textExtract.js";
 
-// ---------------------------------------------------------------------------
-// Errors — carry an HTTP status so the route can map them directly.
-// ---------------------------------------------------------------------------
-
-export class FileStoreError extends Error {
-  statusCode: number;
-  constructor(statusCode: number, message: string) {
-    super(message);
-    this.name = "FileStoreError";
-    this.statusCode = statusCode;
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Sidecar record — persisted next to each upload so the store survives a
@@ -123,7 +123,7 @@ const SPILL_MAX = "2GB";
  * 2 GB box and scales up on a workstation.
  */
 function hostBounds(maxConcurrentIngests: number): { slots: number; memoryMb: number; threads: string } {
-  const slots = HOST_MEM_BYTES < 4 * 1024 ** 3 ? 1 : HOST_CORES <= 2 ? 2 : Math.min(4, Math.ceil(HOST_CORES / 2));
+  const slots = hostSlots();
   const share = HOST_MEM_BYTES / (slots + maxConcurrentIngests + 2);
   const memoryMb = Math.min(1024, Math.max(128, Math.floor(share / 1024 ** 2)));
   return { slots, memoryMb, threads: String(Math.min(HOST_CORES, 4)) };
@@ -131,13 +131,32 @@ function hostBounds(maxConcurrentIngests: number): { slots: number; memoryMb: nu
 
 /** A counting semaphore; `acquire` resolves with the matching release. */
 class Slots {
-  private readonly waiting: Array<() => void> = [];
+  private waiting: Array<() => void> = [];
   private used = 0;
   constructor(private readonly size: number) {}
-  async acquire(): Promise<() => void> {
+  /** With `maxWaitMs`, a wait longer than that ends in a refusal instead of a slot. */
+  async acquire(maxWaitMs?: number): Promise<() => void> {
+    const until = maxWaitMs === undefined ? Infinity : Date.now() + maxWaitMs;
     // Loop, not if: a newcomer can take the slot between a release and the
     // woken waiter's turn, so the waiter checks again before counting itself.
-    while (this.used >= this.size) await new Promise<void>((wake) => this.waiting.push(wake));
+    while (this.used >= this.size) {
+      const left = until - Date.now();
+      if (left <= 0) throw new FileStoreError(503, "The queries ahead of this one are taking too long. Try again in a moment.");
+      await new Promise<void>((wake) => {
+        let timer: NodeJS.Timeout | undefined;
+        const woken = (): void => {
+          clearTimeout(timer);
+          wake();
+        };
+        if (Number.isFinite(left)) {
+          timer = setTimeout(() => {
+            this.waiting = this.waiting.filter((w) => w !== woken);
+            wake();
+          }, left);
+        }
+        this.waiting.push(woken);
+      });
+    }
     this.used++;
     let done = false;
     return () => {
@@ -157,6 +176,8 @@ export class FileStore {
   /** Host-derived limits (see hostBounds) and the read-path slots they allow. */
   private readonly bounds: ReturnType<typeof hostBounds>;
   private readonly querySlots: Slots;
+  /** Turns at running someone else's SQL in the server itself (see `untrusted`). */
+  private readonly inServer = new Slots(2);
   /** Uploads in flight by client-chosen id; a retry awaits the first instead of ingesting twice. */
   private readonly inflight = new Map<string, Promise<FileManifest>>();
 
@@ -166,9 +187,34 @@ export class FileStore {
    * one. Without it the database's own default stands, as it always has.
    */
   private readonly timezone: string | null;
+  /**
+   * SQL someone else wrote is run in a process of its own (see
+   * ../sandbox/supervisor.ts), so a statement that breaks the database
+   * breaks that process and not the server. Null when that was turned off.
+   * The server's own, shared with its apps, when it was handed one; else
+   * this store's, which it then closes.
+   */
+  private readonly processes: QueryProcesses | null;
+  private readonly ownProcesses: boolean;
+  private log: (level: "info" | "warn" | "error", message: string) => void = () => {};
+  private saidUnavailable = false;
 
-  constructor(config: FilesConfig, options: { timezone?: string } = {}) {
+  constructor(
+    config: FilesConfig,
+    options: {
+      timezone?: string;
+      isolate?: boolean;
+      processes?: QueryProcesses | null;
+      /** For tests: a ceiling on a query process's memory, and another program for it to run. */
+      maxQueryProcessMb?: number;
+      queryWorkerPath?: string;
+      log?: (level: "info" | "warn" | "error", message: string) => void;
+    } = {},
+  ) {
     this.timezone = options.timezone ?? null;
+    if (options.log) this.log = options.log;
+    this.ownProcesses = options.isolate !== false && !options.processes;
+    this.processes = options.isolate === false ? null : (options.processes ?? new QueryProcesses({ log: (level, message) => this.log(level, message), maxRssMb: options.maxQueryProcessMb, workerPath: options.queryWorkerPath }));
     this.cfg = {
       // One persistent, app-controlled store for everything (attachments AND
       // durable artifacts). Never the OS temp dir — the OS must not delete our
@@ -262,13 +308,81 @@ export class FileStore {
     }
   }
 
-  /** Columns, rows and the truncated flag from a reader, within the row and byte caps. */
-  private cappedResult(reader: DuckDBResultReader): FileQueryResult {
-    const columns: FileColumn[] = reader.columnNames().map((name, i) => ({ name, type: String(reader.columnTypes()[i]) }));
-    const all = reader.getRowObjects();
-    const fitted = fitBytes(all.slice(0, this.cfg.maxQueryRows).map((r) => normalizeRow(r)), this.cfg.maxResultBytes);
-    return { columns, rows: fitted.rows, rowCount: fitted.rows.length, truncated: all.length > this.cfg.maxQueryRows || fitted.truncated };
+  /**
+   * Run one of the file tool's untrusted statements (see ./untrusted.ts): in
+   * a process of its own, or in the server itself when that is turned off.
+   * Under one of the host's query slots either way. The process is given the
+   * statement's own time limit and a little more; one that has not answered
+   * by then is stopped, which nothing a statement does can prevent.
+   */
+  private async untrusted<K extends keyof typeof untrusted.handlers>(
+    op: K,
+    request: Parameters<(typeof untrusted.handlers)[K]>[0],
+    hardLimitMs: number,
+    who: string,
+  ): Promise<Awaited<ReturnType<(typeof untrusted.handlers)[K]>>> {
+    type Out = Awaited<ReturnType<(typeof untrusted.handlers)[K]>>;
+    // In the server itself, two at a time at most: fewer than the four
+    // threads Node gives everything that waits on a disk or a database. A
+    // statement that could not be stopped at its limit keeps its turn until
+    // it has really ended, so such statements can never take every thread.
+    // Whoever waits for one of those turns waits so long and no longer, and
+    // holds nothing meanwhile that the server's own reads are waiting for.
+    const here = async (): Promise<Out> => {
+      const turn = await this.inServer.acquire(IN_SERVER_WAIT_MS);
+      let kept = false;
+      try {
+        const release = await this.querySlots.acquire();
+        try {
+          return (await (untrusted.handlers[op] as (r: unknown) => Promise<unknown>)(request)) as Out;
+        } finally {
+          release();
+        }
+      } catch (err) {
+        const settled = (err as { settled?: Promise<unknown> }).settled;
+        if (settled) {
+          kept = true;
+          void settled.then(turn, turn);
+        }
+        throw err;
+      } finally {
+        if (!kept) turn();
+      }
+    };
+    if (!this.processes) return here();
+    // In a process of its own: how many run at once is the processes' to
+    // say, and the server's own reads do not wait behind them.
+    try {
+      return await this.processes.run<Out>(op, request, { timeoutMs: hardLimitMs, memoryMb: this.bounds.memoryMb, who, sql: request.sql, scratch: [request.bounds.temp_directory].filter(Boolean), long: op === "file.materialize" });
+    } catch (err) {
+      if (err instanceof QueryProcessError) {
+        // A host where no such process can be started at all: the query is
+        // run here, as it always was before there were such processes, and
+        // it is said loudly. Never worse than it was; and not what is wanted.
+        if (err.failure === "unavailable") {
+          if (!this.saidUnavailable) this.log("error", `queries over files are running inside the server: ${err.message}`);
+          this.saidUnavailable = true;
+          return here();
+        }
+        if (err.failure === "timeout") throw new FileStoreError(408, `Query exceeded the ${hardLimitMs / 1000}s time limit.`);
+      }
+      // The store's own kind of error, so routes answer with its status and words.
+      if (err instanceof FileStoreError) throw err;
+      const status = (err as { statusCode?: number })?.statusCode;
+      throw new FileStoreError(typeof status === "number" ? status : 500, err instanceof Error ? err.message : String(err));
+    }
   }
+
+  /** What every untrusted statement is run under: this host's bounds, the organization's zone, and a time limit per step. */
+  private bounded(timeoutMs: number): untrusted.Bounds {
+    return { bounds: this.boundsConfig(), timezone: this.timezone, timeoutMs };
+  }
+
+  /** Stop the processes that run queries, when they are this store's own. The store itself holds nothing open. */
+  async close(): Promise<void> {
+    if (this.ownProcesses) await this.processes?.close();
+  }
+
 
   async init(): Promise<void> {
     if (this.timezone !== null) {
@@ -1389,35 +1503,17 @@ export class FileStore {
     const records: Array<(typeof files)[number] & { record: FileRecord }> = [];
     for (const f of files) records.push({ ...f, record: await this.getOwnedRecord(f.fileId, requester) });
 
-    // ATTACH is a file operation, so external access must be on while the
-    // album's files are attached — and off, then locked, before any SQL the
-    // caller wrote can run. Same end state as `query`, reached in two steps.
-    return this.withQueryConn(
-      ":memory:",
-      async (conn, bounded) => {
-        for (const [i, r] of records.entries()) {
-          await conn.run(`ATTACH ${sqlString(r.record.dbPath)} AS s${i} (READ_ONLY)`);
-        }
-        await conn.run(`SET enable_external_access = false`);
-        await conn.run(`SET lock_configuration = true`);
-        // Top level = newest photo's tables.
-        const newestTables = records[0].record.manifest.tables.map((t) => t.name);
-        for (const t of newestTables) await conn.run(`CREATE VIEW "${t}" AS SELECT * FROM s0."${t}"`);
-        // history.<table> = every photo that has the table, tagged.
-        await conn.run(`CREATE SCHEMA history`);
-        const allTables = new Set(records.flatMap((r) => r.record.manifest.tables.map((t) => t.name)));
-        for (const t of allTables) {
-          if (t === "__meta") continue;
-          const parts = records
-            .map((r, i) => ({ r, i }))
-            .filter(({ r }) => r.record.manifest.tables.some((x) => x.name === t))
-            .map(({ r, i }) => `SELECT ${sqlString(r.takenAt)}::TIMESTAMPTZ AS taken_at, ${r.sourceSync === null ? "NULL::VARCHAR" : sqlString(r.sourceSync)} AS source_sync, * FROM s${i}."${t}"`);
-          await conn.run(`CREATE VIEW history."${t}" AS ${parts.join(" UNION ALL BY NAME ")}`);
-        }
-        const reader = await bounded(conn.runAndReadUntil(sql, this.cfg.maxQueryRows + 1));
-        return this.cappedResult(reader);
+    return this.untrusted(
+      "file.queryMany",
+      {
+        files: records.map((r) => ({ dbPath: r.record.dbPath, takenAt: r.takenAt, sourceSync: r.sourceSync, tables: r.record.manifest.tables.map((t) => t.name) })),
+        sql,
+        maxRows: this.cfg.maxQueryRows,
+        maxBytes: this.cfg.maxResultBytes,
+        ...this.bounded(this.cfg.queryTimeoutMs * 2),
       },
-      { timeoutMs: this.cfg.queryTimeoutMs * 2, config: {} },
+      this.cfg.queryTimeoutMs * 2,
+      `${records.length} snapshot${records.length === 1 ? "" : "s"} of a page, newest ${records[0].fileId}`,
     );
   }
 
@@ -1429,10 +1525,7 @@ export class FileStore {
     const record = await this.getOwnedRecord(fileId, requester);
     const guard = validateReadOnlySql(sql);
     if (!guard.ok) throw new FileStoreError(400, guard.error!);
-    return this.withQueryConn(record.dbPath, async (conn, bounded) => {
-      const reader = await bounded(conn.runAndReadUntil(sql, this.cfg.maxQueryRows + 1));
-      return this.cappedResult(reader);
-    });
+    return this.untrusted("file.query", { dbPath: record.dbPath, sql, maxRows: this.cfg.maxQueryRows, maxBytes: this.cfg.maxResultBytes, ...this.bounded(this.cfg.queryTimeoutMs) }, this.cfg.queryTimeoutMs, `file ${fileId}`);
   }
 
   /**
@@ -1568,30 +1661,12 @@ export class FileStore {
     let rowCount = 0;
     let columns: string[] = [];
     try {
-      await this.withQueryConn(
-        record.dbPath,
-        async (conn, bounded) => {
-          const result = await bounded(conn.stream(sql));
-          columns = result.columnNames();
-          const out = lineWriter(staged);
-          try {
-            for (;;) {
-              const chunk = await bounded(result.fetchChunk());
-              if (!chunk || chunk.rowCount === 0) break;
-              rowCount += chunk.rowCount;
-              if (rowCount > this.cfg.maxIngestRows) {
-                throw new FileStoreError(413, `Result has too many rows. Maximum is ${this.cfg.maxIngestRows.toLocaleString()}.`);
-              }
-              await out.write(chunk.getRowObjects(columns).map((r) => JSON.stringify(normalizeRow(r))).join("\n") + "\n");
-            }
-            await out.end();
-          } catch (err) {
-            out.destroy();
-            throw err;
-          }
-        },
-        { timeoutMs: EXPORT_STEP_TIMEOUT_MS },
-      );
+      ({ rowCount, columns } = await this.untrusted(
+        "file.materialize",
+        { dbPath: record.dbPath, sql, stagedPath: staged, maxIngestRows: this.cfg.maxIngestRows, ...this.bounded(EXPORT_STEP_TIMEOUT_MS) },
+        MATERIALIZE_TOTAL_MS,
+        `file ${fileId}, to a new file`,
+      ));
     } catch (err) {
       await rm(staged, { force: true }).catch(() => {});
       throw err;
@@ -1608,6 +1683,9 @@ export class FileStore {
     await this.withQueryConn(
       dbPath,
       async (conn, bounded) => {
+        // In a transaction, so that rows which stop coming can be told from
+        // rows that have ended (see ../whole.ts).
+        await conn.run("BEGIN TRANSACTION READ ONLY");
         const result = await bounded(conn.stream(`SELECT * FROM ${quoteIdent(table.name)} ${where} ${orderBy}`));
         const names = result.columnNames();
         const out = lineWriter(outPath);
@@ -1617,7 +1695,10 @@ export class FileStore {
           let heldEmpty = "";
           for (;;) {
             const chunk = await bounded(result.fetchChunk());
-            if (!chunk || chunk.rowCount === 0) break;
+            if (!chunk || chunk.rowCount === 0) {
+              if (!(await bounded(endedWhole(conn)))) throw new FileStoreError(500, "The table could not be read to its end, so no file was made of it. Try again.");
+              break;
+            }
             let text = "";
             for (const raw of chunk.getRowObjects(names)) {
               const row = normalizeRow(raw);
@@ -1976,32 +2057,12 @@ function csvField(s: string): string {
   return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
-/** Append-only UTF-8 text file with awaited writes, so memory stays at one chunk. */
-function lineWriter(path: string): {
-  write: (text: string) => Promise<void>;
-  end: () => Promise<void>;
-  /** Release the descriptor after a failure; `end` already closed it on success. */
-  destroy: () => void;
-} {
-  const out = createWriteStream(path, { encoding: "utf8" });
-  return {
-    write: (text) => new Promise((done, fail) => out.write(text, (err) => (err ? fail(err) : done()))),
-    end: () => new Promise((done, fail) => out.end((err?: Error | null) => (err ? fail(err) : done()))),
-    destroy: () => out.destroy(),
-  };
-}
 
 /** A cell value as CSV text: null and undefined are empty, everything else as-is. */
 function csvText(v: unknown): string {
   return v === null || v === undefined ? "" : String(v);
 }
 
-/** Drop rows from the end until the serialized payload fits the byte cap. */
-function fitBytes<T>(rows: T[], maxBytes: number): { rows: T[]; truncated: boolean } {
-  let out = rows;
-  while (out.length > 0 && byteLen(out) > maxBytes) out = out.slice(0, Math.max(1, Math.floor(out.length * 0.8)) - 1);
-  return { rows: out, truncated: out.length < rows.length };
-}
 
 /**
  * NDJSON → table. Types are inferred from the whole file, not a sample: a
@@ -2241,11 +2302,6 @@ function decodeTextBufferToUtf8(buffer: Buffer): { data: Buffer; reencoded?: str
   return { data: buffer };
 }
 
-/** Strip NUL bytes — they corrupt manifests and are rejected by some LLM APIs. */
-function stripNulls(s: string): string {
-  const NUL = String.fromCharCode(0);
-  return s.indexOf(NUL) === -1 ? s : s.split(NUL).join("");
-}
 
 function detectKind(filename: string): "csv" | "tsv" | "xlsx" | null {
   const ext = extname(filename).toLowerCase();
@@ -2259,10 +2315,6 @@ function mb(bytes: number): string {
   return (bytes / (1024 * 1024)).toFixed(1);
 }
 
-/** Single-quote a string for inline SQL (paths). Doubles embedded quotes. */
-function sqlString(s: string): string {
-  return `'${s.replace(/'/g, "''")}'`;
-}
 
 /** Double-quote a SQL identifier, escaping embedded double quotes. */
 function quoteIdent(name: string): string {
@@ -2309,90 +2361,8 @@ function isSafeMimeType(m: string): boolean {
   return /^[a-zA-Z0-9][a-zA-Z0-9!#$&^_\-.+]*\/[a-zA-Z0-9!#$&^_\-.+]+(;.*)?$/.test(m);
 }
 
-function byteLen(rows: unknown): number {
-  return Buffer.byteLength(JSON.stringify(rows ?? []), "utf8");
-}
 
-function normalizeRow(
-  row: Record<string, unknown>,
-  maxStringLen?: number,
-): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(row)) {
-    out[k] = normalizeValue(v, maxStringLen);
-  }
-  return out;
-}
 
-/**
- * DuckDB's neo client returns native JS values for primitives but typed
- * wrapper objects for temporal/decimal/nested types (e.g. DATE → {days},
- * DECIMAL → {width,scale,value}). Their `toString()` yields the canonical
- * SQL rendering ("2026-01-02", "3.14"), so we stringify wrappers and fall
- * back to a BigInt-safe JSON for anything without a useful toString.
- */
-export function normalizeValue(v: unknown, maxStringLen?: number): unknown {
-  if (v === null || v === undefined) return null;
-  const t = typeof v;
-  if (t === "bigint") {
-    const n = Number(v);
-    return Number.isSafeInteger(n) ? n : (v as bigint).toString();
-  }
-  if (t === "number" || t === "boolean") return v;
-  if (t === "string") return capStr(stripNulls(v as string), maxStringLen);
-  if (v instanceof Date) return v.toISOString();
-  if (t === "object") {
-    const s = safeToString(v);
-    if (s !== null) return capStr(stripNulls(s), maxStringLen);
-    try {
-      return JSON.parse(
-        JSON.stringify(v, (_k, val) => (typeof val === "bigint" ? val.toString() : val)),
-      );
-    } catch {
-      return String(v);
-    }
-  }
-  return v;
-}
 
-function safeToString(v: unknown): string | null {
-  try {
-    const s = (v as { toString(): string }).toString();
-    return s === "[object Object]" ? null : s;
-  } catch {
-    return null;
-  }
-}
 
-function capStr(s: string, maxLen?: number): string {
-  if (!maxLen || s.length <= maxLen) return s;
-  return `${s.slice(0, maxLen)}…`;
-}
 
-/**
- * Race a promise against a timeout. On timeout, run `onTimeout` (interrupts
- * the DuckDB connection, which is what actually stops a running query) and
- * reject with a 408.
- */
-function withTimeout<T>(p: Promise<T>, ms: number, onTimeout: () => void): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      try {
-        onTimeout();
-      } catch {
-        /* ignore */
-      }
-      reject(new FileStoreError(408, `Query exceeded the ${ms / 1000}s time limit.`));
-    }, ms);
-    p.then(
-      (v) => {
-        clearTimeout(timer);
-        resolve(v);
-      },
-      (err) => {
-        clearTimeout(timer);
-        reject(err);
-      },
-    );
-  });
-}

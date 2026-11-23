@@ -1116,6 +1116,16 @@ export interface ResourceDefinition {
 export interface AppServerConfig {
   authToken: string;
   /**
+   * Run SQL written by the assistant (over an uploaded file, a page's
+   * snapshot, or an app's records) in a process of its own. On by default,
+   * and it should stay on: a database cannot be made safe from a query
+   * written to break it, so such a query is given a process that can be
+   * stopped and replaced while the server goes on answering. Set to `false`
+   * only where a server may not start another process; such queries then run
+   * in the server itself.
+   */
+  isolateQueries?: boolean;
+  /**
    * The organization's time zone, as an IANA name ("Asia/Singapore"). It is the
    * zone in which an app's records are counted by day and by month: which
    * day an approval falls on, what "today" means to a query over the tables
