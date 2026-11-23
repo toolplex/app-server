@@ -15,10 +15,10 @@ db.exec(`
   CREATE TABLE monthly (year INTEGER, month INTEGER, sale_date TEXT, amt REAL);
   INSERT INTO monthly VALUES (2025,12,'2025-12-31',1),(2026,7,'2026-07-21',2),(2026,3,'2026-03-05',3),(NULL,9,NULL,4);
   CREATE TABLE secrets (k TEXT);
-  INSERT INTO dim_store VALUES ('TSB BAZAAR','Other'),('TSB BAZAAR','Other'),('SM AURA','SM'),('LONE','Other'),('LONE','Other');
+  INSERT INTO dim_store VALUES ('TOWN BAZAAR','Other'),('TOWN BAZAAR','Other'),('MALL ONE','MO'),('LONE','Other'),('LONE','Other');
   INSERT INTO dim_variant VALUES (142,'RED'),(142,'BLUE'),(7,'RED');
-  INSERT INTO dim_sku VALUES ('142','Burlington'),('0222','Burlington'),('PM','Puma');
-  INSERT INTO fact_sales VALUES ('142','TSB BAZAAR',30),('0222','TSB BAZAAR',60),('142','SM AURA',5),('PM','SM AURA',7),('PM','LONE',1);
+  INSERT INTO dim_sku VALUES ('142','Harborline'),('0222','Harborline'),('PM','Vento');
+  INSERT INTO fact_sales VALUES ('142','TOWN BAZAAR',30),('0222','TOWN BAZAAR',60),('142','MALL ONE',5),('PM','MALL ONE',7),('PM','LONE',1);
 `);
 const query = async (sql: string, params: unknown[]) => db.prepare(sql).all(...(params as any[])) as Record<string, unknown>[];
 const cfg = { dialect: "sqlite" as const, query, deniedTables: ["secrets"], sqlTools: ["execute_sql", "generate_from_sql"] };
@@ -28,13 +28,13 @@ const tables = await a.schema();
 assert.deepEqual(tables.map((t) => t.name).sort(), ["dim_sku", "dim_store", "dim_variant", "fact_sales", "monthly"]); // the denied table is absent
 assert.deepEqual(tables.find((t) => t.name === "dim_sku")!.columns.map((c) => c.name), ["stock_num", "brand"]);
 
-const d = await a.distinct({ table: "DIM_SKU", column: "Brand", values: ["BURLINGTON", "Pumas", ""] }) as any;
-assert.deepEqual(d.matches, [{ value: "Burlington", count: 2 }]); // found, in its real spelling
-assert.deepEqual(d.missing, [{ value: "Pumas", closest: [{ value: "Puma", count: 1 }] }]);
+const d = await a.distinct({ table: "DIM_SKU", column: "Brand", values: ["HARBORLINE", "Ventos", ""] }) as any;
+assert.deepEqual(d.matches, [{ value: "Harborline", count: 2 }]); // found, in its real spelling
+assert.deepEqual(d.missing, [{ value: "Ventos", closest: [{ value: "Vento", count: 1 }] }]);
 assert.match(((await a.distinct({ table: "secrets", column: "k", values: ["x"] })) as any).error, /unknown table/);
 assert.match(((await a.distinct({ table: "dim_sku", column: "nope\"; DROP", values: ["x"] })) as any).error, /unknown column/);
 
-// TSB BAZAAR repeats in both tables; LONE repeats only in dim_store; SM AURA only in fact_sales.
+// TOWN BAZAAR repeats in both tables; LONE repeats only in dim_store; MALL ONE only in fact_sales.
 assert.equal(((await a.repeats({ left: { table: "fact_sales", columns: ["store_name"] }, right: { table: "dim_store", columns: ["store_name"] } })) as any).repeated, 1);
 // a key that is unique on one side repeats nothing
 assert.equal(((await a.repeats({ left: { table: "fact_sales", columns: ["stock_num"] }, right: { table: "dim_sku", columns: ["stock_num"] } })) as any).repeated, 0);
@@ -53,6 +53,47 @@ assert.deepEqual(await a.latest({ table: "monthly", columns: ["year", "month"] }
 assert.deepEqual(((await a.latest({ table: "MONTHLY", columns: ["sale_date"] })) as any).latest, ["2026-07-21"]);
 assert.equal(((await a.latest({ table: "secrets", columns: ["k"] })) as any).latest, undefined);
 assert.match(((await a.latest({ table: "monthly", columns: [] })) as any).error, /1 to 3 columns/);
+
+// values in memory: a column asked about is loaded once, then answered without reading the table,
+// with the same matches and closest values as the SQL answer
+{
+  const reads: string[] = [];
+  const mem = createAnalytics({ ...cfg, warmRefreshMinutes: 5, query: (sql, params) => { reads.push(sql); return query(sql, params); } });
+  const viaSql = await mem.distinct({ table: "dim_sku", column: "brand", values: ["HARBORLINE", "Ventos"] }) as any;
+  await new Promise((r) => setTimeout(r, 20)); // the load runs behind the answer
+  reads.length = 0;
+  const viaMem = await mem.distinct({ table: "dim_sku", column: "brand", values: ["HARBORLINE", "Ventos"] }) as any;
+  assert.deepEqual(viaMem.matches, viaSql.matches);
+  assert.deepEqual(viaMem.missing, viaSql.missing);
+  assert.ok(!reads.some((q) => /FROM "dim_sku"/.test(q)), "answered from memory");
+}
+// configured columns are loaded at start; a number column is never kept
+{
+  const reads: string[] = [];
+  const warm = createAnalytics({ ...cfg, warmColumns: [{ table: "DIM_STORE", column: "Chain" }], query: (sql, params) => { reads.push(sql); return query(sql, params); } });
+  const stop = warm.startWarming();
+  await new Promise((r) => setTimeout(r, 30));
+  reads.length = 0;
+  assert.deepEqual(((await warm.distinct({ table: "dim_store", column: "chain", values: ["mo"] })) as any).matches, [{ value: "MO", count: 1 }]);
+  assert.ok(!reads.some((q) => /FROM "dim_store"/.test(q)), "configured column answered from memory");
+  await warm.distinct({ table: "fact_sales", column: "sold", values: ["30"] });
+  await new Promise((r) => setTimeout(r, 20));
+  reads.length = 0;
+  await warm.distinct({ table: "fact_sales", column: "sold", values: ["30"] });
+  assert.ok(reads.some((q) => /FROM "fact_sales"/.test(q)), "a number column is asked through SQL");
+  stop();
+}
+// where the complete data ends, when the client says; nothing when it does not or cannot
+{
+  const done = createAnalytics({ ...cfg, completeThrough: (table) => (table === "monthly" ? { through: "2026-05-31", rule: "a month counts once 60 days have passed since it ended" } : null) });
+  assert.deepEqual(await done.latest({ table: "monthly", columns: ["sale_date"] }),
+    { table: "monthly", columns: ["sale_date"], latest: ["2026-07-21"], complete_through: "2026-05-31", completeness: "a month counts once 60 days have passed since it ended" });
+  assert.equal(((await done.latest({ table: "fact_sales", columns: ["sold"] })) as any).complete_through, undefined);
+  const odd = createAnalytics({ ...cfg, completeThrough: () => ({ through: "last May" }) });
+  assert.equal(((await odd.latest({ table: "monthly", columns: ["sale_date"] })) as any).complete_through, undefined);
+  const throws = createAnalytics({ ...cfg, completeThrough: () => { throw new Error("no"); } });
+  assert.deepEqual(((await throws.latest({ table: "monthly", columns: ["sale_date"] })) as any).latest, ["2026-07-21"]);
+}
 
 // a view over a denied table shows its rows under another name: it is hidden too, and so is a view over that view
 db.exec(`
@@ -94,7 +135,7 @@ const on = Fastify();
 await on.register(registerAppPages, { authToken: "t", pages: {}, resources: {}, actions: {}, files: { enabled: false }, analytics: cfg });
 const h = { authorization: "Bearer t" };
 assert.equal((await on.inject({ url: "/analytics/schema" })).statusCode, 401);
-assert.deepEqual((await on.inject({ url: "/analytics/info", headers: h })).json(), { analytics_version: 5, dialect: "sqlite", sql_tools: ["execute_sql", "generate_from_sql"] });
+assert.deepEqual((await on.inject({ url: "/analytics/info", headers: h })).json(), { analytics_version: 6, dialect: "sqlite", sql_tools: ["execute_sql", "generate_from_sql"] });
 assert.equal((await on.inject({ url: "/capabilities", headers: h })).json().capabilities.analytics, true);
 const rep = await on.inject({ method: "POST", url: "/analytics/repeats", headers: h, payload: { left: { table: "fact_sales", columns: ["store_name"] }, right: { table: "dim_store", columns: ["store_name"] } } });
 assert.equal(rep.json().repeated, 1);

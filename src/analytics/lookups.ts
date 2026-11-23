@@ -7,7 +7,8 @@
 //   GET  /analytics/schema    tables and views with their columns and types
 //   POST /analytics/distinct  { table, column, values } → which values exist, and the closest real ones
 //   POST /analytics/repeats   { left, right } → how many join-key values repeat in both tables
-//   POST /analytics/latest    { table, columns } → the latest row by a date, or by a year and a month
+//   POST /analytics/latest    { table, columns } → the latest row by a date, or by a year and a month,
+//                             and where the complete data ends when the client says (completeThrough)
 //
 // Every route is read-only. Identifiers are only ever taken from the live
 // schema, never from the request, and values are bound as parameters, so a
@@ -39,22 +40,58 @@ export interface AnalyticsConfig {
    * The engine checks calls to these and nothing else.
    */
   sqlTools?: string[];
+  /**
+   * Text columns the engine's value check asks about most (a store's chain, a brand, a stock number).
+   * Their values are read into memory when the server starts and kept fresh, so the first question of
+   * the day is answered without scanning a large table. Any other text column joins them the first
+   * time it is asked about.
+   */
+  warmColumns?: Array<{ table: string; column: string }>;
+  /** How often a column's values in memory are re-read, in minutes (default 60). An older list is not used. */
+  warmRefreshMinutes?: number;
+  /**
+   * How far a table's data is complete, when the client knows. Data often keeps arriving after a period
+   * ends (sales keyed days or weeks late), so the latest row is not where the complete data ends.
+   * Called by the `latest` lookup with the table and the period column(s) asked about. Return the last
+   * date (YYYY-MM-DD) through which the data is complete and, in a few words, the rule behind it — or
+   * null when not known.
+   */
+  completeThrough?: (table: string, columns: string[]) => Promise<CompleteThrough | null> | CompleteThrough | null;
 }
+
+export interface CompleteThrough { through: string; rule?: string }
 
 export interface AnalyticsColumn { name: string; type: string }
 export interface AnalyticsTable { name: string; kind: "table" | "view"; columns: AnalyticsColumn[]; estimated_rows?: number }
 /** One side of a join: a table and the column(s) it is joined on. */
 export interface JoinSide { table?: string; columns?: unknown[] }
 
-export const ANALYTICS_VERSION = 5;
+export const ANALYTICS_VERSION = 6;
 const SCHEMA_TTL_MS = 10 * 60_000;
 const MAX_VALUES = 20;
 const MAX_CLOSEST_LOOKUPS = 8;
 const MAX_JOIN_COLUMNS = 6;
 const MAX_LATEST_COLUMNS = 3;
+/** A column with more distinct values than this is not kept in memory; it is asked through SQL every time. */
+const MAX_WARM_VALUES = 50_000;
+/** Columns kept in memory beyond the configured ones, learned from the questions asked. */
+const MAX_LEARNED_COLUMNS = 200;
+
+interface ValueList { at: number; byUpper: Map<string, { value: string; count: number }[]> }
 
 export function createAnalytics(deps: AnalyticsConfig) {
   let cached: { at: number; tables: AnalyticsTable[] } | null = null;
+  const refreshMs = Math.max(5, Number(deps.warmRefreshMinutes) || 60) * 60_000;
+  /** table\0column -> its values in memory */
+  const lists = new Map<string, ValueList>();
+  /** Columns with too many values to keep. */
+  const tooMany = new Set<string>();
+  /** Columns to keep fresh: the configured ones and those asked about. */
+  const kept = new Map<string, { table: string; column: string }>();
+  const loading = new Set<string>();
+  /** One load at a time: a refresh must not stack scans on the client's database. */
+  let loadQueue: Promise<void> = Promise.resolve();
+  let timer: ReturnType<typeof setInterval> | null = null;
   const denied = new Set((deps.deniedTables ?? []).map((t) => t.toLowerCase().replace(/"/g, "").replace(/^public\./, "")));
   /** Is a listed table (`name`, or `schema.name` outside public) on the deny list, however the list spells it? */
   const isDenied = (name: string) => { const n = name.toLowerCase(); return denied.has(n) || denied.has(n.slice(n.lastIndexOf(".") + 1)); };
@@ -161,10 +198,93 @@ export function createAnalytics(deps: AnalyticsConfig) {
     return { table: t.name, column: c.name, type: c.type } as const;
   }
 
+  const listKey = (table: string, column: string) => `${table}\u0000${column}`;
+
+  /** Read a column's values and counts into memory, behind any load already running. */
+  function loadList(table: string, column: string): Promise<void> {
+    const key = listKey(table, column);
+    if (loading.has(key) || tooMany.has(key)) return loadQueue;
+    loading.add(key);
+    loadQueue = loadQueue.then(async () => {
+      try {
+        const c = quoteIdent(column);
+        const rows = await deps.query(
+          `SELECT CAST(${c} AS TEXT) AS v, COUNT(*) AS n FROM ${quoteIdent(table)} WHERE ${c} IS NOT NULL GROUP BY 1 LIMIT ${MAX_WARM_VALUES + 1}`,
+          [],
+        );
+        if (rows.length > MAX_WARM_VALUES) { tooMany.add(key); lists.delete(key); kept.delete(key); return; }
+        const byUpper = new Map<string, { value: string; count: number }[]>();
+        for (const row of rows) {
+          const value = String(row.v);
+          const u = value.toUpperCase();
+          byUpper.set(u, [...(byUpper.get(u) ?? []), { value, count: Number(row.n) }]);
+        }
+        lists.set(key, { at: Date.now(), byUpper });
+      } catch {
+        // stays unknown: the next question is asked through SQL, and the next refresh tries again
+      } finally {
+        loading.delete(key);
+      }
+    });
+    return loadQueue;
+  }
+
+  /** Keep a column fresh from now on (a configured one, or one just asked about). */
+  function keep(table: string, column: string, learned: boolean) {
+    const key = listKey(table, column);
+    if (tooMany.has(key) || kept.has(key)) return;
+    if (learned && kept.size >= MAX_LEARNED_COLUMNS + (deps.warmColumns?.length ?? 0)) return;
+    kept.set(key, { table, column });
+    void loadList(table, column);
+  }
+
+  /**
+   * Load the configured columns now and re-read every kept column on the refresh interval.
+   * Called once by the routes; the returned function stops it.
+   */
+  function startWarming(): () => void {
+    void (async () => {
+      for (const w of deps.warmColumns ?? []) {
+        const r = await resolve(w.table, w.column).catch(() => null);
+        if (r && !("error" in r)) keep(r.table, r.column, false);
+      }
+    })();
+    if (!timer) {
+      timer = setInterval(() => { for (const k of kept.values()) void loadList(k.table, k.column); }, refreshMs);
+      timer.unref?.();
+    }
+    return () => { if (timer) clearInterval(timer); timer = null; };
+  }
+
+  /** The distinct answer from a column's values in memory: the same matches and closest values as the SQL below. */
+  function distinctFromMemory(list: ValueList, table: string, column: string, values: string[], limit: number) {
+    const matches: { value: string; count: number }[] = [];
+    const missing: { value: string; closest: { value: string; count: number }[] }[] = [];
+    for (const v of values) {
+      const hit = list.byUpper.get(v.toUpperCase());
+      if (hit) { matches.push(...hit); continue; }
+      const token = longestToken(v);
+      const patterns = token ? [token, token.slice(0, 4)].filter((p, i, a) => p.length >= 3 && a.indexOf(p) === i) : [];
+      let closest: { value: string; count: number }[] = [];
+      for (const pat of patterns) {
+        if (closest.length) break;
+        const p = pat.toUpperCase();
+        closest = [...list.byUpper.entries()].filter(([u]) => u.includes(p)).flatMap(([, e]) => e)
+          .sort((a, b) => b.count - a.count).slice(0, limit);
+      }
+      missing.push({ value: v, closest });
+    }
+    // matches in one spelling each, as GROUP BY returns them
+    const seen = new Set<string>();
+    return { table, column, matches: matches.filter((m) => (seen.has(m.value) ? false : (seen.add(m.value), true))), missing };
+  }
+
   /**
    * For each requested value: does it occur (case-insensitive, as the
    * clients' own filters compare), how often, and if not, the closest real
-   * values.
+   * values. A text column's values are answered from memory when a fresh
+   * list is held; otherwise from the table, and the column is loaded for
+   * the next question.
    */
   async function distinct(body: { table?: string; column?: string; values?: unknown[]; limit?: number }) {
     if (!body?.table || !body?.column) return { error: "table and column are required" };
@@ -178,6 +298,11 @@ export function createAnalytics(deps: AnalyticsConfig) {
       .filter((v) => v !== null && v !== undefined && String(v).length > 0)
       .slice(0, MAX_VALUES)
       .map((v) => String(v));
+
+    const key = listKey(r.table, r.column);
+    const list = lists.get(key);
+    if (list && Date.now() - list.at < refreshMs) return distinctFromMemory(list, r.table, r.column, values, limit);
+    if (typeFamily(r.type) === "text") keep(r.table, r.column, true);
 
     const matches: { value: string; count: number }[] = [];
     if (values.length) {
@@ -311,10 +436,17 @@ export function createAnalytics(deps: AnalyticsConfig) {
         ` ORDER BY ${resolved.map((c) => `${quoteIdent(c)} DESC`).join(", ")} LIMIT 1`,
       [],
     );
-    return { table, columns: resolved, latest: rows[0] ? resolved.map((_, i) => String(rows[0][`c${i + 1}`])) : null };
+    const out = { table, columns: resolved, latest: rows[0] ? resolved.map((_, i) => String(rows[0][`c${i + 1}`])) : null };
+    // Where the complete data ends, when the client knows: said beside the latest row, never instead of it.
+    let complete: CompleteThrough | null = null;
+    try { complete = deps.completeThrough ? await deps.completeThrough(table, resolved) : null; } catch { complete = null; }
+    if (complete && /^\d{4}-\d{2}-\d{2}$/.test(String(complete.through))) {
+      return { ...out, complete_through: String(complete.through), ...(complete.rule ? { completeness: String(complete.rule) } : {}) };
+    }
+    return out;
   }
 
-  return { schema, distinct, repeats, latest, resolve };
+  return { schema, distinct, repeats, latest, resolve, startWarming };
 }
 
 /** Types that compare with each other without a cast: numbers, text, dates. "" when the type is not known. */
@@ -337,6 +469,8 @@ function longestToken(v: string): string | null {
 /** Routes under /analytics, inside the plugin's auth scope. */
 export function registerAnalyticsRoutes(app: FastifyInstance, deps: AnalyticsConfig): void {
   const analytics = createAnalytics(deps);
+  const stopWarming = analytics.startWarming();
+  app.addHook("onClose", async () => stopWarming());
   const guard = async <T>(reply: { code: (n: number) => { send: (b: unknown) => unknown } }, run: () => Promise<T>) => {
     try {
       const out = await run();
