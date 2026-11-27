@@ -45,7 +45,11 @@ const decode = (s: string): string =>
     .replace(/&apos;/g, "'")
     .replace(/&amp;/g, "&");
 
-const attr = (tag: string, name: string): string | undefined => new RegExp(`(?:^|\\s)${name}="([^"]*)"`).exec(tag)?.[1];
+/** An attribute of a tag, by its whole name, in either kind of quotes. */
+const attr = (tag: string, name: string): string | undefined => {
+  const m = new RegExp(`(?:^|\\s)${name}=(?:"([^"]*)"|'([^']*)')`).exec(tag);
+  return m ? (m[1] ?? m[2]) : undefined;
+};
 
 /** The formula cells of one sheet's XML. */
 export function formulasInSheetXml(xml: string, sheet: string, cannotCarry: string[]): SheetFormulas {
@@ -139,35 +143,45 @@ export async function formulasInFile(file: Buffer): Promise<WorkbookFormulas> {
   // One that is a constant, a formula or a whole column it drops or cuts
   // short, and whatever uses the name then shows an error or another figure:
   // that is said before the workbook is loaded. A name that is already dead
-  // (#REF!) has nothing to lose. A hidden name belongs to a feature of Excel
-  // or an add-in (Solver's settings); it is left behind, and that is noted.
+  // (#REF!) has nothing to lose. A hidden name of that kind belongs to a
+  // feature of Excel or an add-in (Solver's settings): unless a formula uses
+  // it, it is left behind, and that is noted.
   const names = new Map<string, string>();
   const notes: string[] = [];
   const PLAIN_RANGES = /^[^!,]+!\$?[A-Za-z]{1,3}\$?\d+(:\$?[A-Za-z]{1,3}\$?\d+)?(,[^!,]+!\$?[A-Za-z]{1,3}\$?\d+(:\$?[A-Za-z]{1,3}\$?\d+)?)*$/;
-  let hidden = 0;
+  const usedIn = (name: string): string | undefined => {
+    const token = new RegExp(`(?<![A-Za-z0-9_.])${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![A-Za-z0-9_.(])`, "i");
+    for (const [sheet, cells] of sheets) for (const [address, says] of cells) if (token.test(says)) return `${sheet}!${address}`;
+    return undefined;
+  };
+  let leftBehind = 0;
   for (const m of workbook.matchAll(/<definedName\s([^>]*)>([^<]*)<\/definedName>/g)) {
     const name = decode(attr(m[1], "name") ?? "");
     if (/^_xlnm\./i.test(name)) continue; // print areas, print titles, filters: Excel's own
     // A sheet name is written with or without quotes; the two mean the same.
     const refersTo = decode(m[2]).replace(/'([^'!]+)'!/g, "$1!");
     if (refersTo.includes("#REF!")) continue;
-    if (attr(m[1], "hidden") === "1") {
-      hidden++;
-      continue;
+    if (!PLAIN_RANGES.test(refersTo)) {
+      const hidden = ["1", "true"].includes(attr(m[1], "hidden") ?? "");
+      const where = hidden ? usedIn(name) : undefined;
+      if (hidden && !where) {
+        leftBehind++;
+        continue;
+      }
+      cannotCarry.push(`the name "${name}" (${refersTo.slice(0, 60)}), which is not a plain range of cells${where ? ` and which a formula uses (${where})` : ""}`);
     }
-    if (!PLAIN_RANGES.test(refersTo)) cannotCarry.push(`the name "${name}" (${refersTo.slice(0, 60)}), which is not a plain range of cells`);
     // A name may belong to one sheet only. The copy keeps one name of each
     // spelling for the whole workbook, which is the same thing unless two
     // sheets each have their own.
     if (names.has(name)) cannotCarry.push(`the name "${name}", which more than one sheet defines for itself`);
     names.set(name, refersTo);
   }
-  if (hidden > 0) notes.push(`The original workbook has ${hidden} hidden name${hidden === 1 ? "" : "s"} (settings of an Excel feature or an add-in, such as Solver). They are not carried into this copy.`);
+  if (leftBehind > 0) notes.push(`The original workbook has ${leftBehind} hidden name${leftBehind === 1 ? "" : "s"} that no formula uses (settings of an Excel feature or an add-in, such as Solver). They are not carried into this copy.`);
   // How the workbook calculates. The copy is set to calculate in full when it
   // is opened; two settings change what a formula's result IS, and are lost.
   const calc = /<calcPr\s[^>]*>/.exec(workbook)?.[0] ?? "";
-  if (attr(calc, "fullPrecision") === "0") cannotCarry.push('the setting "precision as displayed", under which figures are rounded to what their cells show');
-  if (attr(calc, "iterate") === "1") cannotCarry.push("iterative calculation, which formulas that refer to themselves depend on");
+  if (["0", "false"].includes(attr(calc, "fullPrecision") ?? "")) cannotCarry.push('the setting "precision as displayed", under which figures are rounded to what their cells show');
+  if (["1", "true"].includes(attr(calc, "iterate") ?? "")) cannotCarry.push("iterative calculation, which formulas that refer to themselves depend on");
   return { sheets, names, cannotCarry, notes, formulas };
 }
 

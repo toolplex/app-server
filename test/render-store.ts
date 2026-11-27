@@ -471,7 +471,16 @@ async function main(): Promise<void> {
     check("a name that is already dead has nothing to lose", (await fillOf(await crafted("dead", withNames('<definedName name="Old">#REF!</definedName><definedName name="Older">Data!#REF!</definedName>')))).message === "");
     const solverId = await crafted("solver", withNames('<definedName name="solver_adj" hidden="1">Data!$B$2</definedName><definedName name="solver_opt" hidden="1">0.5</definedName>'));
     const solver = await store.renderXlsx({ title: "solver", base: { fileId: solverId }, ops: [{ op: "fill_by_key", sheet: "Data", key: { sheet: "CODE", data: "c" }, set: { SOLD: "q" }, source: { rows: [{ c: "A-1", q: 5 }] } }] }, requester);
-    check("hidden names are left behind with a note, not a refusal", (solver.manifest.notes ?? []).some((n) => /original workbook has 2 hidden names .*They are not carried into this copy/.test(n)));
+    check("a hidden name that no formula uses is left behind with a note, not a refusal", (solver.manifest.notes ?? []).some((n) => /original workbook has 1 hidden name that no formula uses .*They are not carried into this copy/.test(n)));
+    const usedHidden = await fillOf(
+      await crafted("usedhidden", async (zip) => {
+        await withNames('<definedName name="TaxRate" hidden="1">0.12</definedName>')(zip);
+        await change(zip, "xl/worksheets/sheet2.xml", /<f>Data!B3\*2<\/f>/, "<f>Data!B3*TaxRate</f>");
+      }),
+    );
+    check("a hidden name that a formula uses is refused: the formula would show an error", usedHidden.status === 422 && /cannot carry: the name "TaxRate" \(0\.12\), which is not a plain range of cells and which a formula uses \(Calc!B3\)/.test(usedHidden.message));
+    const spelled = await fillOf(await crafted("spelled", (zip) => change(zip, "xl/workbook.xml", "<calcPr ", "<calcPr iterate='true' fullPrecision=\"false\" ")));
+    check("the settings are read however they are spelled", spelled.status === 422 && /precision as displayed/.test(spelled.message) && /iterative calculation/.test(spelled.message));
     // What Excel keeps for itself, and a sheet name that needs quotes, are no obstacle.
     const ordinary = new ExcelJS.Workbook();
     const od = ordinary.addWorksheet("My Data");

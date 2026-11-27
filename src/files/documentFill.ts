@@ -119,6 +119,8 @@ export interface OpReport {
   rowsThatReadLikeHeadings?: number[];
   /** Columns whose values were written as the column already holds its values, not as the data gave them: header → "dates", "numbers", "digits kept as text". */
   writtenAs?: Record<string, string>;
+  /** Columns that were given dates as text and wrote them as text, the column giving no sign of holding real dates. */
+  datesAsText?: string[];
   /** append_rows: what on the sheet is set to a range that does not take in the rows added (a filter, a print area). */
   doesNotCover?: string[];
   emptyValuesLeft?: number;
@@ -460,16 +462,26 @@ const isText = (v: unknown): boolean => typeof v === "string" || (typeof v === "
 type Span = { c1: number; c2: number };
 
 /**
- * The table's own columns: the unbroken run of headings on the header row
- * that holds the columns named. A list, a legend or another table standing
- * beside it, past an empty column, is not part of its rows: a row that is
- * empty across the table is an empty row whatever sits out there.
+ * The columns a row is read across: from the first column the op names to
+ * the last. Not the whole sheet row, where a list, a legend or another
+ * table standing beside this one would make an empty row look filled; and
+ * not further along the header row either, since such a list may stand
+ * directly against the table with headings of its own.
  */
-function headerSpan(ws: ExcelJS.Worksheet, headerRow: number, cols: number[]): Span {
+function headerSpan(cols: number[]): Span {
+  return { c1: Math.min(...cols), c2: Math.max(...cols) };
+}
+
+/**
+ * The same, taken as far as the header row's headings run unbroken: every
+ * column that may belong to the table. Used where reading too much is the
+ * safe mistake (is there a formula in the table's last row?), never to judge
+ * whether a row is empty.
+ */
+function headerRun(ws: ExcelJS.Worksheet, headerRow: number, cols: number[]): Span {
   const row = ws.getRow(headerRow);
   const filled = (c: number) => c >= 1 && !isEmptyValue(row.getCell(c).value);
-  let c1 = Math.min(...cols);
-  let c2 = Math.max(...cols);
+  let { c1, c2 } = headerSpan(cols);
   while (filled(c1 - 1)) c1--;
   while (filled(c2 + 1)) c2++;
   return { c1, c2 };
@@ -539,40 +551,17 @@ function rowAsRead(row: ExcelJS.Row, span: Span): string {
 }
 
 // --- Writing like the column ---------------------------------------------------
-
-/**
- * What a column already holds, when every filled cell looked at is one
- * thing: dates, numbers, or digits kept as text (a branch "103", a code
- * "0222"). Formulas, merged cells and placeholders are passed over; anything
- * else, or a mixture, says nothing.
- */
-type ColumnKind = "dates" | "numbers" | "digits kept as text";
-
-function kindOfColumn(ws: ExcelJS.Worksheet, col: number, rows: number[]): { kind: ColumnKind; like: ExcelJS.Cell } | null {
-  let kind: ColumnKind | null = null;
-  let like: ExcelJS.Cell | null = null;
-  let seen = 0;
-  for (const r of rows) {
-    if (seen >= 25) break;
-    const cell = ws.getRow(r).getCell(col);
-    if (cell.isMerged || isFormula(cell)) continue;
-    const v = cell.value as unknown;
-    if (isEmptyValue(v)) continue;
-    let k: ColumnKind;
-    if (v instanceof Date) k = "dates";
-    else if (typeof v === "number") k = "numbers";
-    else if (typeof v === "string") {
-      if (PLACEHOLDER.test(v.trim())) continue;
-      if (!/^\d+$/.test(v.trim())) return null;
-      k = "digits kept as text";
-    } else return null;
-    if (kind !== null && kind !== k) return null;
-    kind = k;
-    like = like ?? cell;
-    seen++;
-  }
-  return kind && like ? { kind, like } : null;
-}
+//
+// Data arrives as it was fetched, and a date is always fetched as text.
+// Written as it came, it would sit as text under a column of dates, and
+// nothing that reads that column by date (a total for a month, the latest
+// date) would count it. So the sheet's own cells say how a column's values
+// are to be written.
+//
+// The decision is made once for a whole column, never value by value: a
+// column that came out part numbers and part text would add up wrong without
+// looking wrong. Where the data cannot all be written as the column holds
+// its values, the op is refused with the column named.
 
 /** "2026-11-04", or with a time of day and no zone: the day (and time) as written. */
 function dateFromText(s: string): Date | null {
@@ -583,38 +572,96 @@ function dateFromText(s: string): Date | null {
   return date.getUTCFullYear() === y && date.getUTCMonth() === mo - 1 && date.getUTCDate() === d && h < 24 && mi < 60 && se < 60 ? date : null;
 }
 
+/** A number written out plainly: no leading zeros, no separators, no more digits than a number holds exactly. */
+const PLAIN_NUMBER = /^-?(0|[1-9]\d{0,14})(\.\d+)?$/;
+
+/** Does a number format show a date or a time? (The test the workbook library itself applies when it reads a cell.) */
+function isDateFormat(fmt: string | undefined): boolean {
+  if (!fmt) return false;
+  return /[ymdhMsb]+/.test(fmt.replace(/\[[^\]]*]/g, "").replace(/"[^"]*"/g, ""));
+}
+
+interface ColumnFit {
+  /** The value as this column is to hold it. */
+  write: (v: ExcelJS.CellValue) => ExcelJS.CellValue;
+  /** How the values were changed, if they were: "dates", "numbers", "digits kept as text". */
+  as?: string;
+  /** The column holds dates: the format its dates are shown in. */
+  dateFormat?: string;
+  holdsDates: boolean;
+  /** The data's dates were left as text, the column giving no sign of holding real dates. */
+  datesLeftAsText: boolean;
+}
+
 /**
- * A value as the column it goes into holds its values. Data arrives as it
- * was fetched, and a date is always fetched as text: written as it came, it
- * would sit as text under a column of dates, and nothing that reads that
- * column by date (a total for a month, the latest date) would count it. So
- * the sheet's own cells decide: text that is a date becomes a date under
- * dates, text that is a number becomes a number under numbers, and a whole
- * number becomes text under digits kept as text (so that a lookup on the
- * code still finds it). Returns the value, and how it was changed if it was.
+ * How the values of one data column are to be written into one sheet
+ * column. `evidence` are the sheet rows whose cells show what the column
+ * holds; `into` are the cells about to be written; `values` what the data
+ * gives for them.
  */
-function asTheColumnHolds(v: ExcelJS.CellValue, column: { kind: ColumnKind; like: ExcelJS.Cell } | null): { value: ExcelJS.CellValue; as?: ColumnKind } {
-  if (!column || v === null) return { value: v };
-  if (column.kind === "dates" && typeof v === "string") {
-    const date = dateFromText(v);
-    return date ? { value: date, as: "dates" } : { value: v };
+function fitColumn(what: string, header: string, ws: ExcelJS.Worksheet, col: number, evidence: number[], into: ExcelJS.Cell[], values: ExcelJS.CellValue[]): ColumnFit {
+  let dates = 0;
+  let numbers = 0;
+  let digits = 0;
+  let words = 0;
+  let aDate: ExcelJS.Cell | undefined;
+  for (const r of evidence) {
+    const cell = ws.getRow(r).getCell(col);
+    if (cell.isMerged || isFormula(cell)) continue;
+    const v = cell.value as unknown;
+    if (isEmptyValue(v)) continue;
+    if (v instanceof Date) {
+      dates++;
+      aDate = aDate ?? cell;
+    } else if (typeof v === "number") numbers++;
+    else if (typeof v === "string" && PLACEHOLDER.test(v.trim())) continue;
+    else if (typeof v === "string" && /^\d+$/.test(v.trim())) digits++;
+    else words++;
   }
-  if (column.kind === "numbers" && typeof v === "string" && /^-?(0|[1-9]\d{0,14})(\.\d+)?$/.test(v.trim())) return { value: Number(v), as: "numbers" };
-  if (column.kind === "digits kept as text" && typeof v === "number" && Number.isSafeInteger(v) && v >= 0) return { value: String(v), as: "digits kept as text" };
-  return { value: v };
+  const total = dates + numbers + digits + words;
+  const given = values.filter((v) => v !== null && !(typeof v === "string" && v.trim() === ""));
+  const texts = given.filter((v): v is string => typeof v === "string");
+  const same: ColumnFit = { write: (v) => v, holdsDates: false, datesLeftAsText: false };
+  if (given.length === 0) return { ...same, holdsDates: dates > 0 && dates >= 0.8 * total };
+  const allDates = given.every((v) => v instanceof Date || (typeof v === "string" && dateFromText(v) !== null));
+
+  // A column of dates (a stray word or figure in it changes nothing).
+  if (dates > 0 && dates >= 0.8 * total) {
+    const bad = given.find((v) => !(v instanceof Date) && !(typeof v === "string" && dateFromText(v) !== null));
+    if (bad !== undefined) {
+      throw new DocOpError(`${what}: the column "${header}" holds dates in the sheet (${aDate!.address}), and the data gives ${JSON.stringify(bad)} for it, which is not a date. Written as it is, it would not count as a date in anything that reads the column. Give dates as YYYY-MM-DD. Nothing was written.`);
+    }
+    return { write: (v) => (typeof v === "string" && v.trim() !== "" ? dateFromText(v) : v), as: texts.length > 0 ? "dates" : undefined, dateFormat: isDateFormat(aDate!.numFmt) ? aDate!.numFmt : undefined, holdsDates: true, datesLeftAsText: false };
+  }
+  // Dates for a column with nothing in it yet: the cells' own format says whether they are meant as dates.
+  if (allDates && texts.length > 0) {
+    const formatted = into.filter((c) => isDateFormat(c.numFmt)).length;
+    if (total === 0 && into.length > 0 && formatted === into.length) return { write: (v) => (typeof v === "string" && v.trim() !== "" ? dateFromText(v) : v), as: "dates", holdsDates: true, datesLeftAsText: false };
+    return { ...same, datesLeftAsText: true };
+  }
+  // A column of numbers: text that is a number is written as one; any other text is not for this column.
+  if (numbers > 0 && numbers >= 0.8 * total && texts.length > 0) {
+    const bad = texts.find((v) => !PLAIN_NUMBER.test(v.trim()) && !PLACEHOLDER.test(v.trim()));
+    if (bad !== undefined) {
+      throw new DocOpError(`${what}: the column "${header}" holds numbers in the sheet, and the data gives ${JSON.stringify(bad)} for it, which is text and not a plain number. Written as it is, it would be left out of every total. Give plain numbers (no separators, signs or leading zeros; a code that needs its zeros does not belong under a column of numbers). Nothing was written.`);
+    }
+    return { write: (v) => (typeof v === "string" && PLAIN_NUMBER.test(v.trim()) ? Number(v) : v), as: texts.some((v) => PLAIN_NUMBER.test(v.trim())) ? "numbers" : undefined, holdsDates: false, datesLeftAsText: false };
+  }
+  // A column of digits kept as text (a branch "103", a code "0222"), more
+  // than one cell of it and nothing else: whole numbers are written as text
+  // too, so that a lookup on the code still finds them. A figure with a
+  // fraction or a minus sign is no code, and then nothing is changed.
+  if (digits >= 2 && digits === total && texts.length === 0 && given.every((v) => typeof v === "number" && Number.isSafeInteger(v) && v >= 0)) {
+    return { write: (v) => (typeof v === "number" ? String(v) : v), as: "digits kept as text", holdsDates: false, datesLeftAsText: false };
+  }
+  return same;
 }
 
-/** Under a column of dates, anything that is not a date would be left out by whatever reads the column by date. */
-function refuseNonDates(what: string, header: string, column: { kind: ColumnKind; like: ExcelJS.Cell } | null, values: unknown[]): void {
-  if (column?.kind !== "dates") return;
-  const bad = values.find((v) => v !== null && v !== undefined && !(v instanceof Date) && !(typeof v === "string" && (v.trim() === "" || dateFromText(v) !== null)));
-  if (bad === undefined) return;
-  throw new DocOpError(`${what}: the column "${header}" holds dates in the sheet (${column.like.address}), and the data gives ${JSON.stringify(bad)} for it, which is not a date. Written as it is, it would not count as a date in anything that reads the column. Give dates as YYYY-MM-DD. Nothing was written.`);
-}
-
-/** A cell that takes a date shows it as the column's other dates are shown. */
-function showLike(cell: ExcelJS.Cell, like: ExcelJS.Cell): void {
-  if (like.numFmt && (!cell.numFmt || cell.numFmt === "General")) cell.numFmt = like.numFmt;
+/** A date is only a date in a cell whose format shows one: otherwise it is saved, and read back, as a bare number. */
+function writeDate(cell: ExcelJS.Cell, value: Date, format: string | undefined): void {
+  // The style is set on this cell alone: cells loaded from one file share their style object.
+  if (!isDateFormat(cell.numFmt)) cell.style = { ...cell.style, numFmt: format ?? "yyyy-mm-dd" };
+  cell.value = value;
 }
 
 export function fillByKey(ws: ExcelJS.Worksheet, a: FillByKeyArgs): { report: OpReport; written: Written; released: string[] } {
@@ -703,7 +750,7 @@ export function fillByKey(ws: ExcelJS.Worksheet, a: FillByKeyArgs): { report: Op
   // The columns that are to receive figures: a column of numbers in the data,
   // or any column when rows without data are to be given 0.
   const figureCols = targetCols.filter((_, t) => unmatched === "zero" || a.rows.some((r) => typeof r[targets[t][1]] === "number" || typeof r[targets[t][1]] === "bigint"));
-  const span = headerSpan(ws, header.row, [...keyCols, ...targetCols]);
+  const span = headerSpan([...keyCols, ...targetCols]);
   // The row said to hold the headers must not be a row of the table itself.
   if (a.headerRow !== undefined) {
     const own = keyCols.map((c) => cellText(ws.getRow(header.row).getCell(c))).join(SEP);
@@ -954,7 +1001,7 @@ export function fillByKey(ws: ExcelJS.Worksheet, a: FillByKeyArgs): { report: Op
   }
 
   // Everything is checked before anything is written.
-  const plan: Array<{ cell: ExcelJS.Cell; value: ExcelJS.CellValue }> = [];
+  const plan: Array<{ cell: ExcelJS.Cell; value: ExcelJS.CellValue; dateFormat?: string }> = [];
   const problems: Array<{ address: string; why: string }> = [];
   let emptyValuesLeft = 0;
   let unmatchedCellsSet = 0;
@@ -964,22 +1011,25 @@ export function fillByKey(ws: ExcelJS.Worksheet, a: FillByKeyArgs): { report: Op
   const keptRows = new Set<number>();
   const staleIfLeft: Array<{ address: string; key: string; column: string }> = [];
   // What each column to fill already holds, read from the table's own rows.
-  const holds = targetCols.map((c) => kindOfColumn(ws, c, sheetRows.map((s) => s.row)));
-  targets.forEach(([h, d], t) => refuseNonDates("fill_by_key", h, holds[t], [...match.values()].map((row) => row[d])));
-  const writtenAs = new Map<string, ColumnKind>();
-  const dated: Array<{ cell: ExcelJS.Cell; like: ExcelJS.Cell }> = [];
+  const tableRows = sheetRows.map((s) => s.row);
+  const fits = targets.map(([h, d], t) =>
+    fitColumn(
+      "fill_by_key",
+      h,
+      ws,
+      targetCols[t],
+      tableRows,
+      [...match.keys()].map((r) => ws.getRow(r).getCell(targetCols[t])),
+      [...match.values()].map((row) => toCellValue(row[d])),
+    ),
+  );
   for (const s of sheetRows) {
     const d = match.get(s.row);
     const row = ws.getRow(s.row);
     for (let t = 0; t < targets.length; t++) {
       const cell = row.getCell(targetCols[t]);
       if (d) {
-        const fitted = asTheColumnHolds(toCellValue(d[targets[t][1]]), holds[t]);
-        const value = fitted.value;
-        if (fitted.as) {
-          writtenAs.set(targetHeaders[t], fitted.as);
-          if (fitted.as === "dates") dated.push({ cell, like: holds[t]!.like });
-        }
+        const value = fits[t].write(toCellValue(d[targets[t][1]]));
         if (value === null) {
           // In a refresh, no value in the data against a figure in the sheet
           // would leave last period's figure standing as if it were this one's.
@@ -989,7 +1039,7 @@ export function fillByKey(ws: ExcelJS.Worksheet, a: FillByKeyArgs): { report: Op
         }
         const why = blocked(cell, overwrite);
         if (why) problems.push({ address: cell.address, why });
-        else plan.push({ cell, value });
+        else plan.push({ cell, value, dateFormat: fits[t].dateFormat });
         continue;
       }
       // A row with a key and no data may be an item that sold nothing, or
@@ -1010,7 +1060,8 @@ export function fillByKey(ws: ExcelJS.Worksheet, a: FillByKeyArgs): { report: Op
         keptRows.add(s.row);
         continue;
       }
-      if (unmatched === "zero") {
+      // A 0 is a figure: it does not go under a column of dates.
+      if (unmatched === "zero" && !fits[t].holdsDates) {
         plan.push({ cell, value: 0 });
         unmatchedCellsSet++;
       }
@@ -1030,10 +1081,13 @@ export function fillByKey(ws: ExcelJS.Worksheet, a: FillByKeyArgs): { report: Op
   const released = releaseSharedFormulas(ws, planned);
   const written: Written = new Map();
   for (const p of plan) {
-    p.cell.value = p.value;
+    if (p.value instanceof Date) writeDate(p.cell, p.value, p.dateFormat);
+    else p.cell.value = p.value;
     written.set(p.cell.address, p.value);
   }
-  for (const x of dated) if (planned.has(x.cell.address)) showLike(x.cell, x.like);
+  const writtenAs: Record<string, string> = {};
+  targetHeaders.forEach((h, t) => void (fits[t].as && (writtenAs[h] = fits[t].as!)));
+  const datesAsText = targetHeaders.filter((_, t) => fits[t].datesLeftAsText);
 
   const without = sheetRows.filter((s) => !match.has(s.row));
   const unusedData = [...data.keys()].filter((id) => !usedData.has(id));
@@ -1061,7 +1115,8 @@ export function fillByKey(ws: ExcelJS.Worksheet, a: FillByKeyArgs): { report: Op
     ...(stoppedAtRow !== undefined ? { stoppedAtRow, stoppedBecause, dataKeysBelowStop: below.size } : below.size > 0 ? { dataKeysBelowLastRow: below.size } : {}),
     ...(headerRowsPassed > 0 ? { headerRowsPassed } : {}),
     ...(headingsInside.length > 0 ? { rowsThatReadLikeHeadings: headingsInside.slice(0, SAMPLE) } : {}),
-    ...(writtenAs.size > 0 ? { writtenAs: Object.fromEntries(writtenAs) } : {}),
+    ...(Object.keys(writtenAs).length > 0 ? { writtenAs } : {}),
+    ...(datesAsText.length > 0 ? { datesAsText } : {}),
     ...(emptyValuesLeft > 0 ? { emptyValuesLeft } : {}),
     rowsWritten: rowsTouched.size,
     cellsWritten: plan.length,
@@ -1095,11 +1150,12 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
   refuseMixedTypes(rows, names);
   const header = findHeaderRow(ws, names);
   // The table's own last row: a list standing beside the table may run further down.
-  const span = headerSpan(ws, header.row, names.map((n) => header.cols.get(n)!));
+  const span = headerSpan(names.map((n) => header.cols.get(n)!));
   const end = Math.max(lastRowIn(ws, span), header.row);
   const NEW_WORKBOOK = "Build a new workbook from the full data instead.";
   const inLastRow: string[] = [];
-  if (end > header.row) eachCellIn(ws.getRow(end), span, (cell) => void (isFormula(cell) && inLastRow.push(cell.address)));
+  // A column the table works out belongs to it whether or not the op names it.
+  if (end > header.row) eachCellIn(ws.getRow(end), headerRun(ws, header.row, names.map((n) => header.cols.get(n)!)), (cell) => void (isFormula(cell) && inLastRow.push(cell.address)));
   if (inLastRow.length > 0) {
     throw new DocOpError(
       `The last row of sheet "${ws.name}" that holds anything (row ${end}) has formulas (${inLastRow.slice(0, 4).join(", ")}${inLastRow.length > 4 ? ", …" : ""}). Either it is the sheet's totals, which rows added below would be left out of, or every row works a column out with a formula, which rows added here would not have. Nothing was added. ${NEW_WORKBOOK}`,
@@ -1162,23 +1218,29 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
   }
   // What each column already holds, read from the rows nearest the foot of the table.
   const above = Array.from({ length: end - header.row }, (_, i) => end - i);
-  const holds = new Map(names.map((n) => [n, kindOfColumn(ws, header.cols.get(n)!, above)] as const));
-  for (const n of names) refuseNonDates("append_rows", n, holds.get(n) ?? null, rows.map((r) => r[n]));
+  const fits = new Map(
+    names.map((n) => {
+      const col = header.cols.get(n)!;
+      const into = rows.map((_, i) => ws.getRow(end + 1 + i).getCell(col));
+      return [n, fitColumn("append_rows", n, ws, col, above, into, rows.map((r) => toCellValue(r[n])))] as const;
+    }),
+  );
   const written: Written = new Map();
-  const writtenAs = new Map<string, ColumnKind>();
   rows.forEach((r, i) => {
     const row = ws.getRow(end + 1 + i);
     for (const n of names) {
-      const column = holds.get(n) ?? null;
-      const fitted = asTheColumnHolds(toCellValue(r[n]), column);
-      if (fitted.value === null) continue;
+      const fit = fits.get(n)!;
+      const value = fit.write(toCellValue(r[n]));
+      if (value === null) continue;
       const cell = row.getCell(header.cols.get(n)!);
-      cell.value = fitted.value;
-      written.set(cell.address, fitted.value);
-      if (fitted.as) writtenAs.set(n, fitted.as);
-      if (fitted.as === "dates") showLike(cell, column!.like);
+      if (value instanceof Date) writeDate(cell, value, fit.dateFormat);
+      else cell.value = value;
+      written.set(cell.address, value);
     }
   });
+  const writtenAs: Record<string, string> = {};
+  for (const n of names) if (fits.get(n)!.as) writtenAs[n] = fits.get(n)!.as!;
+  const datesAsText = names.filter((n) => fits.get(n)!.datesLeftAsText);
   const cols = names.map((n) => header.cols.get(n)!);
   // A filter or a print area is set to a range; the rows added lie below it.
   const doesNotCover: string[] = [];
@@ -1193,7 +1255,8 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
       range: `${addr(Math.min(...cols), end + 1)}:${addr(Math.max(...cols), end + rows.length)}`,
       rowsWritten: rows.length,
       cellsWritten: written.size,
-      ...(writtenAs.size > 0 ? { writtenAs: Object.fromEntries(writtenAs) } : {}),
+      ...(Object.keys(writtenAs).length > 0 ? { writtenAs } : {}),
+      ...(datesAsText.length > 0 ? { datesAsText } : {}),
       ...(doesNotCover.length > 0 ? { doesNotCover } : {}),
     },
     written,
