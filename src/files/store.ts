@@ -41,7 +41,7 @@ import {
   type XlsxDocSpec,
   type XlsxOpSpec,
 } from "./documents.js";
-import { compareWithBase, dropFormulaResults } from "./documentFill.js";
+import { compareWithBase, dropFormulaResults, signaturesOf } from "./documentFill.js";
 import { resolveDocumentMime, extractDocumentText } from "./textExtract.js";
 
 
@@ -88,6 +88,46 @@ const EXPORT_XLSX_MAX_ROWS = 100_000;
  */
 const DOC_SOURCE_MAX_ROWS = 50_000;
 const DOC_SOURCE_MAX_BYTES = 32 * 1024 * 1024;
+/**
+ * The largest workbook that is copied and written into, in cells that hold
+ * something. The whole workbook is in memory while that happens (measured:
+ * about 1.3 KB of heap per filled cell at the peak, 750 MB for 600,000
+ * cells), so the limit follows the share of the host's memory one job may
+ * use, within these two ends. Past it the copy is refused with the reason
+ * rather than take the server down for everyone.
+ */
+const COPY_FORWARD_MAX_CELLS = 1_000_000;
+const COPY_FORWARD_MIN_CELLS = 100_000;
+const COPY_FORWARD_BYTES_PER_CELL = 1300;
+
+/**
+ * DuckDB hands DECIMAL (and the wider integers) over as text so that no
+ * digit is lost. Written into a sheet as they are, a column of figures would
+ * be text: it looks the same and no total counts it. A value in a numeric
+ * column that a double holds exactly becomes a number; a longer one (an id
+ * of twenty digits) stays text, so its whole column does.
+ */
+const NUMERIC_TYPE = /^(DECIMAL|NUMERIC|HUGEINT|UHUGEINT|UBIGINT|BIGINT|INTEGER|UINTEGER|SMALLINT|USMALLINT|TINYINT|UTINYINT|DOUBLE|FLOAT|REAL)\b/i;
+const EXACT_NUMBER = /^-?(0|[1-9]\d{0,14})(\.\d{1,15})?$/;
+export function numbersFromText(columns: Array<{ name: string; type: string }>, rows: Record<string, unknown>[]): Record<string, unknown>[] {
+  const numeric = columns.filter((c) => NUMERIC_TYPE.test(c.type)).map((c) => c.name);
+  const convert = numeric.filter((c) => {
+    let any = false;
+    for (const r of rows) {
+      const v = r[c];
+      if (typeof v !== "string") continue;
+      if (!EXACT_NUMBER.test(v) || v.replace(/[-.]/g, "").replace(/^0+/, "").length > 15) return false;
+      any = true;
+    }
+    return any;
+  });
+  if (convert.length === 0) return rows;
+  return rows.map((r) => {
+    const o = { ...r };
+    for (const c of convert) if (typeof o[c] === "string") o[c] = Number(o[c]);
+    return o;
+  });
+}
 // Per step (a chunk fetch) while streaming an export, not for the whole file.
 const EXPORT_STEP_TIMEOUT_MS = 60_000;
 // Scratch files (per-sheet CSVs, staged rows, record temp files) older than
@@ -1245,22 +1285,33 @@ export class FileStore {
           );
         }
         await copyFile(baseRec.uploadPath, xlsxPath);
-        const wb = new ExcelJS.Workbook();
+        const ops = await this.resolveOps(spec.ops!, requester);
+        // One workbook in memory at a time. What the base says, cell by cell,
+        // is taken down as text before anything is written, so the base need
+        // not be read again, or kept, to compare the saved file with.
+        let wb: ExcelJS.Workbook | null = new ExcelJS.Workbook();
         await wb.xlsx.readFile(xlsxPath);
-        const done = applyOps(wb, await this.resolveOps(spec.ops!, requester));
+        const before = signaturesOf(wb);
+        const maxCells = Math.min(COPY_FORWARD_MAX_CELLS, Math.max(COPY_FORWARD_MIN_CELLS, Math.floor((this.bounds.memoryMb * 1024 * 1024) / COPY_FORWARD_BYTES_PER_CELL)));
+        if (before.cells > maxCells) {
+          throw new FileStoreError(
+            422,
+            `This workbook is too large to copy and write into on this server (${before.cells.toLocaleString("en-US")} filled cells; the limit here is ${maxCells.toLocaleString("en-US")}). Nothing was saved. Build a new workbook that lists each key with its figures instead.`,
+          );
+        }
+        const done = applyOps(wb, ops);
         // A total over the cells just filled must not go on showing its old figure.
         if (dropFormulaResults(wb) > 0) {
           notes.push("This workbook has formulas. They are calculated when it is opened in Excel; their results are not shown here.");
         }
-        await wb.xlsx.writeFile(xlsxPath);
-        // The saved file, read back, against the file it was copied from:
-        // what was written is there, and nothing else has changed. A workbook
-        // that fails this is not kept.
-        const base = new ExcelJS.Workbook();
-        await base.xlsx.readFile(baseRec.uploadPath);
+        await this.saveWorkbook(wb, xlsxPath);
+        wb = null;
+        // The saved file, read back, against what the base said: what was
+        // written is there, and nothing else has changed. A workbook that
+        // fails this is not kept.
         const saved = new ExcelJS.Workbook();
         await saved.xlsx.readFile(xlsxPath);
-        const wrong = compareWithBase(base, saved, done.written);
+        const wrong = compareWithBase(before.sheets, saved, done.written);
         if (wrong.length > 0) {
           throw new FileStoreError(500, `The workbook did not save as it was written, so it was not kept: ${wrong.join("; ")}.`);
         }
@@ -1322,6 +1373,11 @@ export class FileStore {
     }
   }
 
+  /** Writing a workbook to disk, on its own so that a test can stand in for a write that goes wrong. */
+  protected async saveWorkbook(wb: ExcelJS.Workbook, path: string): Promise<void> {
+    await wb.xlsx.writeFile(path);
+  }
+
   /** Resolve a document source (inline rows, or a SQL read of a local snapshot) to rows. */
   private async resolveSource(
     source: DocSource,
@@ -1342,7 +1398,8 @@ export class FileStore {
     // rows or 512 KB and says so in a flag nobody here looked at: the sheet
     // was saved short and looked complete.
     try {
-      return (await this.queryWhole(source.fileId, sql, requester)).rows;
+      const res = await this.queryWhole(source.fileId, sql, requester);
+      return numbersFromText(res.columns, res.rows);
     } catch (err) {
       if (err instanceof FileStoreError && err.statusCode === 422 && /more rows than can be read whole/.test(err.message)) {
         throw new FileStoreError(

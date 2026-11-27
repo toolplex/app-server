@@ -14,8 +14,10 @@
 //                   nothing beside it to be misaligned with.
 //
 // Every op checks all of its cells before it writes any, and says what it
-// did. What cannot be done safely is refused with the reason; a workbook
-// that is half right is worse than none.
+// did. What cannot be done safely is refused with the reason and a way
+// forward; a workbook that is half right is worse than none. What is merely
+// not there to fill (a heading in the key column, a row with no data) is
+// left alone and counted, so the caller can say so.
 //
 // Pure and synchronous: rows arrive already fetched (see documents.ts).
 // ---------------------------------------------------------------------------
@@ -37,10 +39,16 @@ export interface FillByKeyArgs {
   key: KeyPair | KeyPair[];
   /** Sheet header → data column. */
   set: Record<string, string>;
-  /** A sheet row whose key has no data row: left as it is (default), blanked, or set to 0. */
+  /** A sheet row whose key has no data row: left as it is (default), blanked, or set to 0. Never applied to a formula. */
   unmatched?: "leave" | "blank" | "zero";
   /** Write over cells that already hold a value or a formula. Default false. */
   overwrite?: boolean;
+  /**
+   * Sheet rows that carry the same key: refused (default), since the same
+   * code under two stores is two different rows that one key cannot tell
+   * apart; or "fill_each", when it is one thing listed twice.
+   */
+  sharedKeys?: "refuse" | "fill_each";
   rows: Record<string, unknown>[];
 }
 
@@ -59,11 +67,24 @@ export interface OpReport {
   matched?: number;
   /** Matched only after ignoring leading zeros, letter case or number-versus-text. */
   matchedLoosely?: number;
+  looselyMatchedKeys?: Array<{ sheet: string; data: string }>;
   sheetRowsWithoutData?: number;
   sheetKeysWithoutData?: string[];
+  /** What was done with rows that had no data: nothing, or the cells set to 0 / blanked. */
+  unmatched?: "leave" | "blank" | "zero";
+  unmatchedCellsSet?: number;
+  /** Formulas in rows with no data, which are never written over. */
+  formulasKept?: number;
   dataRowsNotInSheet?: number;
   dataKeysNotInSheet?: string[];
   sheetRowsSharingAKey?: number;
+  /** Rows passed over because their key cell could not be read as a key (a merged heading, a formula with no result, …). */
+  rowsWithUnreadableKey?: number;
+  unreadableKeys?: string[];
+  /** Rows passed over because only part of a several-column key was there. */
+  rowsWithPartialKey?: number;
+  /** The header repeats here: another table begins, and nothing from this row down was touched. */
+  stoppedAtRow?: number;
   emptyValuesLeft?: number;
   /** The first rows as they now read: key, then each target. */
   firstRows?: Array<Record<string, unknown>>;
@@ -127,9 +148,20 @@ function cellText(cell: ExcelJS.Cell): string {
   }
 }
 
-/** The last row of the sheet that holds anything. */
-function lastRow(ws: ExcelJS.Worksheet): number {
-  return ws.rowCount;
+/**
+ * The last row that holds a value or a formula. Not the sheet's own row
+ * count: rows that are only formatted (borders drawn down to row 500) count
+ * there, and rows appended after them would land far below the data.
+ */
+export function lastValueRow(ws: ExcelJS.Worksheet): number {
+  for (let r = ws.rowCount; r >= 1; r--) {
+    let any = false;
+    ws.getRow(r).eachCell({ includeEmpty: false }, (cell) => {
+      if (!isEmptyValue(cell.value)) any = true;
+    });
+    if (any) return r;
+  }
+  return 0;
 }
 
 /**
@@ -140,7 +172,8 @@ function lastRow(ws: ExcelJS.Worksheet): number {
 export function findHeaderRow(ws: ExcelJS.Worksheet, names: string[]): { row: number; cols: Map<string, number> } {
   const wanted = names.map(headerKey);
   let best: { row: number; found: number; texts: string[] } | null = null;
-  const last = Math.min(lastRow(ws), HEADER_SEARCH_ROWS);
+  let widest: { row: number; texts: string[] } | null = null;
+  const last = Math.min(lastValueRow(ws), HEADER_SEARCH_ROWS);
   for (let r = 1; r <= last; r++) {
     const row = ws.getRow(r);
     const seen = new Map<string, number[]>();
@@ -156,65 +189,71 @@ export function findHeaderRow(ws: ExcelJS.Worksheet, names: string[]): { row: nu
     if (found === wanted.length) {
       const twice = names.filter((n) => (seen.get(headerKey(n)) ?? []).length > 1);
       if (twice.length > 0) {
-        throw new DocOpError(`Sheet "${ws.name}" row ${r} has more than one column headed ${twice.map((t) => `"${t}"`).join(", ")}; which one is meant cannot be told.`);
+        throw new DocOpError(`Sheet "${ws.name}" row ${r} has more than one column headed ${twice.map((t) => `"${t}"`).join(", ")}; which one is meant cannot be told. Nothing was written.`);
       }
       return { row: r, cols: new Map(names.map((n) => [n, seen.get(headerKey(n))![0]])) };
     }
     if (found > 0 && (!best || found > best.found)) best = { row: r, found, texts };
+    if (!widest || texts.length > widest.texts.length) widest = { row: r, texts };
   }
+  const list = (texts: string[]) => texts.slice(0, 40).map((t) => `"${t}"`).join(", ");
   const missing = (texts: string[]) => names.filter((n) => !texts.map(headerKey).includes(headerKey(n)));
   if (best) {
     throw new DocOpError(
-      `Sheet "${ws.name}" has no row with all of these headers: ${names.map((n) => `"${n}"`).join(", ")}. Row ${best.row} comes closest but lacks ${missing(best.texts).map((n) => `"${n}"`).join(", ")}; its headers are: ${best.texts.slice(0, 40).map((t) => `"${t}"`).join(", ")}.`,
+      `Sheet "${ws.name}" has no row with all of these headers: ${names.map((n) => `"${n}"`).join(", ")}. Row ${best.row} comes closest but lacks ${missing(best.texts).map((n) => `"${n}"`).join(", ")}; its headers are: ${list(best.texts)}. Use the headers as they are written there. Nothing was written.`,
     );
   }
-  throw new DocOpError(`Sheet "${ws.name}" has none of these headers in its first ${HEADER_SEARCH_ROWS} rows: ${names.map((n) => `"${n}"`).join(", ")}.`);
+  throw new DocOpError(
+    `Sheet "${ws.name}" has none of these headers in its first ${HEADER_SEARCH_ROWS} rows: ${names.map((n) => `"${n}"`).join(", ")}.` +
+      (widest && widest.texts.length > 0 ? ` Its header row looks like row ${widest.row}: ${list(widest.texts)}. Use the headers as they are written there.` : " The sheet looks empty.") +
+      " Nothing was written.",
+  );
 }
 
 // --- Keys --------------------------------------------------------------------
 
-function dateKey(d: Date, where: string): string {
-  if (d.getUTCHours() || d.getUTCMinutes() || d.getUTCSeconds() || d.getUTCMilliseconds()) {
-    throw new DocOpError(`${where} is a date with a time of day, which cannot be matched as a key.`);
-  }
+/** A value that cannot serve as a key, with the reason. */
+class NotAKey extends Error {}
+
+function dateKey(d: Date): string {
+  if (d.getUTCHours() || d.getUTCMinutes() || d.getUTCSeconds() || d.getUTCMilliseconds()) throw new NotAKey("a date with a time of day");
   return d.toISOString().slice(0, 10);
 }
 
-function numberKey(n: number, where: string): string {
-  if (!Number.isInteger(n)) throw new DocOpError(`${where} is a number that is not whole (${n}), which cannot be matched as a key.`);
-  if (!Number.isSafeInteger(n)) throw new DocOpError(`${where} is a number too long to be exact (${n}); a key like that must be stored as text.`);
+function numberKey(n: number): string {
+  if (!Number.isInteger(n)) throw new NotAKey(`a number that is not whole (${n})`);
+  if (!Number.isSafeInteger(n)) throw new NotAKey(`a number too long to be exact (${n}); a key like that must be stored as text`);
   return String(n);
 }
 
-function scalarKey(v: unknown, where: string): string | null {
+function scalarKey(v: unknown): string | null {
   if (v === null || v === undefined) return null;
   if (typeof v === "string") return squash(v) === "" ? null : squash(v);
-  if (typeof v === "number") return numberKey(v, where);
+  if (typeof v === "number") return numberKey(v);
   if (typeof v === "bigint") return v.toString();
   if (typeof v === "boolean") return v ? "TRUE" : "FALSE";
-  if (v instanceof Date) return dateKey(v, where);
-  throw new DocOpError(`${where} holds something that cannot be matched as a key.`);
+  if (v instanceof Date) return dateKey(v);
+  throw new NotAKey("something that is not a plain value");
 }
 
-/** A sheet cell as a key: what the cell holds, not how it happens to be laid out. null when empty. */
+/** A sheet cell as a key: what the cell holds, not how it happens to be laid out. null when empty. Throws NotAKey. */
 function sheetKey(cell: ExcelJS.Cell): string | null {
-  const where = `Key cell ${cell.address}`;
-  if (cell.isMerged) throw new DocOpError(`${where} is part of a merged cell; a merged key covers several rows and cannot identify one.`);
+  if (cell.isMerged) throw new NotAKey("part of a merged cell");
   const v = cell.value as unknown;
   if (v === null || v === undefined) return null;
   if (typeof v === "object" && !(v instanceof Date)) {
     const o = v as { result?: unknown; richText?: Array<{ text?: string }>; text?: unknown; error?: unknown; formula?: unknown; sharedFormula?: unknown };
     if ("formula" in o || "sharedFormula" in o) {
-      if (o.result === undefined || o.result === null) throw new DocOpError(`${where} is a formula with no stored result, so its key cannot be read.`);
-      if (typeof o.result === "object" && !(o.result instanceof Date)) throw new DocOpError(`${where} is a formula that shows an error.`);
-      return scalarKey(o.result, where);
+      if (o.result === undefined || o.result === null) throw new NotAKey("a formula with no stored result");
+      if (typeof o.result === "object" && !(o.result instanceof Date)) throw new NotAKey("a formula that shows an error");
+      return scalarKey(o.result);
     }
-    if (o.error !== undefined) throw new DocOpError(`${where} shows an error.`);
-    if (Array.isArray(o.richText)) return scalarKey(o.richText.map((p) => p.text ?? "").join(""), where);
-    if (o.text !== undefined) return scalarKey(String(o.text), where);
-    return scalarKey(cellText(cell), where);
+    if (o.error !== undefined) throw new NotAKey("an error");
+    if (Array.isArray(o.richText)) return scalarKey(o.richText.map((p) => p.text ?? "").join(""));
+    if (o.text !== undefined) return scalarKey(String(o.text));
+    return scalarKey(cellText(cell));
   }
-  return scalarKey(v, where);
+  return scalarKey(v);
 }
 
 /**
@@ -238,10 +277,11 @@ const shown = (k: string): string => k.split(SEP).join(" + ");
 
 // --- Values ------------------------------------------------------------------
 
-/** Coerce an arbitrary value to a valid exceljs cell value. */
+/** Coerce an arbitrary value to a valid exceljs cell value. A number that is not finite has no cell value. */
 export function toCellValue(v: unknown): ExcelJS.CellValue {
   if (v === null || v === undefined) return null;
-  if (typeof v === "number" || typeof v === "boolean" || typeof v === "string") return v;
+  if (typeof v === "number") return Number.isFinite(v) ? v : null;
+  if (typeof v === "boolean" || typeof v === "string") return v;
   if (v instanceof Date) return v;
   if (typeof v === "bigint") {
     const n = Number(v);
@@ -268,8 +308,11 @@ function refuseBlocked(problems: Array<{ address: string; why: string }>, what: 
   const by = new Map<string, string[]>();
   for (const p of problems) by.set(p.why, [...(by.get(p.why) ?? []), p.address]);
   const parts = [...by.entries()].map(([why, a]) => `${a.length} ${why} (${a.slice(0, 5).join(", ")}${a.length > 5 ? ", …" : ""})`);
-  const onlyOverwritable = [...by.keys()].every((w) => w !== "merged");
-  throw new DocOpError(`${what} would write over cells that are not free: ${parts.join("; ")}. Nothing was written.${onlyOverwritable ? ' Pass "overwrite": true if replacing them is intended.' : " Merged cells cannot be filled row by row."}`);
+  const advice: string[] = [];
+  if (by.has("merged")) advice.push("Merged cells cannot be filled row by row: build a new workbook that lists each key with its figures instead.");
+  if (by.has("a formula")) advice.push('The formulas are the sheet\'s own calculations (totals, computed columns) and are almost never meant to be replaced: check that the right column is being filled. Only if the user asked for those formulas to be replaced, pass "overwrite": true.');
+  if (by.has("already filled")) advice.push('If the existing figures are to be replaced (a refresh), pass "overwrite": true.');
+  throw new DocOpError(`${what} would write over cells that are not free: ${parts.join("; ")}. Nothing was written. ${advice.join(" ")}`);
 }
 
 /** A column that is numbers in some rows and text in others adds up wrong in Excel without saying so. */
@@ -287,17 +330,17 @@ function refuseMixedTypes(rows: Record<string, unknown>[], columns: string[]): v
       }
     }
     if (numbers > 0 && texts > 0) {
-      throw new DocOpError(`Data column "${c}" is a number in ${numbers} rows and text in ${texts} (for example ${JSON.stringify(example)}). Excel would leave the text out of any total. Make the column one type in the query.`);
+      throw new DocOpError(`Data column "${c}" is a number in ${numbers} rows and text in ${texts} (for example ${JSON.stringify(example)}). Excel would leave the text out of any total. Make the column one type in the query. Nothing was written.`);
     }
   }
 }
 
 function requireColumns(rows: Record<string, unknown>[], columns: string[], what: string): void {
-  if (rows.length === 0) throw new DocOpError(`${what}: the data has no rows.`);
+  if (rows.length === 0) throw new DocOpError(`${what}: the data has no rows. Nothing was written.`);
   const have = new Set(Object.keys(rows[0]));
   const missing = columns.filter((c) => !have.has(c));
   if (missing.length > 0) {
-    throw new DocOpError(`${what}: the data has no column ${missing.map((m) => `"${m}"`).join(", ")}. Its columns are: ${[...have].map((h) => `"${h}"`).join(", ")}.`);
+    throw new DocOpError(`${what}: the data has no column ${missing.map((m) => `"${m}"`).join(", ")}. Its columns are: ${[...have].map((h) => `"${h}"`).join(", ")}. Nothing was written.`);
   }
 }
 
@@ -310,6 +353,8 @@ export function fillByKey(ws: ExcelJS.Worksheet, a: FillByKeyArgs): { report: Op
   if (targets.length === 0) throw new DocOpError('fill_by_key needs "set": { <header in the sheet>: <column in the data>, … }.');
   const unmatched = a.unmatched ?? "leave";
   if (!["leave", "blank", "zero"].includes(unmatched)) throw new DocOpError('"unmatched" is one of "leave", "blank", "zero".');
+  const sharedKeys = a.sharedKeys ?? "refuse";
+  if (!["refuse", "fill_each"].includes(sharedKeys)) throw new DocOpError('"sharedKeys" is "refuse" or "fill_each".');
   const overwrite = a.overwrite === true;
 
   const keyHeaders = keys.map((k) => k.sheet);
@@ -327,26 +372,68 @@ export function fillByKey(ws: ExcelJS.Worksheet, a: FillByKeyArgs): { report: Op
   const data = new Map<string, Record<string, unknown>>();
   const repeated = new Set<string>();
   for (let i = 0; i < a.rows.length; i++) {
-    const parts = keys.map((k) => scalarKey(a.rows[i][k.data], `Data row ${i + 1}, "${k.data}"`));
+    let parts: Array<string | null>;
+    try {
+      parts = keys.map((k) => scalarKey(a.rows[i][k.data]));
+    } catch (e) {
+      if (!(e instanceof NotAKey)) throw e;
+      throw new DocOpError(`Data row ${i + 1} has a key that is ${e.message}, which cannot be matched. Make the key column text or whole numbers in the query. Nothing was written.`);
+    }
     if (parts.some((p) => p === null)) continue;
     const id = parts.join(SEP);
     if (data.has(id)) repeated.add(id);
     else data.set(id, a.rows[i]);
   }
   if (repeated.size > 0) {
-    throw new DocOpError(`The data has more than one row for ${repeated.size} key${repeated.size === 1 ? "" : "s"} (${[...repeated].slice(0, 5).map((k) => `"${shown(k)}"`).join(", ")}${repeated.size > 5 ? ", …" : ""}). Which row's figures belong in the sheet cannot be told: make the query return one row per key.`);
+    throw new DocOpError(`The data has more than one row for ${repeated.size} key${repeated.size === 1 ? "" : "s"} (${[...repeated].slice(0, 5).map((k) => `"${shown(k)}"`).join(", ")}${repeated.size > 5 ? ", …" : ""}). Which row's figures belong in the sheet cannot be told: make the query return one row per key. Nothing was written.`);
   }
-  if (data.size === 0) throw new DocOpError("No data row has a key.");
+  if (data.size === 0) throw new DocOpError("No data row has a key. Nothing was written.");
 
-  // The sheet's rows, by their own keys.
+  // The sheet's rows, by their own keys. A row whose key cell cannot be read
+  // as a key (a merged section heading, a formula with no result) is passed
+  // over and counted, not a reason to refuse every other row.
   const sheetRows: Array<{ row: number; id: string }> = [];
-  for (let r = header.row + 1; r <= lastRow(ws); r++) {
+  const unreadable: string[] = [];
+  let partial = 0;
+  let stoppedAtRow: number | undefined;
+  const end = lastValueRow(ws);
+  for (let r = header.row + 1; r <= end; r++) {
     const row = ws.getRow(r);
-    const parts = keyCols.map((c) => sheetKey(row.getCell(c)));
-    if (parts.some((p) => p === null)) continue; // a blank line, or a totals row with no key
+    // The header again: another table starts here, with rows of its own that
+    // this key was not asked about.
+    if (keyCols.every((c, i) => headerKey(cellText(row.getCell(c))) === headerKey(keyHeaders[i]))) {
+      stoppedAtRow = r;
+      break;
+    }
+    let parts: Array<string | null>;
+    try {
+      parts = keyCols.map((c) => sheetKey(row.getCell(c)));
+    } catch (e) {
+      if (!(e instanceof NotAKey)) throw e;
+      unreadable.push(`row ${r} (${e.message})`);
+      continue;
+    }
+    if (parts.every((p) => p === null)) continue; // a blank line, or a totals row with no key
+    if (parts.some((p) => p === null)) {
+      partial++;
+      continue;
+    }
     sheetRows.push({ row: r, id: parts.join(SEP) });
   }
-  if (sheetRows.length === 0) throw new DocOpError(`Sheet "${ws.name}" has no rows with a key under ${keyHeaders.map((h) => `"${h}"`).join(" + ")} below row ${header.row}.`);
+  if (sheetRows.length === 0) {
+    throw new DocOpError(`Sheet "${ws.name}" has no rows with a readable key under ${keyHeaders.map((h) => `"${h}"`).join(" + ")} below row ${header.row}${unreadable.length > 0 ? ` (${unreadable.slice(0, 3).join("; ")})` : ""}. Nothing was written.`);
+  }
+
+  const sheetIds = new Map<string, number[]>();
+  for (const s of sheetRows) sheetIds.set(s.id, [...(sheetIds.get(s.id) ?? []), s.row]);
+  const shared = [...sheetIds.entries()].filter(([, rows]) => rows.length > 1);
+  if (shared.length > 0 && sharedKeys !== "fill_each") {
+    throw new DocOpError(
+      `${shared.length} key${shared.length === 1 ? " appears" : "s appear"} on more than one row of sheet "${ws.name}" (${shared.slice(0, 4).map(([k, rows]) => `"${shown(k)}" on rows ${rows.slice(0, 4).join(", ")}`).join("; ")}${shared.length > 4 ? "; …" : ""}). ` +
+        `If those rows belong to different groups (the same item under two stores, two sections), the key needs the column that tells them apart: give "key" as a list of two columns. ` +
+        `If it is one thing listed twice and each row should get the same figures, pass "sharedKeys": "fill_each". Nothing was written.`,
+    );
+  }
 
   // Exact first. What is left may match once leading zeros, case and
   // number-versus-text are ignored, but only where that is one-to-one on both
@@ -360,7 +447,7 @@ export function fillByKey(ws: ExcelJS.Worksheet, a: FillByKeyArgs): { report: Op
       usedData.add(s.id);
     }
   }
-  let matchedLoosely = 0;
+  const loosely: Array<{ sheet: string; data: string }> = [];
   if (match.size < sheetRows.length) {
     const looseData = new Map<string, Set<string>>();
     for (const id of data.keys()) looseData.set(looseKey(id), new Set([...(looseData.get(looseKey(id)) ?? []), id]));
@@ -374,36 +461,52 @@ export function fillByKey(ws: ExcelJS.Worksheet, a: FillByKeyArgs): { report: Op
       const id = [...candidates][0];
       match.set(s.row, data.get(id)!);
       usedData.add(id);
-      matchedLoosely++;
+      loosely.push({ sheet: shown(s.id), data: shown(id) });
     }
   }
   if (match.size === 0) {
-    throw new DocOpError(`No row of sheet "${ws.name}" has a key found in the data. Sheet keys look like ${sheetRows.slice(0, 5).map((s) => `"${shown(s.id)}"`).join(", ")}; data keys look like ${[...data.keys()].slice(0, 5).map((k) => `"${shown(k)}"`).join(", ")}.`);
+    throw new DocOpError(`No row of sheet "${ws.name}" has a key found in the data. Sheet keys look like ${sheetRows.slice(0, 5).map((s) => `"${shown(s.id)}"`).join(", ")}; data keys look like ${[...data.keys()].slice(0, 5).map((k) => `"${shown(k)}"`).join(", ")}. Nothing was written.`);
   }
 
   // Everything is checked before anything is written.
   const plan: Array<{ cell: ExcelJS.Cell; value: ExcelJS.CellValue }> = [];
   const problems: Array<{ address: string; why: string }> = [];
   let emptyValuesLeft = 0;
+  let unmatchedCellsSet = 0;
+  let formulasKept = 0;
   for (const s of sheetRows) {
     const d = match.get(s.row);
     const row = ws.getRow(s.row);
     for (let t = 0; t < targets.length; t++) {
       const cell = row.getCell(targetCols[t]);
-      let value: ExcelJS.CellValue;
       if (d) {
-        value = toCellValue(d[targets[t][1]]);
+        const value = toCellValue(d[targets[t][1]]);
         if (value === null) {
           emptyValuesLeft++;
           continue;
         }
-      } else if (unmatched === "leave") continue;
-      else value = unmatched === "zero" ? 0 : null;
-      // Blanking a cell that is already blank changes nothing and needs no leave.
-      if (value === null && isEmptyValue(cell.value) && !cell.isMerged) continue;
+        const why = blocked(cell, overwrite);
+        if (why) problems.push({ address: cell.address, why });
+        else plan.push({ cell, value });
+        continue;
+      }
+      if (unmatched === "leave") continue;
+      // A row with a key and no data may be the sheet's own total, labelled
+      // in the key column. Its formulas are never written over, whatever
+      // "overwrite" says: that flag is about the rows that were asked for.
+      if (isFormula(cell)) {
+        formulasKept++;
+        continue;
+      }
+      if (cell.isMerged) continue;
+      const value: ExcelJS.CellValue = unmatched === "zero" ? 0 : null;
+      if (value === null && isEmptyValue(cell.value)) continue; // already blank
       const why = blocked(cell, overwrite);
       if (why) problems.push({ address: cell.address, why });
-      else plan.push({ cell, value });
+      else {
+        plan.push({ cell, value });
+        unmatchedCellsSet++;
+      }
     }
   }
   refuseBlocked(problems, "fill_by_key");
@@ -414,8 +517,6 @@ export function fillByKey(ws: ExcelJS.Worksheet, a: FillByKeyArgs): { report: Op
     written.set(p.cell.address, p.value);
   }
 
-  const sheetIds = new Map<string, number>();
-  for (const s of sheetRows) sheetIds.set(s.id, (sheetIds.get(s.id) ?? 0) + 1);
   const without = sheetRows.filter((s) => !match.has(s.row));
   const unusedData = [...data.keys()].filter((id) => !usedData.has(id));
   const rowsTouched = new Set(plan.map((p) => Number(p.cell.row)));
@@ -427,12 +528,16 @@ export function fillByKey(ws: ExcelJS.Worksheet, a: FillByKeyArgs): { report: Op
     targetColumns: Object.fromEntries(targetHeaders.map((h, i) => [h, numToCol(targetCols[i])])),
     sheetRowsWithKey: sheetRows.length,
     matched: match.size,
-    ...(matchedLoosely > 0 ? { matchedLoosely } : {}),
+    ...(loosely.length > 0 ? { matchedLoosely: loosely.length, looselyMatchedKeys: loosely.slice(0, SAMPLE) } : {}),
     sheetRowsWithoutData: without.length,
-    ...(without.length > 0 ? { sheetKeysWithoutData: without.slice(0, SAMPLE).map((s) => shown(s.id)) } : {}),
+    ...(without.length > 0 ? { sheetKeysWithoutData: without.slice(0, SAMPLE).map((s) => shown(s.id)), unmatched, ...(unmatched !== "leave" ? { unmatchedCellsSet } : {}) } : {}),
+    ...(formulasKept > 0 ? { formulasKept } : {}),
     dataRowsNotInSheet: unusedData.length,
     ...(unusedData.length > 0 ? { dataKeysNotInSheet: unusedData.slice(0, SAMPLE).map(shown) } : {}),
-    sheetRowsSharingAKey: [...sheetIds.values()].filter((n) => n > 1).reduce((x, n) => x + n, 0),
+    sheetRowsSharingAKey: shared.reduce((x, [, rows]) => x + rows.length, 0),
+    ...(unreadable.length > 0 ? { rowsWithUnreadableKey: unreadable.length, unreadableKeys: unreadable.slice(0, SAMPLE) } : {}),
+    ...(partial > 0 ? { rowsWithPartialKey: partial } : {}),
+    ...(stoppedAtRow ? { stoppedAtRow } : {}),
     ...(emptyValuesLeft > 0 ? { emptyValuesLeft } : {}),
     rowsWritten: rowsTouched.size,
     cellsWritten: plan.length,
@@ -459,10 +564,10 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
   requireColumns(rows, [], "append_rows");
   const names = Object.keys(rows[0]);
   const ragged = rows.findIndex((r) => Object.keys(r).some((k) => !names.includes(k)));
-  if (ragged >= 0) throw new DocOpError(`append_rows: data row ${ragged + 1} has columns the first row does not; every row must have the same columns.`);
+  if (ragged >= 0) throw new DocOpError(`append_rows: data row ${ragged + 1} has columns the first row does not; every row must have the same columns. Nothing was written.`);
   refuseMixedTypes(rows, names);
   const header = findHeaderRow(ws, names);
-  const end = lastRow(ws);
+  const end = Math.max(lastValueRow(ws), header.row);
   let formulas = 0;
   if (end > header.row) ws.getRow(end).eachCell({ includeEmpty: false }, (cell) => void (isFormula(cell) && formulas++));
   if (formulas > 0) {
@@ -500,27 +605,29 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
  * Values written as a block from one cell: for the empty data area of a
  * template. Position is all that ties a value to its place here, so the block
  * may not sit beside anything it could be misaligned with: if the rows it
- * covers already hold something in another column, those rows have an
- * identity of their own and fill_by_key is the op that respects it.
+ * covers already hold values in another column, those rows have an identity
+ * of their own and fill_by_key is the op that respects it. A formula beside
+ * the block is the template working the row out from what is filled in, and
+ * gives the row no identity.
  */
 export function populateBlock(
   ws: ExcelJS.Worksheet,
   a: { startCell?: string; columns?: string[]; overwrite?: boolean; rows: Record<string, unknown>[] },
 ): { report: OpReport; written: Written } {
   const { col: c0, row: r0 } = parseSingleCell(a.startCell, 'populate_sheet "startCell"');
-  if (a.rows.length === 0) throw new DocOpError("populate_sheet: the data has no rows.");
+  if (a.rows.length === 0) throw new DocOpError("populate_sheet: the data has no rows. Nothing was written.");
   const first = Object.keys(a.rows[0]);
   // JavaScript lists keys that are whole numbers ("2025") before the others
   // whatever order the query gave them, so a result with such a column has no
   // column order to rely on.
   const names = a.columns && a.columns.length > 0 ? a.columns : first;
   if (!a.columns?.length && first.some((k) => /^\d+$/.test(k))) {
-    throw new DocOpError(`populate_sheet: the data has a column named with a number (${first.filter((k) => /^\d+$/.test(k)).map((k) => `"${k}"`).join(", ")}), and such columns do not keep their place in the result. Give "columns": the data's columns in the order they are to be written.`);
+    throw new DocOpError(`populate_sheet: the data has a column named with a number (${first.filter((k) => /^\d+$/.test(k)).map((k) => `"${k}"`).join(", ")}), and such columns do not keep their place in the result. Give "columns": the data's columns in the order they are to be written. Nothing was written.`);
   }
   requireColumns(a.rows, names, "populate_sheet");
   if (!a.columns?.length) {
     const ragged = a.rows.findIndex((r) => Object.keys(r).length !== first.length || Object.keys(r).some((k) => !first.includes(k)));
-    if (ragged >= 0) throw new DocOpError(`populate_sheet: data row ${ragged + 1} does not have the same columns as the first row.`);
+    if (ragged >= 0) throw new DocOpError(`populate_sheet: data row ${ragged + 1} does not have the same columns as the first row. Nothing was written.`);
   }
   refuseMixedTypes(a.rows, names);
 
@@ -532,7 +639,7 @@ export function populateBlock(
     const row = ws.getRow(r);
     row.eachCell({ includeEmpty: false }, (cell, c) => {
       if (c >= c0 && c <= cEnd) return;
-      if (!isEmptyValue(cell.value) || isFormula(cell)) beside.push(cell.address);
+      if (!isEmptyValue(cell.value) && !isFormula(cell)) beside.push(cell.address);
     });
     for (let c = c0; c <= cEnd; c++) {
       const cell = row.getCell(c);
@@ -541,7 +648,10 @@ export function populateBlock(
     }
   }
   if (beside.length > 0) {
-    throw new DocOpError(`populate_sheet writes by position, and rows ${r0}–${rEnd} of sheet "${ws.name}" already hold data in other columns (${beside.slice(0, 5).join(", ")}${beside.length > 5 ? ", …" : ""}). Values placed by position there can land against the wrong rows. Use fill_by_key: name the column that identifies a row and the columns to fill. Nothing was written.`);
+    throw new DocOpError(
+      `populate_sheet writes by position, and rows ${r0}–${rEnd} of sheet "${ws.name}" already hold data in other columns (${beside.slice(0, 5).join(", ")}${beside.length > 5 ? ", …" : ""}). Values placed by position there can land against the wrong rows. ` +
+        `Use fill_by_key: name the column that identifies a row (an item code, a name; a column that only numbers the rows 1, 2, 3 will do, with the same numbers in the data) and the columns to fill. Nothing was written.`,
+    );
   }
   refuseBlocked(problems, "populate_sheet");
 
@@ -567,8 +677,12 @@ export function populateBlock(
  * A formula keeps the result it had when the file was last saved. After a
  * fill, a total over the filled cells would go on showing the old figure to
  * anything that reads the file without recalculating it, this server's own
- * queryable copy included. The stored results are dropped and Excel is told
+ * queryable copy included. Every stored result is dropped and Excel is told
  * to calculate on opening. Returns how many formulas the workbook has.
+ *
+ * Every formula is written back without a result, whether or not one shows:
+ * a result of 0, FALSE or "" is not visible on the cell's value but is still
+ * in the file, and 0 is exactly what an empty template's totals hold.
  */
 export function dropFormulaResults(wb: ExcelJS.Workbook): number {
   let formulas = 0;
@@ -578,7 +692,6 @@ export function dropFormulaResults(wb: ExcelJS.Workbook): number {
         const v = cell.value as unknown;
         if (typeof v !== "object" || v === null || !("formula" in v || "sharedFormula" in v)) return;
         formulas++;
-        if (!("result" in v) || (v as { result?: unknown }).result === undefined) return;
         const { result: _old, ...rest } = v as Record<string, unknown>;
         cell.value = rest as unknown as ExcelJS.CellValue;
       });
@@ -587,6 +700,9 @@ export function dropFormulaResults(wb: ExcelJS.Workbook): number {
   if (formulas > 0) wb.calcProperties = { ...(wb.calcProperties ?? {}), fullCalcOnLoad: true };
   return formulas;
 }
+
+/** Characters the workbook writer leaves out of text; a cell that held one reads back without it. */
+const NOT_STORED = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g;
 
 /** A cell reduced to what it says: its formula, or its value; never a formula's stored result. */
 function signature(v: unknown): string {
@@ -604,11 +720,11 @@ function signature(v: unknown): string {
   if (typeof v === "number") return `n:${v}`;
   if (typeof v === "boolean") return `b:${v}`;
   // A line break is stored one way whichever way it was written.
-  const s = String(v).replace(/\r\n?/g, "\n");
+  const s = String(v).replace(/\r\n?/g, "\n").replace(NOT_STORED, "");
   return s === "" ? "" : `s:${s}`;
 }
 
-function formulaSignature(cell: ExcelJS.Cell): string {
+function cellSignature(cell: ExcelJS.Cell): string {
   // A shared formula's copies name only their master; the formula text itself
   // is what has to be unchanged.
   if (isFormula(cell)) {
@@ -621,42 +737,68 @@ function formulaSignature(cell: ExcelJS.Cell): string {
   return signature(cell.value);
 }
 
+/** The cell that holds a merged range's value: every other cell of the range only shows it. */
+export function masterOf(cell: ExcelJS.Cell): ExcelJS.Cell {
+  return cell.isMerged ? cell.master : cell;
+}
+
+/** What every cell of a workbook says, by sheet and address; and how many there are. */
+export type Signatures = Map<string, Map<string, string>>;
+
 /**
- * The saved file, read back, against the file it was copied from: every cell
- * an op wrote holds what was written, and no other cell differs. Sheets the
- * ops added are new and have nothing to be compared with. Returns what is
- * wrong, at most a handful, or nothing.
+ * A workbook as plain text per cell, so that it need not be kept in memory
+ * to be compared with later. A merged range is its master cell: the cells it
+ * covers repeat the master's value and would otherwise read as changes of
+ * their own when the master is written.
  */
-export function compareWithBase(
-  base: ExcelJS.Workbook,
-  saved: ExcelJS.Workbook,
-  written: Map<string, Written>,
-): string[] {
+export function signaturesOf(wb: ExcelJS.Workbook): { sheets: Signatures; cells: number } {
+  const sheets: Signatures = new Map();
+  let cells = 0;
+  for (const ws of wb.worksheets) {
+    const of = new Map<string, string>();
+    ws.eachRow({ includeEmpty: false }, (row) =>
+      row.eachCell({ includeEmpty: false }, (cell) => {
+        if (cell.isMerged && cell.master.address !== cell.address) return;
+        const sig = cellSignature(cell);
+        if (sig !== "") {
+          of.set(cell.address, sig);
+          cells++;
+        }
+      }),
+    );
+    sheets.set(ws.name, of);
+  }
+  return { sheets, cells };
+}
+
+/**
+ * The saved file, read back, against the file it was copied from (as it read
+ * before any op ran): every cell an op wrote holds what was written, and no
+ * other cell differs, in either direction. Sheets the ops added are new and
+ * have nothing to be compared with. Returns what is wrong, at most a
+ * handful, or nothing.
+ */
+export function compareWithBase(base: Signatures, saved: ExcelJS.Workbook, written: Map<string, Written>): string[] {
   const wrong: string[] = [];
   const note = (s: string) => void (wrong.length < 8 && wrong.push(s));
-  for (const b of base.worksheets) {
-    const s = saved.getWorksheet(b.name);
-    if (!s) {
-      note(`sheet "${b.name}" is missing from the saved workbook`);
+  const now = signaturesOf(saved).sheets;
+  for (const [name, was] of base) {
+    const is = now.get(name);
+    if (!is) {
+      note(`sheet "${name}" is missing from the saved workbook`);
       continue;
     }
-    const mine = written.get(b.name) ?? new Map<string, ExcelJS.CellValue>();
-    const seen = new Set<string>();
-    const check = (address: string) => {
-      if (seen.has(address)) return;
-      seen.add(address);
-      const got = formulaSignature(s.getCell(address));
+    const mine = written.get(name) ?? new Map<string, ExcelJS.CellValue>();
+    for (const address of new Set([...was.keys(), ...is.keys(), ...mine.keys()])) {
+      const got = is.get(address) ?? "";
       if (mine.has(address)) {
         const want = signature(mine.get(address));
-        if (got !== want) note(`${b.name}!${address} was written as ${want || "(blank)"} and reads ${got || "(blank)"}`);
+        if (got !== want) note(`${name}!${address} was written as ${want || "(blank)"} and reads ${got || "(blank)"}`);
       } else {
-        const was = formulaSignature(b.getCell(address));
-        if (got !== was) note(`${b.name}!${address} was ${was || "(blank)"} and now reads ${got || "(blank)"}, though nothing was to be written there`);
+        const before = was.get(address) ?? "";
+        if (got !== before) note(`${name}!${address} was ${before || "(blank)"} and now reads ${got || "(blank)"}, though nothing was to be written there`);
       }
-    };
-    b.eachRow({ includeEmpty: false }, (row) => row.eachCell({ includeEmpty: false }, (cell) => check(cell.address)));
-    s.eachRow({ includeEmpty: false }, (row) => row.eachCell({ includeEmpty: false }, (cell) => check(cell.address)));
-    for (const address of mine.keys()) check(address);
+    }
   }
   return wrong;
 }

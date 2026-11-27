@@ -26,6 +26,7 @@ import {
   DocOpError,
   appendByHeader,
   fillByKey,
+  masterOf,
   parseSingleCell,
   populateBlock,
   toCellValue,
@@ -92,6 +93,8 @@ export interface FillByKeySpec {
   unmatched?: "leave" | "blank" | "zero";
   /** Write over cells that already hold a value or a formula. */
   overwrite?: boolean;
+  /** Sheet rows carrying the same key: "refuse" (default) or "fill_each". */
+  sharedKeys?: "refuse" | "fill_each";
 }
 
 export type XlsxOpSpec =
@@ -150,8 +153,11 @@ const present = (v: unknown): boolean => v !== undefined && v !== null;
 const SPEC_FIELDS = ["title", "theme", "base", "sheets", "ops", "downloadName"];
 const SOURCE_FIELDS = ["fileId", "sql", "rows"];
 const SHEET_FIELDS = ["name", "source", "columns", "style"];
+const COLUMN_FIELDS = ["key", "header", "numFmt", "width"];
+const STYLE_FIELDS = ["header", "freeze"];
+const HEADER_STYLE_FIELDS = ["bold", "fill", "color"];
 const OP_FIELDS: Record<string, { all: string[]; needs: string[] }> = {
-  fill_by_key: { all: ["op", "sheet", "key", "set", "unmatched", "overwrite", "source"], needs: ["sheet", "key", "set", "source"] },
+  fill_by_key: { all: ["op", "sheet", "key", "set", "unmatched", "overwrite", "sharedKeys", "source"], needs: ["sheet", "key", "set", "source"] },
   populate_sheet: { all: ["op", "sheet", "startCell", "columns", "overwrite", "source"], needs: ["sheet", "startCell", "source"] },
   append_rows: { all: ["op", "sheet", "source"], needs: ["sheet", "source"] },
   set_cell: { all: ["op", "sheet", "cell", "value"], needs: ["sheet", "cell"] },
@@ -182,7 +188,29 @@ export function validateDocSpec(spec: XlsxDocSpec): void {
     if (rows && o.rows!.some((r) => !r || typeof r !== "object" || Array.isArray(r))) wrong.push(`${where} source: every row must be an object of column → value`);
   };
 
+  // Columns and styling say how a sheet this builder creates is laid out. On
+  // populate_sheet a column list only chooses which data columns are written,
+  // and in what order: a header or a format given there would do nothing.
+  const columns = (where: string, cols: unknown, allowed: string[]) => {
+    if (!present(cols)) return;
+    if (!Array.isArray(cols)) return void wrong.push(`${where}: "columns" must be a list`);
+    cols.forEach((c, i) => {
+      if (!c || typeof c !== "object" || !present((c as XlsxColumnSpec).key)) return void wrong.push(`${where}: column ${i + 1} needs a "key" (the data column it reads)`);
+      extra(`${where} column ${i + 1}`, c as object, allowed);
+    });
+  };
+  const style = (where: string, st: unknown) => {
+    if (!present(st)) return;
+    if (typeof st !== "object") return void wrong.push(`${where}: "style" must be an object`);
+    extra(`${where} style`, st as object, STYLE_FIELDS);
+    const h = (st as XlsxSheetStyle).header;
+    if (present(h) && typeof h === "object") extra(`${where} style header`, h as object, HEADER_STYLE_FIELDS);
+  };
+
   extra("The request", spec, SPEC_FIELDS);
+  if (present(spec.theme) && !Object.keys(THEMES).includes(String(spec.theme))) {
+    wrong.push(`theme "${String(spec.theme)}" is not one of ${Object.keys(THEMES).join(", ")}; leave it out for the default look`);
+  }
   const hasSheets = Array.isArray(spec.sheets) && spec.sheets.length > 0;
   const hasOps = Array.isArray(spec.ops) && spec.ops.length > 0;
   if (hasSheets && hasOps) wrong.push('give "sheets" (a new workbook) or "base" with "ops" (a copy of an existing one), not both: the sheets would be ignored');
@@ -195,6 +223,8 @@ export function validateDocSpec(spec: XlsxDocSpec): void {
     extra(where, sh, SHEET_FIELDS);
     if (!present(sh.name)) wrong.push(`${where} needs a "name"`);
     source(where, sh.source);
+    columns(where, sh.columns, COLUMN_FIELDS);
+    style(where, sh.style);
   });
   (spec.ops ?? []).forEach((op, i) => {
     const where = `Op ${i + 1}`;
@@ -206,6 +236,13 @@ export function validateDocSpec(spec: XlsxDocSpec): void {
     const missing = fields.needs.filter((f) => !present(o[f])).map((f) => `"${f}"`);
     if (missing.length > 0) wrong.push(`${where} (${String(o.op)}) needs ${missing.join(", ")}`);
     if (fields.all.includes("source") && present(o.source)) source(`${where} (${String(o.op)})`, o.source);
+    if (o.op === "add_sheet") {
+      columns(where, o.columns, COLUMN_FIELDS);
+      style(where, o.style);
+    }
+    if (o.op === "populate_sheet") columns(`${where} (populate_sheet)`, o.columns, ["key"]);
+    // Without a value the cell would be blanked: that has to be said, not left out.
+    if (o.op === "set_cell" && !("value" in o)) wrong.push(`${where} (set_cell) needs "value" (null to empty the cell)`);
   });
   if (wrong.length > 0) throw new DocOpError(`The workbook request cannot be carried out as written: ${wrong.join("; ")}.`);
 }
@@ -291,7 +328,8 @@ export function applyOps(wb: ExcelJS.Workbook, ops: ResolvedOp[]): { reports: Op
       case "set_cell": {
         const ws = sheetOrThrow(wb, op.sheet);
         const { col, row } = parseSingleCell(op.cell, 'set_cell "cell"');
-        const cell = ws.getRow(row).getCell(col);
+        // A cell inside a merged range shows the range's one value: that is the cell that is set.
+        const cell = masterOf(ws.getRow(row).getCell(col));
         const value = toFormulaAwareValue(op.value);
         cell.value = value;
         record(ws.name, new Map([[cell.address, value]]));

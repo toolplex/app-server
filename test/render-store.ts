@@ -7,10 +7,12 @@
  */
 
 import assert from "node:assert";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 
-import { FileStore } from "../src/files/store.js";
+import ExcelJS from "exceljs";
+
+import { FileStore, numbersFromText } from "../src/files/store.js";
 
 // The store refuses a dir under the OS temp dir (data-durability guard), so the
 // test scratch lives under cwd (the repo tree) and is removed in `finally`.
@@ -178,6 +180,45 @@ async function main(): Promise<void> {
       wholeRefused = (e as Error).message;
     }
     check("a whole read over its limit is refused, not cut", /more rows than can be read whole.*Nothing was read/.test(wholeRefused));
+
+    // 8. Figures from a query on a file reach the sheet as numbers. DuckDB
+    // hands DECIMAL over as text; written as text, a column of figures looks
+    // right and no total in Excel counts it.
+    const dec = await store.renderXlsx(
+      { title: "decimals", sheets: [{ name: "S", source: { fileId: src.fileId, sql: "SELECT store, CAST(SUM(sold) AS DECIMAL(18,2)) AS total, ROUND(SUM(sold) * 1.12, 2) AS with_tax, 1.0 / 0 AS broken FROM data GROUP BY store ORDER BY store" } }] },
+      requester,
+    );
+    const decBook = new ExcelJS.Workbook();
+    await decBook.xlsx.readFile((await store.getBinaryInfo(dec.manifest.fileId, requester)).path);
+    const ds = decBook.worksheets[0];
+    check("a DECIMAL total is a number in the sheet", ds.getCell("B2").value === 100 && typeof ds.getCell("C2").value === "number" && ds.getCell("C2").value === 112);
+    check("a figure that is not finite is left empty, not written as Infinity", ds.getCell("D2").value === null);
+    check("an id too long for a number keeps its whole column as text", JSON.stringify(numbersFromText([{ name: "id", type: "HUGEINT" }, { name: "n", type: "DECIMAL(18,2)" }, { name: "t", type: "VARCHAR" }], [{ id: "12345678901234567890", n: "10.50", t: "007" }, { id: "5", n: "2", t: "8" }])) === JSON.stringify([{ id: "12345678901234567890", n: 10.5, t: "007" }, { id: "5", n: 2, t: "8" }]));
+
+    // 9. A write that does not come out as it went in is refused and nothing is kept.
+    class WritesSomethingElse extends FileStore {
+      protected async saveWorkbook(wb: ExcelJS.Workbook, path: string): Promise<void> {
+        wb.worksheets[0].getCell("B2").value = "not what was asked";
+        await wb.xlsx.writeFile(path);
+      }
+    }
+    const dir2 = await mkdtemp(SCRATCH_PREFIX);
+    try {
+      const faulty = new WritesSomethingElse({ enabled: true, dir: dir2 });
+      await faulty.init();
+      const { manifest: base2 } = await faulty.renderXlsx({ title: "base", sheets: [{ name: "Items", source: { rows: [{ CODE: "A-1", NAME: "Shirt", SOLD: null }] }, columns: [{ key: "CODE" }, { key: "NAME" }, { key: "SOLD" }] }] }, requester);
+      const filesBefore = (await readdir(dir2)).filter((f) => f.endsWith(".xlsx")).length;
+      let said = "";
+      try {
+        await faulty.renderXlsx({ title: "filled", base: { fileId: base2.fileId }, ops: [{ op: "fill_by_key", sheet: "Items", key: { sheet: "CODE", data: "c" }, set: { SOLD: "q" }, source: { rows: [{ c: "A-1", q: 5 }] } }] }, requester);
+      } catch (e) {
+        said = (e as Error).message;
+      }
+      check("a saved file that differs from what was written is refused", /did not save as it was written, so it was not kept: Items!B2 was s:Shirt and now reads s:not what was asked/.test(said));
+      check("and no workbook is left behind", (await readdir(dir2)).filter((f) => f.endsWith(".xlsx")).length === filesBefore);
+    } finally {
+      await rm(dir2, { recursive: true, force: true });
+    }
 
     console.log(`\n✓ render-store: ${passed} checks passed`);
   } finally {
