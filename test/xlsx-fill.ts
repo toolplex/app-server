@@ -22,7 +22,7 @@ import ExcelJS from "exceljs";
 import JSZip from "jszip";
 
 import { applyOps, validateDocSpec, type ResolvedOp, type XlsxDocSpec } from "../src/files/documents.js";
-import { DocOpError, compareWithBase, dropFormulaResults, findHeaderRow, lastValueRow, parseSingleCell, signaturesOf } from "../src/files/documentFill.js";
+import { DocOpError, compareWithBase, dropFormulaResults, findHeaderRow, lastValueRow, parseSingleCell, signaturesOf, unshareFormulas } from "../src/files/documentFill.js";
 
 let passed = 0;
 function check(label: string, cond: boolean): void {
@@ -222,7 +222,7 @@ async function main(): Promise<void> {
     {
       const wb = tracker();
       wb.getWorksheet("Items")!.getCell("F3").value = "SOLD";
-      refused("a header that appears twice", wb, [{ ...FILL, rows: DATA }], /more than one column headed "SOLD"/);
+      refused("a header that appears twice", wb, [{ ...FILL, rows: DATA }], /"SOLD" heads columns D and F.*as "column:D"/);
     }
     {
       const wb = tracker();
@@ -441,6 +441,8 @@ async function main(): Promise<void> {
     invalid("a column with no key", { sheets: [{ name: "S", source: src, columns: [{ header: "A" }] }] }, /column 1 needs a "key"/);
     invalid("set_cell with no value", { base: { fileId: "f" }, ops: [{ op: "set_cell", sheet: "S", cell: "A1" }] }, /set_cell\) needs "value" \(null to empty the cell\)/);
     invalid("a style field that does nothing", { sheets: [{ name: "S", source: src, style: { header: { bold: true, italic: true }, zoom: 2 } }] }, /style: "zoom" is not used here.*style header: "italic" is not used here/);
+    invalid("an unmatched mode that does not exist", { base: { fileId: "f" }, ops: [{ op: "fill_by_key", sheet: "S", key: { sheet: "A", data: "a" }, set: { B: "a" }, unmatched: "blank", source: src }] }, /"unmatched" is "leave" or "zero"/);
+    invalid("a sharedKeys mode that does not exist", { base: { fileId: "f" }, ops: [{ op: "fill_by_key", sheet: "S", key: { sheet: "A", data: "a" }, set: { B: "a" }, sharedKeys: "yes", source: src }] }, /"sharedKeys" is "refuse" or "fill_each"/);
     validateDocSpec({ base: { fileId: "f" }, ops: [{ op: "fill_by_key", sheet: "S", key: { sheet: "A", data: "a" }, set: { B: "a" }, sharedKeys: "fill_each", unmatched: "zero", overwrite: true, source: src }] });
     check("every option fill_by_key takes is accepted", true);
 
@@ -454,29 +456,39 @@ async function main(): Promise<void> {
     // Found by an independent review of the first version of this code.
     // -----------------------------------------------------------------------
 
-    // "Items with no sales are 0" must never reach the sheet's own totals, even with overwrite.
+    // "Items with no sales are 0": nothing a row without data already holds is written over, whatever is asked.
+    // Such a row may be an item that sold nothing, or the sheet's own total or a heading in the key column.
     {
       const sheet = () => {
         const wb = tracker();
         const ws = wb.getWorksheet("Items")!;
-        ws.getCell("A9").value = "TOTAL"; // the totals row is labelled in the key column
+        ws.getCell("A9").value = "TOTAL"; // a totals row labelled in the key column, with formulas
+        ws.getCell("A10").value = "GRAND TOTAL"; // and one with figures somebody typed
+        ws.getCell("D10").value = 600;
         ws.getCell("D5").value = 77; // last month's figure for an item with no data now
         return wb;
       };
       const wb = sheet();
       const { reports } = applyOps(wb, [{ ...FILL, unmatched: "zero", overwrite: true, rows: [DATA[1]] }]);
       const ws = wb.getWorksheet("Items")!;
-      check("the totals keep their formulas", (ws.getCell("D9").value as ExcelJS.CellFormulaValue).formula === "SUM(D4:D8)" && (ws.getCell("E9").value as ExcelJS.CellFormulaValue).formula === "SUM(E4:E8)");
-      check("rows with no data are set to 0", ws.getCell("D5").value === 0 && ws.getCell("E5").value === 0 && ws.getCell("D8").value === 0 && ws.getCell("D4").value === 1);
-      check("and the report says what was done, not that the rows were left alone", reports[0].unmatched === "zero" && reports[0].unmatchedCellsSet === 6 && reports[0].formulasKept === 2 && reports[0].sheetRowsWithoutData === 4);
-
-      const blank = sheet();
-      applyOps(blank, [{ ...FILL, unmatched: "blank", overwrite: true, rows: [DATA[1]] }]);
-      check('"blank" empties the cell and does not write 0', blank.getWorksheet("Items")!.getCell("D5").value === null && blank.getWorksheet("Items")!.getCell("E5").value === null && (blank.getWorksheet("Items")!.getCell("D9").value as ExcelJS.CellFormulaValue).formula === "SUM(D4:D8)");
-      refused('"blank" over an existing figure without overwrite', sheet(), [{ ...FILL, unmatched: "blank", rows: [DATA[1]] }], /1 already filled \(D5\).*a refresh/);
+      check("totals keep their formulas", (ws.getCell("D9").value as ExcelJS.CellFormulaValue).formula === "SUM(D4:D8)" && (ws.getCell("E9").value as ExcelJS.CellFormulaValue).formula === "SUM(E4:E8)");
+      check("a typed total is not turned into 0", ws.getCell("D10").value === 600);
+      check("a figure already there is kept, not zeroed", ws.getCell("D5").value === 77);
+      check("empty cells of rows without data are set to 0", ws.getCell("E5").value === 0 && ws.getCell("D7").value === 0 && ws.getCell("E8").value === 0 && ws.getCell("E10").value === 0 && ws.getCell("D4").value === 1);
+      const r = reports[0];
+      check("the report says what was set, what was kept, and for which keys", r.unmatched === "zero" && r.unmatchedCellsSet === 6 && r.formulasKept === 2 && r.unmatchedValuesKept === 2 && r.keysThatKeptTheirValues?.join() === "A-200,GRAND TOTAL" && r.sheetRowsWithoutData === 5);
+      // To make an item's old figure 0, the caller gives the item a row: then it is a row the data has.
+      const explicit = sheet();
+      applyOps(explicit, [{ ...FILL, overwrite: true, rows: [DATA[1], { code: "A-200", sold: 0, on_hand: 0 }] }]);
+      check("an item given a row with 0 is set to 0", explicit.getWorksheet("Items")!.getCell("D5").value === 0 && explicit.getWorksheet("Items")!.getCell("D10").value === 600);
       const left = sheet();
       const leftReport = applyOps(left, [{ ...FILL, rows: [DATA[1]] }]).reports[0];
-      check('by default such rows are left as they were, and the report says "leave"', left.getWorksheet("Items")!.getCell("D5").value === 77 && leftReport.unmatched === "leave" && leftReport.unmatchedCellsSet === undefined);
+      check('by default rows without data are left as they were, and the report says "leave"', left.getWorksheet("Items")!.getCell("D5").value === 77 && left.getWorksheet("Items")!.getCell("E5").value === null && leftReport.unmatched === "leave" && leftReport.unmatchedCellsSet === undefined);
+      // A row the data has, with no value for a column, is not a row without data: nothing is put there.
+      const nulls = tracker();
+      const nr = applyOps(nulls, [{ ...FILL, unmatched: "zero", rows: [{ code: "A-100", sold: null, on_hand: 10 }] }]).reports[0];
+      check("an empty value in a row the data has is not turned into 0", nulls.getWorksheet("Items")!.getCell("D4").value === null && nulls.getWorksheet("Items")!.getCell("E4").value === 10 && nr.emptyValuesLeft === 1);
+      refused("an option that does not exist", tracker(), [{ ...FILL, unmatched: "blank" as never, rows: DATA }], /"unmatched" is "leave" or "zero"/);
     }
     // A refusal over formulas does not send the caller straight to "overwrite".
     {
@@ -622,6 +634,157 @@ async function main(): Promise<void> {
       saved.getWorksheet("Items")!.getCell("G20").value = "stray";
       check("a cell that appears only in the saved file is caught", compareWithBase(before.sheets, saved, written).some((w) => /Items!G20 was \(blank\) and now reads s:stray/.test(w)));
       check("the base's cells are counted", before.cells > 20);
+    }
+
+    // -----------------------------------------------------------------------
+    // Found by a second independent review.
+    // -----------------------------------------------------------------------
+
+    // A second table below the first under DIFFERENT headers: its columns mean something else.
+    {
+      const stacked = () => {
+        const wb = new ExcelJS.Workbook();
+        const ws = wb.addWorksheet("S");
+        ws.getRow(1).values = ["CODE", "SOLD"];
+        ws.getRow(2).values = ["A-1"];
+        ws.getRow(3).values = ["A-2"];
+        ws.getCell("A5").value = "Returns";
+        ws.getRow(6).values = ["ITEM", "RETURNED"];
+        ws.getRow(7).values = ["B-1", 3];
+        ws.getRow(8).values = ["B-2"];
+        return wb;
+      };
+      const wb = stacked();
+      const ws = wb.getWorksheet("S")!;
+      const { reports } = applyOps(wb, [{ op: "fill_by_key", sheet: "S", key: { sheet: "CODE", data: "c" }, set: { SOLD: "q" }, rows: [{ c: "A-1", q: 1 }, { c: "A-2", q: 2 }, { c: "B-2", q: 9 }] }]);
+      check("a sold figure is never written under the other table's heading", ws.getCell("B8").value === null && ws.getCell("B7").value === 3 && ws.getCell("B2").value === 1 && ws.getCell("B3").value === 2);
+      check("the fill stops at the row of headings and says so", reports[0].stoppedAtRow === 6 && reports[0].stoppedBecause === "a row of headings" && reports[0].dataRowsNotInSheet === 1);
+      // The table below is filled by naming its own headers.
+      applyOps(wb, [{ op: "fill_by_key", sheet: "S", key: { sheet: "ITEM", data: "c" }, set: { RETURNED: "q" }, rows: [{ c: "B-2", q: 4 }] }]);
+      check("the second table is reached by its own headers", ws.getCell("B8").value === 4);
+      // A row of words that is not a header row does not stop a fill of text.
+      const notes = new ExcelJS.Workbook();
+      const wn = notes.addWorksheet("S");
+      wn.getRow(1).values = ["CODE", "STATUS"];
+      wn.getRow(2).values = ["A-1", "old"];
+      wn.getRow(3).values = ["A-9", "no data for this one"];
+      wn.getRow(4).values = ["A-2", "old"];
+      applyOps(notes, [{ op: "fill_by_key", sheet: "S", key: { sheet: "CODE", data: "c" }, set: { STATUS: "s" }, overwrite: true, rows: [{ c: "A-1", s: "ok" }, { c: "A-2", s: "late" }] }]);
+      check("a fill of words is not stopped by a row of words", wn.getCell("B4").value === "late" && wn.getCell("B3").value === "no data for this one");
+    }
+    // The header counts as repeated only when every key column repeats it.
+    {
+      const wb = new ExcelJS.Workbook();
+      const ws = wb.addWorksheet("S");
+      ws.getRow(1).values = ["Store", "Item", "Qty"];
+      ws.getRow(2).values = ["North", "Shirt"];
+      ws.getRow(3).values = ["Store", "Polo"]; // a shop that is called "Store"
+      ws.getRow(4).values = ["South", "Shirt"];
+      const { reports } = applyOps(wb, [{ op: "fill_by_key", sheet: "S", key: [{ sheet: "Store", data: "s" }, { sheet: "Item", data: "i" }], set: { Qty: "q" }, rows: [{ s: "North", i: "Shirt", q: 1 }, { s: "Store", i: "Polo", q: 2 }, { s: "South", i: "Shirt", q: 3 }] }]);
+      check("one key column that happens to read like its header does not end the table", ws.getCell("C3").value === 2 && ws.getCell("C4").value === 3 && reports[0].stoppedAtRow === undefined);
+    }
+
+    // One header text over several columns, or headings that run over two rows: columns named by letter.
+    {
+      const oneRow = new ExcelJS.Workbook();
+      const w1 = oneRow.addWorksheet("S");
+      w1.getRow(1).values = ["CODE", "Qty", "Amount", "Qty", "Amount"];
+      w1.getRow(2).values = ["A-1"];
+      refused("a header used for two columns", oneRow, [{ op: "fill_by_key", sheet: "S", key: { sheet: "CODE", data: "c" }, set: { Qty: "q" }, rows: [{ c: "A-1", q: 1 }] }], /"Qty" heads columns B and D.*as "column:B"/);
+      const months = () => {
+        const wb = new ExcelJS.Workbook();
+        const ws = wb.addWorksheet("S");
+        ws.getRow(1).values = ["CODE", "Jan", null, "Feb"];
+        ws.getRow(2).values = [null, "Qty", "Amount", "Qty", "Amount"];
+        ws.getRow(3).values = ["A-1"];
+        ws.getRow(4).values = ["A-2"];
+        return wb;
+      };
+      refused("headings on two rows, named by text", months(), [{ op: "fill_by_key", sheet: "S", key: { sheet: "CODE", data: "c" }, set: { Qty: "q" }, rows: [{ c: "A-1", q: 1 }] }], /no row with all of these headers.*headings run over two rows.*as "column:D"/);
+      const wb = months();
+      const { reports } = applyOps(wb, [{ op: "fill_by_key", sheet: "S", key: { sheet: "CODE", data: "c" }, set: { "column:D": "q", "column:e": "a" }, rows: [{ c: "A-2", q: 7, a: 70 }, { c: "A-1", q: 5, a: 50 }] }]);
+      const ws = wb.getWorksheet("S")!;
+      check("columns named by letter are filled, under headings on two rows", ws.getCell("D3").value === 5 && ws.getCell("E4").value === 70 && ws.getCell("B3").value === null && ws.getCell("D2").value === "Qty" && reports[0].targetColumns?.["column:D"] === "D" && reports[0].headerRow === 1 && reports[0].matched === 2);
+      refused("only letters, so no header row can be found", months(), [{ op: "fill_by_key", sheet: "S", key: { sheet: "column:A", data: "c" }, set: { "column:D": "q" }, rows: [{ c: "A-1", q: 1 }] }], /at least one column must be named by its header/);
+    }
+
+    // append_rows: a total anywhere on the sheet that would not take in the new rows.
+    {
+      const sheet = (total: string, where: string, tail?: boolean) => {
+        const wb = new ExcelJS.Workbook();
+        const ws = wb.addWorksheet("Log");
+        ws.getRow(3).values = ["Date", "Qty"];
+        ws.getRow(4).values = ["d1", 1];
+        ws.getRow(5).values = ["d2", 2];
+        ws.getCell(where).value = { formula: total, result: 3 };
+        if (tail) ws.getCell("A8").value = "Prepared by: someone";
+        return wb;
+      };
+      const one = [{ Date: "d3", Qty: 3 }];
+      refused("a total above the data", sheet("SUM(B4:B5)", "B1"), [{ op: "append_rows", sheet: "Log", rows: one }], /would not take in the rows to be added: B1 \(=SUM\(B4:B5\)\)/);
+      refused("a total followed by a line of text", sheet("SUM(B4:B5)", "B6", true), [{ op: "append_rows", sheet: "Log", rows: one }], /would not take in the rows to be added: B6/);
+      const roomy = sheet("SUM(B4:B6)", "B1");
+      applyOps(roomy, [{ op: "append_rows", sheet: "Log", rows: one }]);
+      check("a total that reaches the new row lets it in", roomy.getWorksheet("Log")!.getCell("B6").value === 3);
+      refused("but not two rows when it reaches only one", sheet("SUM(B4:B6)", "B1"), [{ op: "append_rows", sheet: "Log", rows: [...one, { Date: "d4", Qty: 4 }] }], /would not take in the rows to be added/);
+      const other = sheet("SUM(Other!B4:B5)+SUM(D4:D5)", "D1");
+      applyOps(other, [{ op: "append_rows", sheet: "Log", rows: one }]);
+      check("a formula over another sheet or other columns does not stand in the way", other.getWorksheet("Log")!.getCell("A6").value === "d3");
+    }
+
+    // populate_sheet: a formula beside the block is the row's identity unless it reads the block.
+    {
+      const wb = new ExcelJS.Workbook();
+      const ws = wb.addWorksheet("T");
+      ws.getRow(1).values = ["Item", "Qty", "Double"];
+      for (let r = 2; r <= 3; r++) {
+        ws.getCell(`A${r}`).value = { formula: `Items!A${r}`, result: `K${r}` }; // the item, looked up from another sheet
+        ws.getCell(`C${r}`).value = { formula: `B${r}*2`, result: 0 };
+      }
+      refused("a block beside a looked-up key column", wb, [{ op: "populate_sheet", sheet: "T", startCell: "B2", rows: [{ q: 1 }, { q: 2 }] }], /already hold data in other columns \(A2, A3\)/);
+      let advice = "";
+      const full = new ExcelJS.Workbook();
+      const wf = full.addWorksheet("T");
+      wf.getRow(1).values = ["Qty"];
+      wf.getCell("A3").value = 5;
+      try {
+        applyOps(full, [{ op: "populate_sheet", sheet: "T", startCell: "A2", rows: [{ q: 1 }, { q: 2 }] }]);
+      } catch (e) {
+        advice = (e as Error).message;
+      }
+      check("a block that runs into existing cells is told why before overwrite is mentioned", /1 already filled \(A3\).*more rows than the empty area has room for.*Only if this same area is being filled again/.test(advice));
+      const big = new ExcelJS.Workbook();
+      const wbig = big.addWorksheet("T");
+      wbig.getRow(1).values = ["Id"];
+      applyOps(big, [{ op: "populate_sheet", sheet: "T", startCell: "A2", rows: [{ id: 2n ** 60n }, { id: 5n }] }]);
+      check("a whole number too long to be exact is written as text, not rounded", wbig.getCell("A2").value === "1152921504606846976" && wbig.getCell("A3").value === 5);
+    }
+
+    // Filled-down formulas: writing the first cell must not change or break the cells below it.
+    {
+      const wb0 = new ExcelJS.Workbook();
+      const ws0 = wb0.addWorksheet("F");
+      ws0.getRow(1).values = ["CODE", "QTY", "PRICE", "VALUE", "NOTE"];
+      for (let i = 0; i < 4; i++) ws0.getRow(i + 2).values = [`K${i}`, i + 1, 10];
+      ws0.fillFormula("D2:D5", "B2*C2", [10, 20, 30, 40]);
+      ws0.getCell("E2").value = "first line\r\nsecond line";
+      const basePath = join(dir, "shared2.xlsx");
+      await wb0.xlsx.writeFile(basePath);
+      const wb = new ExcelJS.Workbook();
+      await wb.xlsx.readFile(basePath);
+      check("the base has a filled-down formula", (wb.getWorksheet("F")!.getCell("D3").value as ExcelJS.CellSharedFormulaValue).sharedFormula === "D2");
+      check("each cell is given its own formula", unshareFormulas(wb) === 4 && (wb.getWorksheet("F")!.getCell("D4").value as ExcelJS.CellFormulaValue).formula === "B4*C4");
+      const before = signaturesOf(wb);
+      // A value written with a Windows line break is stored with a plain one; the two are the same text.
+      const { written } = applyOps(wb, [{ op: "set_cell", sheet: "F", cell: "D2", value: 99 }, { op: "set_cell", sheet: "F", cell: "E3", value: "written\r\nwith a line break" }]);
+      dropFormulaResults(wb);
+      const saved = await save(wb, out);
+      const sf = saved.getWorksheet("F")!;
+      check("the first cell takes the value and the cells below keep their own formulas", sf.getCell("D2").value === 99 && sf.getCell("D3").formula === "B3*C3" && sf.getCell("D5").formula === "B5*C5");
+      check("and the read-back agrees, line breaks included", compareWithBase(before.sheets, saved, written).length === 0);
+      const xml = await (await JSZip.loadAsync(await readFile(out))).file("xl/worksheets/sheet1.xml")!.async("string");
+      const d4 = /<c r="D4"[^>]*>(.*?)<\/c>/.exec(xml)?.[1] ?? "";
+      check("in the file itself: a formula of its own with no stored result", /<f>B4\*C4<\/f>/.test(d4) && !/<v>/.test(d4) && !/t="shared"/.test(xml));
     }
 
     console.log(`\n✓ xlsx-fill: ${passed} checks passed`);

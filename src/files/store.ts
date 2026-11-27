@@ -41,7 +41,8 @@ import {
   type XlsxDocSpec,
   type XlsxOpSpec,
 } from "./documents.js";
-import { compareWithBase, dropFormulaResults, signaturesOf } from "./documentFill.js";
+import JSZip from "jszip";
+import { compareWithBase, dropFormulaResults, signaturesOf, unshareFormulas } from "./documentFill.js";
 import { resolveDocumentMime, extractDocumentText } from "./textExtract.js";
 
 
@@ -103,20 +104,57 @@ const COPY_FORWARD_BYTES_PER_CELL = 1300;
 /**
  * DuckDB hands DECIMAL (and the wider integers) over as text so that no
  * digit is lost. Written into a sheet as they are, a column of figures would
- * be text: it looks the same and no total counts it. A value in a numeric
- * column that a double holds exactly becomes a number; a longer one (an id
- * of twenty digits) stays text, so its whole column does.
+ * be text: it looks the same and no total counts it.
+ *
+ * A column with decimals is figures: every value becomes a number (a sheet
+ * holds fifteen digits of one in any case). A column of whole numbers may
+ * be ids: it becomes numbers only when every value fits a number exactly,
+ * so an id of twenty digits stays text, and so does its whole column.
  */
-const NUMERIC_TYPE = /^(DECIMAL|NUMERIC|HUGEINT|UHUGEINT|UBIGINT|BIGINT|INTEGER|UINTEGER|SMALLINT|USMALLINT|TINYINT|UTINYINT|DOUBLE|FLOAT|REAL)\b/i;
-const EXACT_NUMBER = /^-?(0|[1-9]\d{0,14})(\.\d{1,15})?$/;
+const DECIMAL_TYPE = /^(DECIMAL|NUMERIC|DOUBLE|FLOAT|REAL)\b/i;
+const WHOLE_TYPE = /^(HUGEINT|UHUGEINT|UBIGINT|BIGINT|INTEGER|UINTEGER|SMALLINT|USMALLINT|TINYINT|UTINYINT)\b/i;
+const DECIMAL_TEXT = /^-?\d+(\.\d+)?([eE][-+]?\d+)?$/;
+const WHOLE_TEXT = /^-?(0|[1-9]\d{0,14})$/;
 export function numbersFromText(columns: Array<{ name: string; type: string }>, rows: Record<string, unknown>[]): Record<string, unknown>[] {
-  const numeric = columns.filter((c) => NUMERIC_TYPE.test(c.type)).map((c) => c.name);
-  const convert = numeric.filter((c) => {
+  const convert = columns
+    .filter((c) => {
+      const pattern = DECIMAL_TYPE.test(c.type) ? DECIMAL_TEXT : WHOLE_TYPE.test(c.type) ? WHOLE_TEXT : null;
+      if (!pattern) return false;
+      let any = false;
+      for (const r of rows) {
+        const v = r[c.name];
+        if (typeof v !== "string") continue;
+        if (!pattern.test(v) || !Number.isFinite(Number(v))) return false;
+        any = true;
+      }
+      return any;
+    })
+    .map((c) => c.name);
+  if (convert.length === 0) return rows;
+  return rows.map((r) => {
+    const o = { ...r };
+    for (const c of convert) if (typeof o[c] === "string") o[c] = Number(o[c]);
+    return o;
+  });
+}
+
+/**
+ * Rows a caller wrote out itself can carry figures as text ("1250"). The
+ * same rule as for rows read from a client's database: a column becomes
+ * numbers only when every value in it is a plain number as written, with no
+ * leading zeros (a code such as "0222" keeps its whole column as text) and
+ * no more digits than a number holds exactly.
+ */
+const PLAIN_NUMBER_TEXT = /^-?(0|[1-9]\d{0,14})(\.\d+)?$/;
+export function plainNumbersFromText(rows: Record<string, unknown>[]): Record<string, unknown>[] {
+  if (rows.length === 0) return rows;
+  const names = [...new Set(rows.flatMap((r) => Object.keys(r)))];
+  const convert = names.filter((c) => {
     let any = false;
     for (const r of rows) {
       const v = r[c];
-      if (typeof v !== "string") continue;
-      if (!EXACT_NUMBER.test(v) || v.replace(/[-.]/g, "").replace(/^0+/, "").length > 15) return false;
+      if (v === null || v === undefined) continue;
+      if (typeof v !== "string" || !PLAIN_NUMBER_TEXT.test(v)) return false;
       any = true;
     }
     return any;
@@ -1289,16 +1327,32 @@ export class FileStore {
         // One workbook in memory at a time. What the base says, cell by cell,
         // is taken down as text before anything is written, so the base need
         // not be read again, or kept, to compare the saved file with.
+        const maxCells = this.copyForwardCellLimit();
+        const tooLarge = (cells: string) =>
+          new FileStoreError(
+            422,
+            `This workbook is too large to copy and write into on this server (${cells}; the limit here is ${maxCells.toLocaleString("en-US")} filled cells). Nothing was saved. Build a new workbook that lists each key with its figures instead.`,
+          );
+        // Refused before it is loaded when the base is plainly too large: its
+        // rows times its columns, sheet by sheet, counts empty cells too, so
+        // only well past the limit is certain.
+        const estimate = baseRec.manifest.tables.reduce((n, t) => n + (t.rowCount ?? 0) * (t.columns?.length ?? 0), 0);
+        if (estimate > maxCells * 1.5) throw tooLarge(`${estimate.toLocaleString("en-US")} cells by its rows and columns`);
+        // A copy made with this library keeps cell content, styles, formulas
+        // and layout. It does not keep charts or pivot tables; whoever gets
+        // the copy has to be told when the original had them.
+        const parts = Object.keys((await JSZip.loadAsync(await readFile(baseRec.uploadPath))).files);
+        const lost = [parts.some((f) => f.startsWith("xl/charts/")) ? "charts" : "", parts.some((f) => f.startsWith("xl/pivotTables/")) ? "pivot tables" : ""].filter(Boolean);
+        if (lost.length > 0) {
+          notes.push(`The original workbook has ${lost.join(" and ")}. They are not carried into this copy: tell the user, who may want the figures pasted into the original instead.`);
+        }
         let wb: ExcelJS.Workbook | null = new ExcelJS.Workbook();
         await wb.xlsx.readFile(xlsxPath);
+        // Filled-down formulas are given a formula each, so that writing one
+        // cell cannot change or break the cells below it.
+        unshareFormulas(wb);
         const before = signaturesOf(wb);
-        const maxCells = Math.min(COPY_FORWARD_MAX_CELLS, Math.max(COPY_FORWARD_MIN_CELLS, Math.floor((this.bounds.memoryMb * 1024 * 1024) / COPY_FORWARD_BYTES_PER_CELL)));
-        if (before.cells > maxCells) {
-          throw new FileStoreError(
-            422,
-            `This workbook is too large to copy and write into on this server (${before.cells.toLocaleString("en-US")} filled cells; the limit here is ${maxCells.toLocaleString("en-US")}). Nothing was saved. Build a new workbook that lists each key with its figures instead.`,
-          );
-        }
+        if (before.cells > maxCells) throw tooLarge(`${before.cells.toLocaleString("en-US")} filled cells`);
         const done = applyOps(wb, ops);
         // A total over the cells just filled must not go on showing its old figure.
         if (dropFormulaResults(wb) > 0) {
@@ -1373,6 +1427,14 @@ export class FileStore {
     }
   }
 
+  /**
+   * The most filled cells a workbook may have to be copied and written into
+   * on this host: its share of memory for one job, within fixed ends.
+   */
+  protected copyForwardCellLimit(): number {
+    return Math.min(COPY_FORWARD_MAX_CELLS, Math.max(COPY_FORWARD_MIN_CELLS, Math.floor((this.bounds.memoryMb * 1024 * 1024) / COPY_FORWARD_BYTES_PER_CELL)));
+  }
+
   /** Writing a workbook to disk, on its own so that a test can stand in for a write that goes wrong. */
   protected async saveWorkbook(wb: ExcelJS.Workbook, path: string): Promise<void> {
     await wb.xlsx.writeFile(path);
@@ -1383,7 +1445,7 @@ export class FileStore {
     source: DocSource,
     requester: Requester,
   ): Promise<Record<string, unknown>[]> {
-    if (Array.isArray(source.rows)) return source.rows;
+    if (Array.isArray(source.rows)) return plainNumbersFromText(source.rows);
     if (!source.fileId) {
       throw new FileStoreError(400, "Each document source needs a fileId or inline rows.");
     }
@@ -1415,48 +1477,16 @@ export class FileStore {
   private async resolveOps(ops: XlsxOpSpec[], requester: Requester): Promise<ResolvedOp[]> {
     const out: ResolvedOp[] = [];
     for (const op of ops) {
-      switch (op.op) {
-        case "set_cell":
-          out.push({ op: "set_cell", sheet: op.sheet, cell: op.cell, value: op.value });
-          break;
-        case "fill_by_key":
-          out.push({
-            op: "fill_by_key",
-            sheet: op.sheet,
-            key: op.key,
-            set: op.set,
-            unmatched: op.unmatched,
-            overwrite: op.overwrite,
-            rows: await this.resolveSource(op.source, requester),
-          });
-          break;
-        case "populate_sheet":
-          out.push({
-            op: "populate_sheet",
-            sheet: op.sheet,
-            startCell: op.startCell,
-            columns: op.columns,
-            overwrite: op.overwrite,
-            rows: await this.resolveSource(op.source, requester),
-          });
-          break;
-        case "append_rows":
-          out.push({
-            op: "append_rows",
-            sheet: op.sheet,
-            rows: await this.resolveSource(op.source, requester),
-          });
-          break;
-        case "add_sheet":
-          out.push({
-            op: "add_sheet",
-            name: op.name,
-            rows: await this.resolveSource(op.source, requester),
-            columns: op.columns,
-            style: op.style,
-          });
-          break;
+      // The op goes on whole, with only its source turned into rows. The
+      // fields used to be copied one by one, and one that was missed (the
+      // option that allows a key on several rows) never reached the code
+      // that reads it: its refusal named a remedy that did nothing.
+      if (op.op === "set_cell") {
+        out.push({ op: "set_cell", sheet: op.sheet, cell: op.cell, value: op.value });
+        continue;
       }
+      const { source, ...rest } = op;
+      out.push({ ...rest, rows: await this.resolveSource(source, requester) } as ResolvedOp);
     }
     return out;
   }

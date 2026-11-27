@@ -13,7 +13,7 @@
 // Fidelity note: exceljs re-serializes the whole workbook on save, so a
 // copy-forward preserves cell content / styles / formulas / column layout but
 // can drop charts and pivot tables. Fine for data-grid trackers; the store
-// warns when a base carries those parts. See DOCUMENT_ARTIFACTS_SCOPING.md §8.
+// says so in the result's notes when a base carries those parts.
 //
 // Writing into an existing sheet is in documentFill.ts, with its rules: by
 // key or by header where the sheet can say where a value goes, by position
@@ -89,8 +89,8 @@ export interface FillByKeySpec {
   key: KeyPair | KeyPair[];
   /** Header in the sheet → column in the data. */
   set: Record<string, string>;
-  /** A sheet row with no data row: "leave" (default), "blank" or "zero". */
-  unmatched?: "leave" | "blank" | "zero";
+  /** A sheet row with no data row: "leave" (default), or "zero" to put 0 in its empty cells. */
+  unmatched?: "leave" | "zero";
   /** Write over cells that already hold a value or a formula. */
   overwrite?: boolean;
   /** Sheet rows carrying the same key: "refuse" (default) or "fill_each". */
@@ -241,6 +241,10 @@ export function validateDocSpec(spec: XlsxDocSpec): void {
       style(where, o.style);
     }
     if (o.op === "populate_sheet") columns(`${where} (populate_sheet)`, o.columns, ["key"]);
+    if (o.op === "fill_by_key") {
+      if (present(o.unmatched) && !["leave", "zero"].includes(String(o.unmatched))) wrong.push(`${where} (fill_by_key): "unmatched" is "leave" or "zero"`);
+      if (present(o.sharedKeys) && !["refuse", "fill_each"].includes(String(o.sharedKeys))) wrong.push(`${where} (fill_by_key): "sharedKeys" is "refuse" or "fill_each"`);
+    }
     // Without a value the cell would be blanked: that has to be said, not left out.
     if (o.op === "set_cell" && !("value" in o)) wrong.push(`${where} (set_cell) needs "value" (null to empty the cell)`);
   });
