@@ -101,6 +101,8 @@ const DOC_SOURCE_MAX_BYTES = 32 * 1024 * 1024;
 const COPY_FORWARD_MAX_CELLS = 1_000_000;
 const COPY_FORWARD_MIN_CELLS = 100_000;
 const COPY_FORWARD_BYTES_PER_CELL = 1300;
+const NEW_WORKBOOK_BYTES_PER_CELL = 2400;
+const NEW_WORKBOOK_MIN_CELLS = 200_000;
 
 /**
  * DuckDB hands DECIMAL (and the wider integers) over as text so that no
@@ -1419,8 +1421,9 @@ export class FileStore {
         // 125,000 rows split over three sheets took a server's process past
         // its ceiling. The whole workbook is held to the limit this server's
         // memory allows.
-        const cells = sheets.reduce((n, sh) => n + sh.rows.length * Math.max(1, sh.columns?.length ?? Object.keys(sh.rows[0] ?? {}).length), 0);
-        const maxCells = this.copyForwardCellLimit();
+        // (An empty column list means every column of the data, as it does when the sheet is written.)
+        const cells = sheets.reduce((n, sh) => n + sh.rows.length * Math.max(1, sh.columns?.length || Object.keys(sh.rows[0] ?? {}).length), 0);
+        const maxCells = this.newWorkbookCellLimit();
         if (cells > maxCells) {
           throw new FileStoreError(
             422,
@@ -1478,7 +1481,18 @@ export class FileStore {
    * The most filled cells a workbook may have to be copied and written into
    * on this host: its share of memory for one job, within fixed ends.
    */
-  /** How many cells a workbook built or copied here may hold: this server's share of memory for one job, over what a cell costs. */
+  /**
+   * How many cells a NEW workbook may hold. Building one and reading it back
+   * for its queryable copy costs more per cell than copying one (measured:
+   * about 875 MB at 400,000 cells, 1.6 GB at 820,000), so the limit is lower
+   * for the same memory; and a host with little to spare still builds a
+   * workbook of ordinary size.
+   */
+  protected newWorkbookCellLimit(): number {
+    return Math.min(COPY_FORWARD_MAX_CELLS, Math.max(NEW_WORKBOOK_MIN_CELLS, Math.floor((this.bounds.memoryMb * 1024 * 1024) / NEW_WORKBOOK_BYTES_PER_CELL)));
+  }
+
+  /** How many cells a workbook copied here may hold: this server's share of memory for one job, over what a cell costs. */
   protected copyForwardCellLimit(): number {
     return Math.min(COPY_FORWARD_MAX_CELLS, Math.max(COPY_FORWARD_MIN_CELLS, Math.floor((this.bounds.memoryMb * 1024 * 1024) / COPY_FORWARD_BYTES_PER_CELL)));
   }

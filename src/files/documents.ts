@@ -106,7 +106,7 @@ export interface FillByKeySpec {
 export type XlsxOpSpec =
   | ({ op: "fill_by_key"; source: DocSource } & FillByKeySpec)
   | { op: "populate_sheet"; sheet: string; startCell: string; columns?: XlsxColumnSpec[]; overwrite?: boolean; source: DocSource }
-  | { op: "append_rows"; sheet: string; source: DocSource }
+  | { op: "append_rows"; sheet: string; afterRow?: number; source: DocSource }
   | { op: "set_cell"; sheet: string; cell: string; value: unknown }
   | {
       op: "add_sheet";
@@ -142,7 +142,7 @@ export interface ResolvedSheet {
 export type ResolvedOp =
   | ({ op: "fill_by_key"; rows: Record<string, unknown>[] } & FillByKeySpec)
   | { op: "populate_sheet"; sheet: string; startCell?: string; columns?: XlsxColumnSpec[]; overwrite?: boolean; rows: Record<string, unknown>[] }
-  | { op: "append_rows"; sheet: string; rows: Record<string, unknown>[] }
+  | { op: "append_rows"; sheet: string; afterRow?: number; rows: Record<string, unknown>[] }
   | { op: "set_cell"; sheet: string; cell: string; value: unknown }
   | {
       op: "add_sheet";
@@ -165,7 +165,7 @@ const HEADER_STYLE_FIELDS = ["bold", "fill", "color"];
 const OP_FIELDS: Record<string, { all: string[]; needs: string[] }> = {
   fill_by_key: { all: ["op", "sheet", "key", "set", "unmatched", "overwrite", "sharedKeys", "headerRow", "lastRow", "source"], needs: ["sheet", "key", "set", "source"] },
   populate_sheet: { all: ["op", "sheet", "startCell", "columns", "overwrite", "source"], needs: ["sheet", "startCell", "source"] },
-  append_rows: { all: ["op", "sheet", "source"], needs: ["sheet", "source"] },
+  append_rows: { all: ["op", "sheet", "afterRow", "source"], needs: ["sheet", "source"] },
   set_cell: { all: ["op", "sheet", "cell", "value"], needs: ["sheet", "cell"] },
   add_sheet: { all: ["op", "name", "source", "columns", "style"], needs: ["name", "source"] },
 };
@@ -261,6 +261,7 @@ export function validateDocSpec(spec: XlsxDocSpec): void {
         wrong.push(`${where} (fill_by_key): "set" is { <header in the sheet>: <column in the data>, … }, each a column name as text`);
       }
     }
+    if (o.op === "append_rows" && present(o.afterRow) && !(Number.isInteger(o.afterRow) && (o.afterRow as number) >= 1)) wrong.push(`${where} (append_rows): "afterRow" is the number of a sheet row (1 or more)`);
     // Without a value the cell would be blanked: that has to be said, not left out.
     if (o.op === "set_cell" && !("value" in o)) wrong.push(`${where} (set_cell) needs "value" (null to empty the cell)`);
   });
@@ -347,7 +348,7 @@ export function applyOps(wb: ExcelJS.Workbook, ops: ResolvedOp[]): { reports: Op
       }
       case "append_rows": {
         const ws = sheetOrThrow(wb, op.sheet);
-        const done = appendByHeader(ws, op.rows);
+        const done = appendByHeader(ws, op.rows, { afterRow: op.afterRow });
         record(ws.name, done.written);
         reports.push(done.report);
         break;

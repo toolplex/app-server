@@ -1215,7 +1215,7 @@ async function main(): Promise<void> {
     {
       const one = (rows: object[]) => [{ op: "append_rows" as const, sheet: "S", rows: rows as Record<string, unknown>[] }];
       refused("another table below an empty row", sheetOf([["CODE", "QTY"], ["A", 1], [], ["ITEM", "RETURNED"], ["X", 2]]), one([{ CODE: "B", QTY: 2 }]), /has an empty row \(row 3\) between its headers \(row 1\) and the last row that holds anything \(row 5: A5 "X", B5 "2"\)/);
-      refused("a footer directly below the rows", sheetOf([["CODE", "QTY"], ["A", 1], ["Prepared by: someone"]]), one([{ CODE: "B", QTY: 2 }]), /\(row 3: A3 "Prepared by: someone"\) does not read like the rows above it: every one of them holds a figure under "QTY", and it does not/);
+      refused("a footer directly below the rows", sheetOf([["CODE", "QTY"], ["A", 1], ["Prepared by: someone"]]), one([{ CODE: "B", QTY: 2 }]), /cannot be told for certain: A3 "Prepared by: someone" reads like the label of a total, an average or a closing line.*The table's last rows are: row 2 \(A2 "A", B2 "1"\); row 3 \(A3 "Prepared by: someone"\)\. Read them\..*"afterRow": 3/);
       const plain = sheetOf([["Report"], [], ["CODE", "QTY"], ["A", 1]], (ws) => void (ws.getCell("D1").value = { formula: "SUM(B1:B2)", result: 0 }));
       plain.addWorksheet("Other").getCell("A1").value = { formula: "SUM(S!A4:B4)+SUM(Données!B4:B5)", result: 0 };
       applyOps(plain, one([{ CODE: "B", QTY: 2 }]));
@@ -1407,29 +1407,61 @@ async function main(): Promise<void> {
       // A total somebody typed, with its label, or known only by being the sum of what is above it.
       const typed = (last: unknown[]) => sheetOf([["Date", "Store", "Qty", "Amount"], ["d1", "N", 1, 10], ["d2", "S", 2, 20], ["d3", "E", 3, 30], last]);
       const four = [{ op: "append_rows" as const, sheet: "S", rows: [{ Date: "d4", Store: "W", Qty: 9, Amount: 90 }] }];
-      refused("a typed total that leaves a column empty", typed(["TOTAL", null, 6, 60]), four, /\(row 5: A5 "TOTAL", C5 "6", D5 "60"\) does not read like the rows above it: every one of them holds something under "Store", and it does not/);
-      refused("a typed total with its label, every column filled", typed(["Total", "all", 6, 61]), four, /reads like the table's totals: A5 "Total"/);
-      refused("a typed total with no label", typed(["all", "all", 6, 60]), four, /reads like the table's totals: C5 \(6\) and D5 \(60\) are each the sum of the figures above them/);
+      const closing = /The last row of sheet "S" that holds anything \(row \d+\) is the table's total or closing line, by /;
+      const asked = /Whether the last row of sheet "S" is a row of the table cannot be told for certain: /;
+      refused("a typed total that leaves a column empty", typed(["TOTAL", null, 6, 60]), four, /is the table's total or closing line, by its label, A5 "TOTAL"/);
+      refused("a typed total with its label, every column filled", typed(["Total", "all", 6, 61]), four, /by its label, A5 "Total"/);
+      refused("a typed total with no label", typed(["all", "all", 6, 60]), four, /by C5 \(6\) and D5 \(60\) each being the sum of the figures above them/);
       // What closes a table without a formula and without the word "total".
-      refused("an average row", typed(["Average", null, 2, 20]), four, /does not read like the rows above it/);
-      refused("a total in another language", typed(["Kabuuan", "lahat", 6.0, 60.01]), four, /reads like the table's totals: A5 "Kabuuan"/);
-      refused("a line net of something", typed(["Net of returns", "all", 5, 50]), four, /reads like the table's totals: A5 "Net of returns"/);
+      refused("an average row", typed(["Average", null, 2, 20]), four, /by its label, A5 "Average"/);
+      refused("a total in another language", typed(["Kabuuan", "lahat", 6.0, 60.01]), four, /by its label, A5 "Kabuuan"/);
+      refused("a line net of something", typed(["Net of returns", "all", 5, 50]), four, /by its label, A5 "Net of returns"/);
+      refused("a label followed by a colon", typed(["Total:", "all", 7, 61]), four, /by its label, A5 "Total:"/);
+      refused("a last row that lacks what every row above has, with no other sign", typed(["d9", null, 20, 61]), four, /cannot be told for certain: row 5 does not hold anything under "Store", which every row above it does/);
+      // A label that only begins like one is certain together with a figure that is the sum above it (rounded as typed totals are).
+      const items = (last: unknown[]) => sheetOf([["Item", "Amount"], ["a", 100.25], ["b", 110.2], ["c", 100.3], last]);
+      const oneItem = [{ op: "append_rows" as const, sheet: "S", rows: [{ Item: "d", Amount: 5 }] }];
+      refused("a total with a longer label", items(["Total Amount", 310.75]), oneItem, /by its label, A5 "Total Amount", and B5 \(310\.75\) being the sum of the figures above it/);
+      refused("a total rounded to a whole number", items(["TOTAL PHP", 311]), oneItem, /by its label, A5 "TOTAL PHP", and B5 \(311\) being the sum/);
+      refused("a subtotal named for its group", items(["Sub-total South", 310.75]), oneItem, closing);
+      // Without the sum to confirm it, such a label only raises the question; so do the other words a closing line begins with.
+      for (const label of ["Total Amount", "Count", "Maximum", "Average per item", "% of target", "Balance c/f", "Note: prices exclude VAT", "Checked by"]) {
+        refused(`a last row labelled "${label}"`, items([label, 42]), oneItem, asked);
+      }
+      refused("an unlabelled total in the table's only column of figures", items(["all", 310.75]), oneItem, /B5 \(310\.75\) is the sum of the figures above it, in the table's only column of figures/);
+      // The answer to the question: the row to add after, once the rows have been read.
+      const confirmed = items(["Total Engine Oil 1L", 42]);
+      refused("an item whose name begins like a total, until it is confirmed", confirmed, oneItem, /A5 "Total Engine Oil 1L" reads like the label of a total.*The table's last rows are: row 3 \(A3 "b", B3 "110\.2"\); row 4 \(A4 "c", B4 "100\.3"\); row 5 \(A5 "Total Engine Oil 1L", B5 "42"\)\. Read them\. If row 5 is an ordinary row of the table.*send the same op with "afterRow": 5 and the rows are added from row 6/);
+      applyOps(confirmed, [{ ...oneItem[0], afterRow: 5 }]);
+      check("confirmed, the rows are added after it", confirmed.getWorksheet("S")!.getCell("A6").value === "d" && confirmed.getWorksheet("S")!.getCell("B6").value === 5);
+      refused("a row to add after that is not the sheet's last", items(["e", 42]), [{ ...oneItem[0], afterRow: 4 }], /"afterRow" is 4, and the last row of sheet "S" that holds anything is row 5 \(A5 "e", B5 "42"\)\. Rows are added only after that row/);
+      refused("what is certain is not waived by confirming", items(["Total", 42]), [{ ...oneItem[0], afterRow: 5 }], /by its label, A5 "Total"/);
+      const pending = sheetOf([["Item", "Qty"], ["a", 1], ["b", 2], ["c", "pending"]]);
+      refused("a word under a column of figures in the last row", pending, [{ op: "append_rows", sheet: "S", rows: [{ Item: "d", Qty: 4 }] }], /row 4 \(A4 "c", B4 "pending"\) holds words under "Qty", a column of figures: another table's headings, a note, or only an odd value/);
+      applyOps(pending, [{ op: "append_rows", sheet: "S", afterRow: 4, rows: [{ Item: "d", Qty: 4 }] }]);
+      check("and confirmed as only an odd value, the log takes the row", pending.getWorksheet("S")!.getCell("B5").value === 4);
+      refused("a note in one cell under a table with an optional column", sheetOf([["Item", "Qty", "Remark"], ["a", 1, null], ["b", 2, "x"], ["prices exclude VAT", null, null]]), [{ op: "append_rows", sheet: "S", rows: [{ Item: "d", Qty: 4, Remark: null }] }], /row 4 holds a value under one header only, where the rows above it hold more/);
+      refused("a note in one cell directly under headers with no rows yet", sheetOf([["Item", "Qty"], ["prices exclude VAT"]]), [{ op: "append_rows", sheet: "S", rows: [{ Item: "d", Qty: 4 }] }], /row 2 is the only row under the headers and holds a value under one of them only/);
       const datedLog = (last: unknown[]) => sheetOf([["Date", "Store", "Qty", "Amount"], [day(1), "N", 1, 10], [day(2), "S", 2, 20], [day(3), "S", 3, 30], last]);
       const fourD = [{ op: "append_rows" as const, sheet: "S", rows: [{ Date: "2026-11-04", Store: "W", Qty: 9, Amount: 90 }] }];
-      refused("a subtotal for the last group, labelled with the group", datedLog(["South", "S", 5, 50]), fourD, /Row 5 of sheet "S" \(.*\) does not read like a row of the table under row 1: it holds words under "Date", a column of dates/);
-      refused("a signature line that fills two columns", datedLog(["Prepared by:", "J. Cruz", null, null]), fourD, /does not read like a row of the table under row 1: it holds words under "Date"/);
-      refused("another table directly below, with no empty row", sheetOf([["Date", "Store", "Qty", "Amount"], [day(1), "N", 1, 10], [day(2), "S", 2, 20], ["Date", "Store", "Returned", "Refund"], [day(3), "S", 11, 110]]), fourD, /Row 4 of sheet "S" \(A4 "Date", B4 "Store", C4 "Returned", D4 "Refund"\) does not read like a row of the table under row 1: it holds words under "Date", a column of dates/);
-      refused("the headers again inside a table of words", sheetOf([["Name", "Remarks"], ["a", "x"], ["Name", "Remarks"], ["b", "y"]]), [{ op: "append_rows", sheet: "S", rows: [{ Name: "c", Remarks: "z" }] }], /Row 3 of sheet "S" \(A3 "Name", B3 "Remarks"\) does not read like a row of the table under row 1: it holds the headers again/);
+      refused("a subtotal for the last group, labelled with the group", datedLog(["South", "S", 5, 50]), fourD, /cannot be told for certain: row 5 \(.*\) holds words under "Date", a column of dates/);
+      refused("a signature line that fills two columns", datedLog(["Prepared by:", "J. Cruz", null, null]), fourD, /A5 "Prepared by:" reads like the label of a total, an average or a closing line/);
+      refused("another table directly below, with no empty row", sheetOf([["Date", "Store", "Qty", "Amount"], [day(1), "N", 1, 10], [day(2), "S", 2, 20], ["Date", "Store", "Returned", "Refund"], [day(3), "S", 11, 110]]), fourD, /holds words under every column of figures on row 4 \(A4 "Date", B4 "Store", C4 "Returned", D4 "Refund"\): it reads like another table's headings/);
+      refused("the headers again inside a table of words", sheetOf([["Name", "Remarks"], ["a", "x"], ["Name", "Remarks"], ["b", "y"]]), [{ op: "append_rows", sheet: "S", rows: [{ Name: "c", Remarks: "z" }] }], /holds the headers again on row 3 \(A3 "Name", B3 "Remarks"\): another table begins there/);
       const hidden = datedLog([day(4), "E", 4, 40]);
       hidden.getWorksheet("S")!.getRow(6).hidden = true;
       refused("rows below the table that are hidden", hidden, fourD, /The rows below the table on sheet "S" \(from row 6\) are hidden/);
       // Ordinary logs are not refused for looking a little like one of those.
       const chance = sheetOf([["No.", "Date", "Qty"], [1, day(1), 5], [2, day(2), 7], [3, day(3), 12]]);
-      applyOps(chance, [{ op: "append_rows", sheet: "S", rows: [{ Date: "2026-11-04", Qty: 9 }] }]);
-      check("a last figure that happens to equal the sum of those above, in one column, is a row like any other", chance.getWorksheet("S")!.getCell("C5").value === 9 && chance.getWorksheet("S")!.getCell("B5").value instanceof Date);
+      refused("a last figure that equals the sum of those above, in the only column of figures: asked, with the rows shown as they are written", chance, [{ op: "append_rows", sheet: "S", rows: [{ Date: "2026-11-04", Qty: 9 }] }], /C4 \(12\) is the sum of the figures above it, in the table's only column of figures\. Nothing was added\. The table's last rows are: row 2 \(A2 "1", B2 "2026-11-01", C2 "5"\); row 3 \(A3 "2", B3 "2026-11-02", C3 "7"\); row 4 \(A4 "3", B4 "2026-11-03", C4 "12"\)/);
+      applyOps(chance, [{ op: "append_rows", sheet: "S", afterRow: 4, rows: [{ Date: "2026-11-04", Qty: 9 }] }]);
+      check("and confirmed, it is a row like any other (a running number is never taken for a total)", chance.getWorksheet("S")!.getCell("C5").value === 9 && chance.getWorksheet("S")!.getCell("B5").value instanceof Date);
+      const longer = sheetOf([["No.", "Date", "Qty", "Amt"], [1, day(1), 5, 50], [2, day(2), 7, 71], [3, day(3), 12, 99]]);
+      applyOps(longer, [{ op: "append_rows", sheet: "S", rows: [{ Date: "2026-11-04", Qty: 9, Amt: 9 }] }]);
+      check("with other columns of figures that do not sum, one that does by chance raises no question", longer.getWorksheet("S")!.getCell("C5").value === 9);
       const product = sheetOf([["Item", "Qty"], ["Brake Fluid 500ml", 4], ["Total Engine Oil 1L", 7]]);
-      applyOps(product, [{ op: "append_rows", sheet: "S", rows: [{ Item: "Coolant 1L", Qty: 2 }] }]);
-      check('an item whose name begins with "Total" is not a total', product.getWorksheet("S")!.getCell("A4").value === "Coolant 1L");
+      applyOps(product, [{ op: "append_rows", sheet: "S", afterRow: 3, rows: [{ Item: "Coolant 1L", Qty: 2 }] }]);
+      check('an item whose name begins with "Total" is a row of the table once that is confirmed', product.getWorksheet("S")!.getCell("A4").value === "Coolant 1L");
       const optional = sheetOf([["Date", "Note"], [day(1), "rain"], [day(2), null], [day(3), null]]);
       applyOps(optional, [{ op: "append_rows", sheet: "S", rows: [{ Date: "2026-11-04", Note: "ok" }] }]);
       check("a last row that lacks a value some rows above also lack is a row of the table", optional.getWorksheet("S")!.getCell("B5").value === "ok");

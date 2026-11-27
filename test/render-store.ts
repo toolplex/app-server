@@ -292,6 +292,10 @@ async function main(): Promise<void> {
       protected copyForwardCellLimit(): number {
         return this.limit;
       }
+      fresh: number | undefined;
+      protected newWorkbookCellLimit(): number {
+        return this.fresh ?? this.limit;
+      }
     }
     const dir3 = await mkdtemp(SCRATCH_PREFIX);
     try {
@@ -375,12 +379,13 @@ async function main(): Promise<void> {
 
     // 17. The size limit follows this server's memory; it is not one number for every server.
     class Limit extends FileStore {
-      shown(): { limit: number; memoryMb: number } {
-        return { limit: this.copyForwardCellLimit(), memoryMb: (this as unknown as { bounds: { memoryMb: number } }).bounds.memoryMb };
+      shown(): { limit: number; fresh: number; memoryMb: number } {
+        return { limit: this.copyForwardCellLimit(), fresh: this.newWorkbookCellLimit(), memoryMb: (this as unknown as { bounds: { memoryMb: number } }).bounds.memoryMb };
       }
     }
     const lim = new Limit({ enabled: true, dir: dir }).shown();
     check("the size limit is this server's memory share divided by what a cell costs, within its two ends", lim.limit === Math.min(1_000_000, Math.max(100_000, Math.floor((lim.memoryMb * 1024 * 1024) / 1300))) && lim.limit < 1_000_000);
+    check("a new workbook costs more per cell, so its limit is lower for the same memory, and never below an ordinary size", lim.fresh === Math.min(1_000_000, Math.max(200_000, Math.floor((lim.memoryMb * 1024 * 1024) / 2400))) && lim.fresh < lim.limit && lim.fresh >= 200_000);
 
     // 18. Pivot tables are named too; an op cannot carry rows of its own beside its source.
     const pz = await JSZip.loadAsync(await plain.xlsx.writeBuffer());
@@ -535,6 +540,20 @@ async function main(): Promise<void> {
       check("a new workbook over the limit across its sheets is refused, with what to do instead", /^422 This workbook would be too large to build on this server: 8 cells over 2 sheets; the limit here is 7\. Nothing was saved\. Save the full list as a table instead/.test(await newBook()));
       heavy.limit = 8;
       check("and one at the limit is built", (await newBook()) === "");
+      heavy.limit = 1000;
+      heavy.fresh = 7;
+      check("a new workbook is held to its own limit, not to the one for a copied workbook", /the limit here is 7\./.test(await newBook()));
+      heavy.fresh = undefined;
+      heavy.limit = 5;
+      let listed = "";
+      try {
+        await heavy.renderXlsx({ title: "listed", sheets: [{ name: "A", columns: [], source: { rows: [{ a: 1, b: 2, c: 3 }, { a: 4, b: 5, c: 6 }] } }] }, requester);
+      } catch (e) {
+        listed = (e as Error).message;
+      }
+      check("an empty column list means every column, for the count as for the sheet", /too large to build on this server: 6 cells over 1 sheet; the limit here is 5/.test(listed));
+      const named = await heavy.renderXlsx({ title: "two of three", sheets: [{ name: "A", columns: [{ key: "a" }, { key: "b" }], source: { rows: [{ a: 1, b: 2, c: 3 }, { a: 4, b: 5, c: 6 }] } }] }, requester).then(() => "", (e) => (e as Error).message);
+      check("and the columns that are written are the ones counted", named === "");
       heavy.limit = 13; // nine filled cells, three of them formulas: 9 + 3 × 1.5, rounded, is 14
       check("three formulas among nine cells put a workbook over a limit of thirteen", /^422 This workbook is too large .*\(9 filled cells, 3 of them formulas, which count for more; the limit here is 13 filled cells\)/.test(await tryFill()));
       heavy.limit = 14;
