@@ -79,7 +79,7 @@ async function main(): Promise<void> {
       {
         title: "SR Report v2",
         base: { fileId: built.fileId },
-        ops: [{ op: "append_rows", sheet: "Summary", source: { rows: [{ Sold: 9, Store: "Gamma" }] } }],
+        ops: [{ op: "append_rows", sheet: "Summary", afterRow: 3, source: { rows: [{ Sold: 9, Store: "Gamma" }] } }],
       },
       requester,
     );

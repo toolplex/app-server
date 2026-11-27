@@ -123,6 +123,10 @@ export interface OpReport {
   datesAsText?: string[];
   /** Columns in which numbers went in as text, as the data gave them: Excel leaves text out of totals. */
   numbersAsText?: string[];
+  /** append_rows: the row the caller confirmed as the table's last, as it reads. */
+  addedAfter?: string;
+  /** append_rows: signs that the row added after is not an ordinary row of the table, which the caller confirmed it is. */
+  lastRowSigns?: string[];
   /** append_rows: what on the sheet is set to a range that does not take in the rows added (a filter, a print area). */
   doesNotCover?: string[];
   emptyValuesLeft?: number;
@@ -1287,9 +1291,10 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
   // average, a note, a signature, another table's last row) cannot be read
   // off a sheet with certainty, and every rule for it has been wrong one way
   // or the other. So there are two kinds of sign. Some are certain, and
-  // refuse. The rest only raise a doubt: then nothing is added, the last
-  // rows are quoted with their numbers, and the caller, who can read them,
-  // confirms the row to add after ("afterRow") or builds a new workbook.
+  // refuse. The rest are only signs, and no list of them is complete: so
+  // nothing is ever added until the caller, who can read, has been shown
+  // the last rows with their numbers and any signs found, and has confirmed
+  // the row to add after ("afterRow").
   type Kind = "number" | "date" | "text" | "none";
   const kindOf = (cell: ExcelJS.Cell): Kind => {
     const v = cell.value as unknown;
@@ -1333,6 +1338,7 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
   // Figures in the last row that are the sum of the figures above them (to
   // the rounding a typed total has). A running number is left out: 1 + 2 = 3.
   const sums: string[] = [];
+  const nearSums: string[] = []; // rounded further than that: to tens, to thousands
   let figureColumns = 0;
   if (tableRows.length >= 3) {
     for (let c = run.c1; c <= run.c2; c++) {
@@ -1352,19 +1358,25 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
       }
       if (n >= 2 && !counting) figureColumns++;
       const v = lastRow.getCell(c).value;
-      if (typeof v === "number" && v !== 0 && n >= 2 && !counting && Math.abs(sum - v) <= Math.max(0.5, 1e-6 * Math.abs(v))) sums.push(`${addr(c, end)} (${v})`);
+      if (typeof v !== "number" || v === 0 || n < 2 || counting) continue;
+      if (Math.abs(sum - v) <= Math.max(0.5, 1e-6 * Math.abs(v))) sums.push(`${addr(c, end)} (${v})`);
+      else if (Math.abs(sum - v) <= 0.005 * Math.abs(v)) nearSums.push(`${addr(c, end)} (${v})`);
     }
   }
   // A label that closes a table: the whole of a cell ("Total", "Sub-total",
   // "Average"), or its first word ("Total Amount", "Average per item").
   const strip = (t: string) => t.trim().replace(/\s*[:(].*$/, "");
-  const CLOSING_LABEL = /^((grand|sub|net)[- ]?)?totals?$|^(sum|average|avg|mean|kabuuan|overall)$|^(total|net|average|sum) (of|for) /i;
-  const CLOSING_WORD = /^((grand|sub|net)[- ]?)?totals?\b|^(sum|average|avg|mean|kabuuan|overall|count|maximum|minimum|max|min|balance)\b|^%|^(prepared|checked|approved|noted|reviewed|received) by\b|^(note|notes|remarks?|source)\b|\b[cb]\/f\b/i;
+  // Certain on its own: a cell that says nothing but "total" (a value such
+  // as "Average" or "Overall" can be a rating or a remark). Anything that
+  // names a total anywhere ("Month total", "** TOTAL **", "Share of total"),
+  // or begins as a closing line does, raises the question.
+  const CLOSING_LABEL = /^((grand|sub|net)[- ]?)?totals?$|^kabuuan$|^(total|net) (of|for) /i;
+  const CLOSING_WORD = /\btotals?\b|^(sub[- ]?total|sum|average|avg|ave|mean|kabuuan|overall|count|maximum|minimum|max|min|balance|target|variance|margin)\b|^%|^(prepared|checked|approved|noted|reviewed|received) by\b|^(note|notes|remarks?|source)\b|\b[cb]\/f\b/i;
   const labels: Array<{ cell: ExcelJS.Cell; whole: boolean }> = [];
   if (end > header.row) {
     lastRow.eachCell({ includeEmpty: false }, (cell) => {
       if (typeof cell.value !== "string") return;
-      const whole = CLOSING_LABEL.test(strip(cell.value));
+      const whole = CLOSING_LABEL.test(strip(cell.value).replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ""));
       if (whole || CLOSING_WORD.test(cell.value.trim())) labels.push({ cell, whole });
     });
   }
@@ -1383,14 +1395,17 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
   const doubts: string[] = [];
   if (tableRows.length > 0) {
     for (const l of labels) doubts.push(`${said(l)} reads like the label of a total, an average or a closing line`);
-    // One figure that is the sum of those above it is a total when it is the table's only column of
-    // figures; beside other columns of figures that are not sums, it is chance.
-    if (sums.length === 1 && figureColumns === 1) doubts.push(`${sums[0]} is the sum of the figures above it, in the table's only column of figures`);
+    // One figure that is the sum of those above it may be chance, or the total of a row that also
+    // holds an average or a rounded figure beside it: it raises the question either way.
+    if (sums.length === 1) doubts.push(`${sums[0]} is the sum of the figures above it${figureColumns === 1 ? ", in the table's only column of figures" : ""}`);
+    for (const near of nearSums) doubts.push(`${near} is the sum of the figures above it, rounded`);
     let merged = false;
     eachCellIn(lastRow, run, (cell) => void (merged = merged || cell.isMerged));
     if (merged) doubts.push(`row ${end} has merged cells, as a banner or a footer has`);
     for (const r of tableRows) {
-      const odd = cols0.findIndex((c, i) => columnKinds[i].figures && kindOf(ws.getRow(r).getCell(c)) === "text");
+      // (For the question, a column is one of figures when figures are most of what it holds: a second
+      // table below it already makes several of its cells words.)
+      const odd = cols0.findIndex((c, i) => columnKinds[i].main !== "text" && columnKinds[i].count.number + columnKinds[i].count.date >= 2 && kindOf(ws.getRow(r).getCell(c)) === "text");
       if (odd >= 0 && doubts.length < 6) doubts.push(`${quote(r)} holds words under "${names[odd]}", a column of ${columnKinds[odd].main === "date" ? "dates" : "figures"}: another table's headings, a note, or only an odd value`);
     }
     if (tableRows.length >= 2) {
@@ -1412,14 +1427,7 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
       doubts.push(above.length === 0 ? `row ${end} is the only row under the headers and holds a value under one of them only` : `row ${end} holds a value under one header only, where the rows above it hold more`);
     }
   }
-  if (doubts.length > 0 && opts.afterRow !== end) {
-    const shown = tableRows.slice(-3).map(quote).join("; ");
-    throw new DocOpError(
-      `Whether the last row of sheet "${ws.name}" is a row of the table cannot be told for certain: ${[...new Set(doubts)].slice(0, 5).join("; ")}. Nothing was added. ` +
-        `The table's last rows are: ${shown}. Read them. If row ${end} is an ordinary row of the table (and any row named above is only an odd value in it), send the same op with "afterRow": ${end} and the rows are added from row ${end + 1}. ` +
-        `If it is a total, an average, a note, a signature line or part of another table, do not: ${NEW_WORKBOOK.charAt(0).toLowerCase()}${NEW_WORKBOOK.slice(1)}`,
-    );
-  }
+  const signs = [...new Set(doubts)].slice(0, 5);
   const lastNew = end + rows.length;
   // Over these columns, over rows already there, and ending before the last row to be added.
   const short = (g: Box) => cols0.some((c) => c >= g.c1 && c <= g.c2) && g.r2 > header.row && g.r1 <= end && g.r2 < lastNew;
@@ -1467,6 +1475,23 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
       return [n, fitColumn("append_rows", n, ws, col, above, into, rows.map((r) => toCellValue(r[n])))] as const;
     }),
   );
+  // Rows are added only once the caller has read the table's last rows and
+  // said which row to add after. The signs above are not complete, and cannot
+  // be: a subtotal labelled only with its group, a footer in a table of
+  // words, a second table headed by years look like rows of the table to
+  // anything that reads cells. A reader of the rows can tell. (A table that
+  // has only its headers has no last row to be mistaken about.) This comes
+  // after everything that refuses, so that a confirmed row is a written one.
+  if (tableRows.length > 0 && opts.afterRow !== end) {
+    const shown = tableRows.slice(-3).map(quote).join("; ");
+    throw new DocOpError(
+      `append_rows adds rows after the last row of the sheet, and only once that row has been read and confirmed to be a row of the table. Nothing was added. ` +
+        `The last rows of sheet "${ws.name}" are: ${shown}. ` +
+        (signs.length > 0 ? `Signs that row ${end} may not be an ordinary row: ${signs.join("; ")}. ` : "") +
+        `Read them. If row ${end} is an ordinary row of the table${signs.length > 0 ? " (and any row named above is only an odd value in it)" : ""}, send the same op with "afterRow": ${end} and the rows are added from row ${end + 1}. ` +
+        `If it is a total, a subtotal, an average, a note, a signature line or part of another table, do not: ${NEW_WORKBOOK.charAt(0).toLowerCase()}${NEW_WORKBOOK.slice(1)}`,
+    );
+  }
   const written: Written = new Map();
   const wrote = new Map<string, ExcelJS.CellValue[]>();
   rows.forEach((r, i) => {
@@ -1508,6 +1533,8 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
       range: `${addr(Math.min(...cols), end + 1)}:${addr(Math.max(...cols), end + rows.length)}`,
       rowsWritten: rows.length,
       cellsWritten: written.size,
+      ...(tableRows.length > 0 ? { addedAfter: quote(end) } : {}),
+      ...(signs.length > 0 ? { lastRowSigns: signs } : {}),
       ...(Object.keys(writtenAs).length > 0 ? { writtenAs } : {}),
       ...(datesAsText.length > 0 ? { datesAsText } : {}),
       ...(numbersAsText.length > 0 ? { numbersAsText } : {}),
