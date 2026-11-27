@@ -502,15 +502,15 @@ function eachCellIn(row: ExcelJS.Row, span: Span, f: (cell: ExcelJS.Cell) => voi
  * the table but words, dates and years. A cell that only shows a label merged
  * across the row (a section banner) says nothing either way.
  */
-function looksLikeHeadings(row: ExcelJS.Row, figureCols: number[], span: Span, datedCols: Set<number>): boolean {
+function looksLikeHeadings(row: ExcelJS.Row, figureCols: number[], span: Span, timeCols: Set<number>): boolean {
   let headings = 0;
   for (const c of figureCols) {
     const cell = row.getCell(c);
     if (cell.isMerged && cell.master.address !== cell.address) continue;
     const v = cell.value as unknown;
     if (v instanceof Date) {
-      // A date is a heading (a month over its figures) only in a column whose own values are not dates or times.
-      if (!datedCols.has(c)) headings++;
+      // A date is a heading (a month over its figures), except a time of day in a column of times.
+      if (!timeCols.has(c)) headings++;
       continue;
     }
     if (!isText(v)) return false;
@@ -583,6 +583,10 @@ function dateFromText(s: string): Date | null {
 
 /** A number written out plainly: no leading zeros, no separators, no more digits than a number holds exactly. */
 const PLAIN_NUMBER = /^-?(0|[1-9]\d{0,14})(\.\d+)?$/;
+/** Text a person would read as a figure, however it is dressed: "1,250.50", "(500)", "45%", "$12.50". */
+const READS_AS_A_NUMBER = /^[\s$€£¥₱(+-]*\d[\d,.\s]*%?\)?$/;
+/** Text that begins as a date does, whether or not it is one this reads ("2026-11-03T16:00:00.000Z"). */
+const READS_AS_A_DATE = /^\d{4}-\d{2}-\d{2}([T ]|$)/;
 
 /** A number format without what is not a format code: colours and conditions in brackets, text in quotes. */
 const formatCodes = (fmt: string): string => fmt.replace(/\[[^\]]*]/g, "").replace(/"[^"]*"/g, "");
@@ -685,7 +689,13 @@ function fitColumn(what: string, header: string, ws: ExcelJS.Worksheet, col: num
   }
   // A column with nothing in it yet: the format of the cells to be written is all there is to go by.
   if (total === 0 && texts.length > 0 && into.length > 0) {
-    if (given.every(isADate) && into.every((c) => showsADay(c.numFmt))) return { write: toDate, as: "dates", holdsDates: true };
+    if (into.every((c) => showsADay(c.numFmt))) {
+      const bad = given.find((v) => !isADate(v));
+      if (bad === undefined) return { write: toDate, as: "dates", holdsDates: true };
+      if (typeof bad === "string" && READS_AS_A_DATE.test(bad.trim())) {
+        throw new DocOpError(`${what}: the cells of the column "${header}" are formatted for dates (${into[0].address}), and the data gives ${JSON.stringify(bad)} for it, which is not a date as this reads one: a time followed by Z is a moment, and which day it falls on depends on where one stands. Give dates as YYYY-MM-DD (a time of day after it as HH:MM:SS, without a Z). Nothing was written.`);
+      }
+    }
     if (into.every((c) => isNumberFormat(c.numFmt))) {
       if (notANumber !== undefined) {
         throw new DocOpError(`${what}: the cells of the column "${header}" are formatted for numbers (${into[0].address}: ${into[0].numFmt}), and the data gives ${JSON.stringify(notANumber)} for it, which is text and not a plain number. Written as it is, it would be left out of every total. Give plain numbers. Nothing was written.`);
@@ -712,7 +722,7 @@ function writeFitted(cell: ExcelJS.Cell, value: ExcelJS.CellValue, fit: ColumnFi
 /** Values that went into a column as text though they read as numbers, or as dates: what a total or a date filter will not count. */
 function writtenAsText(values: ExcelJS.CellValue[]): { numbers: boolean; dates: boolean } {
   const texts = values.filter((v): v is string => typeof v === "string");
-  return { numbers: texts.some((v) => PLAIN_NUMBER.test(v.trim())), dates: texts.some((v) => dateFromText(v) !== null) };
+  return { numbers: texts.some((v) => READS_AS_A_NUMBER.test(v.trim())), dates: texts.some((v) => READS_AS_A_DATE.test(v.trim())) };
 }
 
 export function fillByKey(ws: ExcelJS.Worksheet, a: FillByKeyArgs): { report: OpReport; written: Written; released: string[] } {
@@ -800,31 +810,37 @@ export function fillByKey(ws: ExcelJS.Worksheet, a: FillByKeyArgs): { report: Op
   const ownHeadings = targetCols.map((c) => headerKey(cellText(ws.getRow(header.row).getCell(c))));
   // The columns that are to receive figures: a column of numbers in the data,
   // or any column when rows without data are to be given 0.
-  const figureCols = targetCols.filter((_, t) => unmatched === "zero" || a.rows.some((r) => typeof r[targets[t][1]] === "number" || typeof r[targets[t][1]] === "bigint"));
-  // Two widths. Whether a row READS LIKE HEADINGS is judged across the columns
-  // the op names, so that a list beside the table cannot make headings look
-  // like an ordinary row. Whether a row is EMPTY is judged across every
-  // column the header row's headings run over, so that a label in a column
-  // of the table the op does not name (a category beside the items) is not
-  // taken for a gap.
+  // (A column the data gives words or dates for is not one, even when rows without data are to get 0.)
+  const figureCols = targetCols.filter((_, t) => {
+    const values = a.rows.map((r) => r[targets[t][1]]);
+    if (values.some((v) => typeof v === "number" || typeof v === "bigint")) return true;
+    return unmatched === "zero" && !values.some((v) => typeof v === "string" && v.trim() !== "");
+  });
+  // A row is judged across the columns the op names: whether it is empty, and
+  // whether it reads like headings. That is the stricter reading both ways.
+  // What stands in other columns may be this table's (a category beside the
+  // items) or something else's (a list against the table), and the sheet
+  // does not say which; taking it for the table's hid the gap between two
+  // tables, so it is not taken for anything. A sheet with a label in such a
+  // column and nothing on that row under the columns named is asked about
+  // when the answer matters, like any other gap. Rows are quoted in messages
+  // across the table's whole width, so the caller sees what is there.
   const span = headerSpan([...keyCols, ...targetCols]);
   const run = headerRun(ws, header.row, [...keyCols, ...targetCols]);
-  // Columns to fill whose own values are dates or times, so that a date in
-  // them is a value and not a heading: a column headed in words, under which
-  // most of what is typed (and at least two cells) are dates. One date alone
-  // under a column of figures is what another table's heading looks like.
-  const datedCols = new Set(
+  // Columns to fill that hold times of day (a shift's start, given as a
+  // number): a time in them is a value. A calendar date under a column that
+  // receives figures is never one: it is what another table's heading (a
+  // month over its figures) looks like.
+  const timeCols = new Set(
     figureCols.filter((c) => {
-      if (ws.getRow(header.row).getCell(c).value instanceof Date) return false;
-      let dates = 0;
-      let filled = 0;
+      let times = 0;
       for (let r = first; r <= sheetEnd; r++) {
         const cell = ws.getRow(r).getCell(c);
-        if (cell.isMerged || isFormula(cell) || isEmptyValue(cell.value)) continue;
-        filled++;
-        if (cell.value instanceof Date) dates++;
+        if (cell.isMerged || isFormula(cell) || !(cell.value instanceof Date)) continue;
+        if (showsADay(cell.numFmt) || !isDateFormat(cell.numFmt)) return false;
+        times++;
       }
-      return dates >= 2 && dates * 2 >= filled;
+      return times > 0;
     }),
   );
   // The row said to hold the headers must not be a row of the table itself.
@@ -883,7 +899,7 @@ export function fillByKey(ws: ExcelJS.Worksheet, a: FillByKeyArgs): { report: Op
     let blank = false;
     for (let r = from; r <= sheetEnd && out.length < 8; r++) {
       const row = ws.getRow(r);
-      if (isBlankRow(row, run)) {
+      if (isBlankRow(row, span)) {
         blank = true;
         continue;
       }
@@ -901,8 +917,8 @@ export function fillByKey(ws: ExcelJS.Worksheet, a: FillByKeyArgs): { report: Op
         known = false;
       }
       if (known) continue;
-      const headings = targetsAgain(row) || looksLikeHeadings(row, figureCols, span, datedCols);
-      if (r === from || headings || gap) out.push(`row ${r} (${rowAsRead(row, run) || "no text"}), which ${headings ? "reads like column headings" : "follows an empty row and has no key the data has"}`);
+      const headings = targetsAgain(row) || looksLikeHeadings(row, figureCols, span, timeCols);
+      if (r === from || headings || gap) out.push(`row ${r} (${rowAsRead(row, run) || "no text"}), which ${headings ? "reads like column headings" : "follows a row with nothing under these columns and has no key the data has"}`);
     }
     return out;
   };
@@ -919,7 +935,7 @@ export function fillByKey(ws: ExcelJS.Worksheet, a: FillByKeyArgs): { report: Op
   let afterBlank = false;
   for (let r = first; r <= end; r++) {
     const row = ws.getRow(r);
-    if (isBlankRow(row, run)) {
+    if (isBlankRow(row, span)) {
       afterBlank = true;
       continue;
     }
@@ -958,7 +974,7 @@ export function fillByKey(ws: ExcelJS.Worksheet, a: FillByKeyArgs): { report: Op
       // are the second line of this table's own headings (a month above
       // "Qty" and "Amount"); with a word in the key column they are not.
       const keyCellFilled = keyCols.some((c) => !isEmptyValue(row.getCell(c).value));
-      const headings = (ownAgain || looksLikeHeadings(row, figureCols, span, datedCols)) && (sheetRows.length > 0 || keyCellFilled);
+      const headings = (ownAgain || looksLikeHeadings(row, figureCols, span, timeCols)) && (sheetRows.length > 0 || keyCellFilled);
       if (a.lastRow !== undefined) {
         // Taken at the caller's word as a row of the table; said in the report, so that it can be looked at again.
         if (headings && !ownAgain) headingsInside.push(r);
@@ -969,7 +985,7 @@ export function fillByKey(ws: ExcelJS.Worksheet, a: FillByKeyArgs): { report: Op
           );
         }
       } else if (headings || gap) {
-        const why = headings ? (ownAgain ? "this table's column headings again, under another key heading" : "what reads like column headings") : "an empty row above it, and no key the data has";
+        const why = headings ? (ownAgain ? "this table's column headings again, under another key heading" : "what reads like column headings") : "a row above it with nothing under these columns, and no key the data has";
         const what = whatTheAnswerChanges(r);
         if (what) throw ask(r, why, what);
         // Nothing beyond it that the answer would change. After a gap the
@@ -1229,40 +1245,66 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
   if (ragged >= 0) throw new DocOpError(`append_rows: data row ${ragged + 1} has columns the first row does not; every row must have the same columns. Nothing was written.`);
   refuseMixedTypes(rows, names);
   const header = findHeaderRow(ws, names);
-  // The table's own last row, across every column its headings run over: a
-  // list standing beside the table past an empty column may run further
-  // down, and a total in a column of the table the op does not name is still
-  // the table's last row.
-  const run = headerRun(ws, header.row, names.map((n) => header.cols.get(n)!));
-  const span = headerSpan(names.map((n) => header.cols.get(n)!));
-  const end = Math.max(lastRowIn(ws, run), header.row);
+  const cols0 = names.map((n) => header.cols.get(n)!);
+  const span = headerSpan(cols0);
+  const run = headerRun(ws, header.row, cols0);
+  const WHOLE_ROW: Span = { c1: 1, c2: 16384 };
   const NEW_WORKBOOK = "Build a new workbook from the full data instead.";
+  // Rows are added after the last thing on the sheet. That is the foot of
+  // this table only when nothing but the table's rows lies between its
+  // headers and there, the last row included: every one of those rows holds
+  // something under the headers being filled. A row that does not is an
+  // empty row (what follows it may be another table, a note, a footer), a
+  // total kept in a column the op does not name, or a row of a list standing
+  // beside the table and running further down. Which of those it is cannot
+  // be told, and in none of them is the end of the sheet the foot of the
+  // table.
+  const end = Math.max(lastValueRow(ws), header.row);
+  const lastRow = ws.getRow(end);
+  for (let r = header.row + 1; r <= end; r++) {
+    if (!isBlankRow(ws.getRow(r), span)) continue;
+    throw new DocOpError(
+      r === end
+        ? `The last row of sheet "${ws.name}" that holds anything (row ${end}: ${rowAsRead(lastRow, WHOLE_ROW) || "no text"}) holds nothing under the headers being filled: it is a total kept in another column, or part of something standing beside the table, and rows added below it would not be at the foot of the table. Nothing was added. ${NEW_WORKBOOK}`
+        : `Sheet "${ws.name}" has an empty row (row ${r}) between its headers (row ${header.row}) and the last row that holds anything (row ${end}: ${rowAsRead(lastRow, WHOLE_ROW) || "no text"}). What lies below an empty row may be another table, a note or a footer, and rows added at the end of the sheet would go under that instead of at the foot of the table. Nothing was added. ${NEW_WORKBOOK}`,
+    );
+  }
+  // The last row must be a row of the table, not what closes it.
   const inLastRow: string[] = [];
-  // A column the table works out belongs to it whether or not the op names it.
-  if (end > header.row) eachCellIn(ws.getRow(end), run, (cell) => void (isFormula(cell) && inLastRow.push(cell.address)));
+  if (end > header.row) lastRow.eachCell({ includeEmpty: false }, (cell) => void (isFormula(cell) && inLastRow.push(cell.address)));
   if (inLastRow.length > 0) {
     throw new DocOpError(
       `The last row of sheet "${ws.name}" that holds anything (row ${end}) has formulas (${inLastRow.slice(0, 4).join(", ")}${inLastRow.length > 4 ? ", …" : ""}). Either it is the sheet's totals, which rows added below would be left out of, or every row works a column out with a formula, which rows added here would not have. Nothing was added. ${NEW_WORKBOOK}`,
     );
   }
-  const cols0 = names.map((n) => header.cols.get(n)!);
-  // Rows are added after the last thing on the sheet. That is the foot of the
-  // table only when the table plainly runs from its headers to there: no
-  // empty row in between (what follows one may be another table, a note, a
-  // footer), and a last row that looks like a row of the table.
-  for (let r = header.row + 1; r < end; r++) {
-    // Empty across the columns being filled: here the narrower reading is the
-    // safe one, since a list standing against the table would fill the gap.
-    if (isBlankRow(ws.getRow(r), span)) {
-      throw new DocOpError(
-        `Sheet "${ws.name}" has an empty row (row ${r}) between its headers (row ${header.row}) and the last row that holds anything (row ${end}: ${rowAsRead(ws.getRow(end), run) || "no text"}). What lies below an empty row may be another table, a note or a footer, and rows added at the end of the sheet would go under that instead of at the foot of the table. Nothing was added. ${NEW_WORKBOOK}`,
-      );
+  if (end > header.row && cols0.length > 1 && cols0.filter((c) => !isEmptyValue(lastRow.getCell(c).value)).length <= 1) {
+    throw new DocOpError(
+      `The last row of sheet "${ws.name}" that holds anything (row ${end}: ${rowAsRead(lastRow, WHOLE_ROW) || "no text"}) has a value under at most one of the headers being filled: it reads like a note or a footer below the table, not like its last row, and rows added below it would not be at the foot of the table. Nothing was added. ${NEW_WORKBOOK}`,
+    );
+  }
+  // A total somebody typed has no formula to give it away: it is known by its label, or by being the sum of what is above it.
+  let total: string | undefined;
+  if (end > header.row) {
+    eachCellIn(lastRow, run, (cell) => {
+      if (!total && typeof cell.value === "string" && /\b(sub[- ]?|grand )?totals?\b|\bsum\b/i.test(cell.value)) total = `${cell.address} "${cellText(cell)}"`;
+    });
+    for (let c = run.c1; c <= run.c2 && !total; c++) {
+      const v = lastRow.getCell(c).value;
+      if (typeof v !== "number" || v === 0) continue;
+      let sum = 0;
+      let n = 0;
+      for (let r = header.row + 1; r < end; r++) {
+        const x = ws.getRow(r).getCell(c).value;
+        if (typeof x === "number") {
+          sum += x;
+          n++;
+        }
+      }
+      if (n >= 2 && Math.abs(sum - v) <= 1e-6 * Math.max(1, Math.abs(v))) total = `${addr(c, end)} (${v}) is the sum of the ${n} figures above it`;
     }
   }
-  if (end > header.row && cols0.length > 1 && cols0.filter((c) => !isEmptyValue(ws.getRow(end).getCell(c).value)).length <= 1) {
-    throw new DocOpError(
-      `The last row of sheet "${ws.name}" that holds anything (row ${end}: ${rowAsRead(ws.getRow(end), run) || "no text"}) has a value under at most one of the headers being filled: it reads like a note or a footer below the table, not like its last row, and rows added below it would not be at the foot of the table. Nothing was added. ${NEW_WORKBOOK}`,
-    );
+  if (total) {
+    throw new DocOpError(`The last row of sheet "${ws.name}" that holds anything (row ${end}) reads like the table's totals: ${total}. Rows added below it would be left out of them and the totals would no longer be the totals. Nothing was added. ${NEW_WORKBOOK}`);
   }
   const lastNew = end + rows.length;
   // Over these columns, over rows already there, and ending before the last row to be added.
@@ -1315,6 +1357,14 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
   const wrote = new Map<string, ExcelJS.CellValue[]>();
   rows.forEach((r, i) => {
     const row = ws.getRow(end + 1 + i);
+    // A row added to a table is laid out as the table's last row is: its
+    // number formats, its borders. (A copy of the style, each cell its own.)
+    if (end > header.row) {
+      for (let c = run.c1; c <= run.c2; c++) {
+        const like = lastRow.getCell(c).style;
+        if (like && Object.keys(like).length > 0) row.getCell(c).style = { ...like };
+      }
+    }
     for (const n of names) {
       const fit = fits.get(n)!;
       const raw = toCellValue(r[n]);

@@ -150,7 +150,7 @@ async function main(): Promise<void> {
       const open = applyOps(tracker(), [{ ...FILL, rows: [DATA[1], DATA[3]] }]).reports[0];
       check("a gap with nothing of the data below it is read across", open.stoppedAtRow === undefined && open.lastRow === 9 && open.sheetRowsWithoutData === 2 && open.sheetKeysWithoutData?.join() === "B-300,B-400");
       // The same sheet with rows without data to be given 0: now it matters, and it is asked.
-      refused("zeros for rows without data, across a gap", tracker(), [{ ...FILL, unmatched: "zero", rows: [DATA[1], DATA[3]] }], /Where the table under row 3 of sheet "Items" ends cannot be told.*Row 7 \(A7 "B-300", B7 "Polo", C7 "Navy"\) has an empty row above it, and no key the data has, and 2 rows with a key lie from there down, which would or would not be given 0/);
+      refused("zeros for rows without data, across a gap", tracker(), [{ ...FILL, unmatched: "zero", rows: [DATA[1], DATA[3]] }], /Where the table under row 3 of sheet "Items" ends cannot be told.*Row 7 \(A7 "B-300", B7 "Polo", C7 "Navy"\) has a row above it with nothing under these columns, and no key the data has, and 2 rows with a key lie from there down, which would or would not be given 0/);
       check("a sheet row with no data is left as it was", ws.getCell("D7").value === null && ws.getCell("E8").value === null);
       check("sheet rows without data are counted and named", r.sheetRowsWithoutData === 2 && r.sheetKeysWithoutData?.join() === "B-300,B-400");
       check("data rows not in the sheet are counted and named", r.dataRowsNotInSheet === 1 && r.dataKeysNotInSheet?.join() === "Z-999");
@@ -675,7 +675,7 @@ async function main(): Promise<void> {
       const three = [{ c: "A-1", q: 1 }, { c: "A-2", q: 2 }, { c: "B-2", q: 9 }];
       const sold = (extra: object, rows: object[]) => [{ op: "fill_by_key" as const, sheet: "S", key: { sheet: "CODE", data: "c" }, set: { SOLD: "q" }, ...extra, rows: rows as Record<string, unknown>[] }];
       // A key of the data sits below an empty row and a title: which table it belongs to is asked, not guessed.
-      refused("a gap and a title with the data's keys below", stacked(), sold({}, three), /Where the table under row 1 of sheet "S" ends cannot be told from the sheet\. Row 5 \(A5 "Returns"\) has an empty row above it, and no key the data has, and 1 of the data's keys are found from there down \(for example "B-2"\).*each of these rows may begin something else, or be only a label or an item the data has no row for: row 5 \(A5 "Returns"\), which follows an empty row and has no key the data has; row 6 \(A6 "ITEM", B6 "RETURNED"\), which reads like column headings\. Send the same op with "lastRow": the row just above the first of them that does begin something else\. That is 4 if another table, a note or a footer begins at row 5.*The sheet's last row with anything in it is 8: that is the answer only if every row down to it belongs to this one table/);
+      refused("a gap and a title with the data's keys below", stacked(), sold({}, three), /Where the table under row 1 of sheet "S" ends cannot be told from the sheet\. Row 5 \(A5 "Returns"\) has a row above it with nothing under these columns, and no key the data has, and 1 of the data's keys are found from there down \(for example "B-2"\).*each of these rows may begin something else, or be only a label or an item the data has no row for: row 5 \(A5 "Returns"\), which follows a row with nothing under these columns and has no key the data has; row 6 \(A6 "ITEM", B6 "RETURNED"\), which reads like column headings\. Send the same op with "lastRow": the row just above the first of them that does begin something else\. That is 4 if another table, a note or a footer begins at row 5.*The sheet's last row with anything in it is 8: that is the answer only if every row down to it belongs to this one table/);
       const wb = stacked();
       const ws = wb.getWorksheet("S")!;
       const { reports } = applyOps(wb, sold({ lastRow: 4 }, three));
@@ -1153,7 +1153,7 @@ async function main(): Promise<void> {
       const asked = /Where the table under row 1 of sheet "S" ends cannot be told from the sheet/;
       refused('headings such as "Q1", directly below', sheetOf([["CODE", "QTY"], ["A"], ["ITEM", "Q1"], ["X"]]), byCode(set, d), asked);
       refused("headings that are dates, directly below", sheetOf([["CODE", "QTY"], ["A"], ["ITEM", new Date(Date.UTC(2026, 0, 1))], ["X"]]), byCode(set, d), asked);
-      refused("headings that are years, after an empty row", sheetOf([["CODE", "QTY"], ["A"], [], ["Branch", 2025], ["X"]]), byCode(set, d), /Row 4 \(A4 "Branch", B4 "2025"\) has an empty row above it, and no key the data has/);
+      refused("headings that are years, after an empty row", sheetOf([["CODE", "QTY"], ["A"], [], ["Branch", 2025], ["X"]]), byCode(set, d), /Row 4 \(A4 "Branch", B4 "2025"\) has a row above it with nothing under these columns, and no key the data has/);
       refused("a narrower table, after an empty row", sheetOf([["CODE", "NAME", "QTY"], ["A"], [], ["ITEM"], ["X"]]), byCode(set, d), asked);
       refused("a fill of words, after an empty row", sheetOf([["CODE", "QTY"], ["A"], [], ["ITEM", "NOTE"], ["X"]]), byCode(set, [{ c: "A", q: "ok" }, { c: "X", q: "late" }]), asked);
       refused("a first table with headers and no rows yet", sheetOf([["CODE", "QTY"], ["ITEM", "RETURNED"], ["X"]]), byCode(set, [{ c: "X", q: 9 }]), /Row 2 \(A2 "ITEM", B2 "RETURNED"\) has what reads like column headings/);
@@ -1249,7 +1249,7 @@ async function main(): Promise<void> {
       const two = beside([["CODE", "QTY", "AMOUNT"], ["A"], [], ["ITEM", "RETURNED", "REFUND"], ["X"]]);
       refused("two tables with a list beside them", two, byCode({ QTY: "q", AMOUNT: "a" }, [{ c: "A", q: 1, a: 10 }, { c: "X", q: 9, a: 90 }]), /Row 4 \(A4 "ITEM", B4 "RETURNED", C4 "REFUND"\) has what reads like column headings, and 1 of the data's keys are found from there down/);
       const gap = beside([["CODE", "QTY", "AMOUNT"], ["A"], [], ["Branch", 2025, 2026], ["X"]]);
-      refused("an empty row across the table, though not across the sheet", gap, byCode({ QTY: "q", AMOUNT: "a" }, [{ c: "A", q: 1, a: 10 }, { c: "X", q: 9, a: 90 }]), /Row 4 \(A4 "Branch", B4 "2025", C4 "2026"\) has an empty row above it, and no key the data has/);
+      refused("an empty row across the table, though not across the sheet", gap, byCode({ QTY: "q", AMOUNT: "a" }, [{ c: "A", q: 1, a: 10 }, { c: "X", q: 9, a: 90 }]), /Row 4 \(A4 "Branch", B4 "2025", C4 "2026"\) has a row above it with nothing under these columns, and no key the data has/);
     }
 
     // The question names every row that may begin something else, with its number.
@@ -1260,7 +1260,7 @@ async function main(): Promise<void> {
         "a label after a gap, then another table further down",
         grouped(),
         byCode({ QTY: "q" }, data),
-        /each of these rows may begin something else, or be only a label or an item the data has no row for: row 4 \(A4 "Group B"\), which follows an empty row and has no key the data has; row 7 \(A7 "Returns"\), which follows an empty row and has no key the data has; row 8 \(A8 "ITEM", B8 "RETURNED"\), which reads like column headings\. Send the same op with "lastRow": the row just above the first of them that does begin something else/,
+        /each of these rows may begin something else, or be only a label or an item the data has no row for: row 4 \(A4 "Group B"\), which follows a row with nothing under these columns and has no key the data has; row 7 \(A7 "Returns"\), which follows a row with nothing under these columns and has no key the data has; row 8 \(A8 "ITEM", B8 "RETURNED"\), which reads like column headings\. Send the same op with "lastRow": the row just above the first of them that does begin something else/,
       );
       const right = grouped();
       const r = applyOps(right, byCode({ QTY: "q" }, data, { lastRow: 5 })).reports[0];
@@ -1271,7 +1271,7 @@ async function main(): Promise<void> {
       const once = sheetOf([["CODE", "QTY"], ["A"], [], ["B"], ["Z"], ["C"]]);
       applyOps(once, byCode({ QTY: "q" }, [{ c: "A", q: 1 }, { c: "B", q: 2 }, { c: "C", q: 3 }]));
       check("a row the data has nothing for, two rows after a gap, is an ordinary row", once.getWorksheet("S")!.getCell("B6").value === 3);
-      refused("a row of nothing but spaces is an empty row", sheetOf([["CODE", "QTY"], ["A"], ["  ", " "], ["Label"], ["X"]]), byCode({ QTY: "q" }, [{ c: "A", q: 1 }, { c: "X", q: 9 }]), /Row 4 \(A4 "Label"\) has an empty row above it/);
+      refused("a row of nothing but spaces is an empty row", sheetOf([["CODE", "QTY"], ["A"], ["  ", " "], ["Label"], ["X"]]), byCode({ QTY: "q" }, [{ c: "A", q: 1 }, { c: "X", q: 9 }]), /Row 4 \(A4 "Label"\) has a row above it with nothing under these columns/);
     }
 
     // A value is written as the column it goes into holds its values; decided for the whole column, never value by value.
@@ -1377,13 +1377,16 @@ async function main(): Promise<void> {
 
     // append_rows: the foot of the table, not of whatever stands beside it; and what does not take the rows in.
     {
-      const wb = sheetOf([["CODE", "QTY", null, "List"], ["A", 1, null, "x"], ["B", 2, null, "y"], [null, null, null, "z"], [null, null, null, "w"]], (ws) => {
+      const wb = sheetOf([["CODE", "QTY", null, "List"], ["A", 1, null, "x"], ["B", 2, null, "y"]], (ws) => {
         ws.autoFilter = "A1:B3";
         ws.pageSetup.printArea = "A1:B3";
         ws.getCell("F1").value = { formula: "SUM(A2:B2)", result: 1 };
       });
       const r = applyOps(wb, [{ op: "append_rows", sheet: "S", rows: [{ CODE: "C", QTY: 3 }] }]).reports[0];
-      check("rows are added at the foot of the table, though a list beside it runs further down", wb.getWorksheet("S")!.getCell("A4").value === "C" && r.range === "A4:B4");
+      check("rows are added at the foot of the table, with a list beside it that ends where the table does", wb.getWorksheet("S")!.getCell("A4").value === "C" && r.range === "A4:B4");
+      check("a filter and a print area that do not take the new rows in are said", r.doesNotCover?.join() === "the sheet's filter,the sheet's print area");
+      // A list beside the table that runs further down: the end of the sheet is then not the foot of the table.
+      refused("a list beside the table that runs further down", sheetOf([["CODE", "QTY", null, "List"], ["A", 1, null, "x"], ["B", 2, null, "y"], [null, null, null, "z"], [null, null, null, "w"]]), [{ op: "append_rows", sheet: "S", rows: [{ CODE: "C", QTY: 3 }] }], /has an empty row \(row 4\) between its headers \(row 1\) and the last row that holds anything \(row 5: D5 "w"\)/);
       refused("an empty row of the table, with a list beside it and more below", sheetOf([["CODE", "QTY", "List"], ["A", 1, "x"], [null, null, "y"], ["ITEM", "RET", "z"], ["X", 2, "w"]]), [{ op: "append_rows", sheet: "S", rows: [{ CODE: "C", QTY: 3 }] }], /has an empty row \(row 3\) between its headers \(row 1\) and the last row that holds anything \(row 5: A5 "X", B5 "2", C5 "w"\)/);
       check("a filter and a print area that do not take the new rows in are said", r.doesNotCover?.join() === "the sheet's filter,the sheet's print area");
     }
@@ -1396,13 +1399,34 @@ async function main(): Promise<void> {
       // Adding rows never writes into the table's last row because the op does not name the column that fills it.
       const totals = (last: unknown) => sheetOf([["Date", "Store", "Qty", "Amount"], ["d1", "N", 1, 10], ["d2", "S", 2, 20], ["d3", "E", 3, 30], [null, null, null, last]]);
       const three = [{ op: "append_rows" as const, sheet: "S", rows: [{ Date: "d4", Store: "W", Qty: 9 }] }];
-      refused("a total in a column the append does not name", totals({ formula: "SUM(D2:D4)", result: 60 }), three, /The last row of sheet "S" that holds anything \(row 5\) has formulas \(D5\)/);
-      refused("a typed total in a column the append does not name", totals(60), three, /\(row 5: D5 "60"\) has a value under at most one of the headers being filled/);
+      refused("a total in a column the append does not name", totals({ formula: "SUM(D2:D4)", result: 60 }), three, /\(row 5: D5 "60"\) holds nothing under the headers being filled: it is a total kept in another column/);
+      refused("a typed total in a column the append does not name", totals(60), three, /\(row 5: D5 "60"\) holds nothing under the headers being filled/);
+      // The same total past a column with no heading, where the table's headings stop short of it.
+      const pastAGap = sheetOf([["Date", "Store", "Qty", null, "Amount"], ["d1", "N", 1, null, 10], ["d2", "S", 2, null, 20], [null, null, null, null, 30]]);
+      refused("a total under a column past one with no heading", pastAGap, three, /\(row 4: E4 "30"\) holds nothing under the headers being filled/);
+      // A total somebody typed, with its label, or known only by being the sum of what is above it.
+      const typed = (last: unknown[]) => sheetOf([["Date", "Store", "Qty", "Amount"], ["d1", "N", 1, 10], ["d2", "S", 2, 20], ["d3", "E", 3, 30], last]);
+      const four = [{ op: "append_rows" as const, sheet: "S", rows: [{ Date: "d4", Store: "W", Qty: 9, Amount: 90 }] }];
+      refused("a typed total with its label", typed(["TOTAL", null, 6, 60]), four, /The last row of sheet "S" that holds anything \(row 5\) reads like the table's totals: A5 "TOTAL"/);
+      refused("a typed total with no label", typed(["all", "all", 6, 60]), four, /reads like the table's totals: C5 \(6\) is the sum of the 3 figures above it/);
+      const ordinary = typed(["d4", "W", 4, 40]);
+      const ra = applyOps(ordinary, [{ op: "append_rows", sheet: "S", rows: [{ Date: "d5", Store: "X", Qty: 5, Amount: 50 }] }]).reports[0];
+      check("a last row that is a row of the table takes the new rows below it", ordinary.getWorksheet("S")!.getCell("C6").value === 5 && ra.range === "A6:D6");
 
       // A label in a column of the table the op does not name is not an empty row.
-      const grouped = sheetOf([["Cat", "CODE", "QTY"], [null, "A", null], ["Veg", null, null], [null, "Z", null], [null, "B", null]]);
-      const rg = applyOps(grouped, byCode({ QTY: "q" }, [{ c: "A", q: 1 }, { c: "B", q: 2 }])).reports[0];
-      check("a category written beside the items is read across, not taken for a gap", grouped.getWorksheet("S")!.getCell("C5").value === 2 && rg.stoppedAtRow === undefined && rg.sheetKeysWithoutData?.join() === "Z");
+      // A category written in a column the op does not name, on a row of its own: that row has nothing under
+      // the columns named. Followed by an item the data has, the table plainly goes on; followed by one it
+      // lacks, with the data's keys further down, it is asked about like any other gap, and the row is quoted
+      // across the table's whole width so that the label is seen.
+      const grouped = (afterLabel: string) => sheetOf([["Cat", "CODE", "QTY"], [null, "A", null], ["Veg", null, null], [null, afterLabel, null], [null, "B", null]]);
+      const goesOn = grouped("C");
+      applyOps(goesOn, byCode({ QTY: "q" }, [{ c: "A", q: 1 }, { c: "C", q: 3 }, { c: "B", q: 2 }]));
+      check("a category label followed by an item the data has is read across", goesOn.getWorksheet("S")!.getCell("C4").value === 3 && goesOn.getWorksheet("S")!.getCell("C5").value === 2);
+      const two12 = [{ c: "A", q: 1 }, { c: "B", q: 2 }];
+      refused("a category label followed by an item the data lacks, with the data's keys below", grouped("Z"), byCode({ QTY: "q" }, two12), /Row 4 \(B4 "Z"\) has a row above it with nothing under these columns, and no key the data has, and 1 of the data's keys are found from there down/);
+      const said = grouped("Z");
+      const rg = applyOps(said, byCode({ QTY: "q" }, two12, { lastRow: 5 })).reports[0];
+      check("and told where the table ends, it is filled to there", said.getWorksheet("S")!.getCell("C5").value === 2 && rg.sheetKeysWithoutData?.join() === "Z");
 
       // What a column holds is what most of its cells are; a label or a total among them changes nothing.
       const dated = (extra: unknown[]) => sheetOf([["CODE", "Due"], ["A", day(1)], ["B", day(2)], ["C", day(3)], ...extra.map((x, i) => [`X${i}`, x]), ["T", null]]);
@@ -1486,6 +1510,77 @@ async function main(): Promise<void> {
       applyOps(neg, byCode({ Branch: "n" }, [{ c: "C", n: 103 }, { c: "D", n: -4 }]));
       check("a minus sign among the values means figures", neg.getWorksheet("S")!.getCell("B4").value === 103 && neg.getWorksheet("S")!.getCell("B5").value === -4);
       refused("a number and a word for one column", codes(), byCode({ Branch: "n" }, [{ c: "C", n: 103 }, { c: "D", n: "HQ" }]), /Data column "n" is a number in 1 rows and text in 1/);
+    }
+
+    // -----------------------------------------------------------------------
+    // Found by the check of that last change.
+    // -----------------------------------------------------------------------
+    {
+      const day = (d: number) => new Date(Date.UTC(2026, 10, d));
+      // A moment written with a Z is not put into a sheet as text without a word.
+      const plainCol = sheetOf([["CODE", "When"], ["A"], ["B"]]);
+      const rz = applyOps(plainCol, byCode({ When: "d" }, [{ c: "A", d: "2026-11-03T16:00:00.000Z" }])).reports[0];
+      check("a moment with Z into an empty column goes in as text, and that is said", plainCol.getWorksheet("S")!.getCell("B2").value === "2026-11-03T16:00:00.000Z" && rz.datesAsText?.join() === "When");
+      const dateCol = () => sheetOf([["CODE", "When"], ["A"], ["B"]], (ws) => void ["B2", "B3"].forEach((a) => (ws.getCell(a).numFmt = "dd/mm/yyyy")));
+      refused("a moment with Z into cells formatted for dates", dateCol(), byCode({ When: "d" }, [{ c: "A", d: "2026-11-03T16:00:00.000Z" }, { c: "B", d: "2026-11-04" }]), /the cells of the column "When" are formatted for dates \(B2\), and the data gives "2026-11-03T16:00:00\.000Z" for it, which is not a date as this reads one/);
+      // Figures dressed as text into a column that says nothing: text, and said.
+      const dressed = sheetOf([["CODE", "Amt"], ["A"], ["B"], ["C"], ["D"]]);
+      const rd = applyOps(dressed, byCode({ Amt: "q" }, [{ c: "A", q: "1,250.50" }, { c: "B", q: "(500)" }, { c: "C", q: "45%" }, { c: "D", q: "$12.50" }])).reports[0];
+      check("figures with separators, brackets, a percent sign or a currency sign are named as having gone in as text", dressed.getWorksheet("S")!.getCell("B2").value === "1,250.50" && rd.numbersAsText?.join() === "Amt");
+      const asText = sheetOf([["CODE", "Amt"], ["A"], ["B"]], (ws) => void ["B2", "B3"].forEach((a) => (ws.getCell(a).numFmt = "@")));
+      applyOps(asText, byCode({ Amt: "q" }, [{ c: "A", q: "12" }, { c: "B", q: "13" }]));
+      check("cells formatted as Text are not cells formatted for numbers", asText.getWorksheet("S")!.getCell("B2").value === "12");
+      const oneOfTwo = sheetOf([["CODE", "Amt"], ["A"], ["B"]], (ws) => void (ws.getCell("B2").numFmt = "#,##0.00"));
+      applyOps(oneOfTwo, byCode({ Amt: "q" }, [{ c: "A", q: "12" }, { c: "B", q: "13" }]));
+      check("one cell of two formatted for numbers is not a column formatted for numbers", oneOfTwo.getWorksheet("S")!.getCell("B2").value === "12");
+
+      // What most of a column's cells are: exactly half and more than any other kind is enough; less is not.
+      const kinds = (cells: unknown[]) => sheetOf([["CODE", "Due"], ...cells.map((x, i) => [`X${i}`, x]), ["T", null]]);
+      const half = kinds([day(1), day(2), "tbc soon", 5]);
+      applyOps(half, byCode({ Due: "d" }, [{ c: "T", d: "2026-11-09" }], { lastRow: 6 }));
+      check("two dates of four cells, the rest a word and a figure: a column of dates", half.getWorksheet("S")!.getCell("B6").value instanceof Date);
+      const fewer = kinds([day(1), day(2), "tbc soon", 5, "0222"]);
+      applyOps(fewer, byCode({ Due: "d" }, [{ c: "T", d: "2026-11-09" }], { lastRow: 7 }));
+      check("two dates of five cells, though more than any other kind: no longer a column of dates", fewer.getWorksheet("S")!.getCell("B7").value === "2026-11-09");
+
+      // A calendar date under a column that receives figures is a heading, however many of them there are.
+      const months = sheetOf([["CODE", "QTY"], ["A", 5], ["ITEM", day(1)], ["X"], ["ITEM2", day(2)], ["Y"]]);
+      refused("two tables below with dates for headings", months, byCode({ QTY: "q" }, [{ c: "A", q: 1 }, { c: "X", q: 9 }], { overwrite: true }), /Row 3 \(A3 "ITEM".*\) has what reads like column headings/);
+      // A list standing against the table does not hide the gap between two blocks.
+      const against = sheetOf([["CODE", "QTY", "List"], ["A", null, "x"], [null, null, "y"], ["DAMAGED STOCK", null, "z"], ["X", null, "w"]]);
+      refused("a gap under the columns named, with a list's entry on that row", against, byCode({ QTY: "q" }, [{ c: "A", q: 1 }, { c: "X", q: 9 }]), /Row 4 \(A4 "DAMAGED STOCK", C4 "z"\) has a row above it with nothing under these columns/);
+      // Rows without data to get 0, and a column of dates the data gives dates for: its dates are values, not headings.
+      const due = sheetOf([["CODE", "Due", "Qty"], ["A", null, null], ["B", day(1), 4], ["C", null, null]]);
+      applyOps(due, byCode({ Due: "d", Qty: "q" }, [{ c: "A", d: "2026-11-09", q: 1 }, { c: "C", d: "2026-11-10", q: 3 }], { unmatched: "zero" }));
+      check("a date under a column the data gives dates for is not a heading", due.getWorksheet("S")!.getCell("C4").value === 3 && due.getWorksheet("S")!.getCell("B3").value instanceof Date);
+
+      const onlyDue = sheetOf([["CODE", "Due"], ["A", null], ["B", day(1)], ["C", null]]);
+      applyOps(onlyDue, byCode({ Due: "d" }, [{ c: "A", d: "2026-11-09" }, { c: "C", d: "2026-11-10" }], { unmatched: "zero" }));
+      check("and with zeros asked for, a row holding a date under it is still an ordinary row", onlyDue.getWorksheet("S")!.getCell("B4").value instanceof Date && onlyDue.getWorksheet("S")!.getCell("B3").value instanceof Date);
+      // The read-back takes a number and the moment it shows for the same thing, and nothing else.
+      const one = new ExcelJS.Workbook();
+      one.properties.date1904 = true;
+      const w1 = one.addWorksheet("S");
+      w1.getCell("A1").value = "Start";
+      w1.getCell("A2").value = new Date(Date.UTC(1904, 0, 1, 13, 30));
+      w1.getCell("A2").numFmt = "hh:mm";
+      const savedOne = await save(one, out);
+      const serial = 0.5625;
+      check("a number against the time a 1904 workbook shows for it", compareWithBase(new Map([["S", new Map()]]), savedOne, new Map([["S", new Map<string, ExcelJS.CellValue>([["A1", "Start"], ["A2", serial]])]])).length === 0);
+      check("another number against that time is a difference", compareWithBase(new Map([["S", new Map()]]), savedOne, new Map([["S", new Map<string, ExcelJS.CellValue>([["A1", "Start"], ["A2", 0.25]])]])).length === 1);
+
+      // Rows added to a table are laid out as its rows are, and what went in as text is said for an append too.
+      const laid = sheetOf([["Date", "Qty", "Code"], [day(1), 1, "x1"], [day(2), 2, "x2"]], (ws) => {
+        for (const r of [2, 3]) {
+          ws.getCell(`A${r}`).numFmt = "dd-mmm-yy";
+          ws.getCell(`B${r}`).numFmt = "#,##0.00";
+          ws.getCell(`B${r}`).border = { bottom: { style: "thin" } };
+        }
+      });
+      const rl = applyOps(laid, [{ op: "append_rows", sheet: "S", rows: [{ Date: "2026-11-03", Qty: 5002, Code: "12" }] }]).reports[0];
+      const wl = (await save(laid, out)).getWorksheet("S")!;
+      check("an added row takes the number format and the borders of the row above it", wl.getCell("B4").value === 5002 && wl.getCell("B4").numFmt === "#,##0.00" && wl.getCell("B4").border?.bottom?.style === "thin" && wl.getCell("A4").numFmt === "dd-mmm-yy" && wl.getCell("A4").value instanceof Date);
+      check("and digits that went in as text are named", rl.numbersAsText?.join() === "Code" && rl.writtenAs?.Date === "dates");
     }
 
     console.log(`\n✓ xlsx-fill: ${passed} checks passed`);
