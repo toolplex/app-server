@@ -123,7 +123,7 @@ export interface OpReport {
   datesAsText?: string[];
   /** Columns in which numbers went in as text, as the data gave them: Excel leaves text out of totals. */
   numbersAsText?: string[];
-  /** append_rows: the row the caller confirmed as the table's last, as it reads. */
+  /** append_rows: the row the caller confirmed the rows go after (the table's last row, or its headers when it has no rows), as it reads. */
   addedAfter?: string;
   /** append_rows: signs that the row added after is not an ordinary row of the table, which the caller confirmed it is. */
   lastRowSigns?: string[];
@@ -559,8 +559,13 @@ function lastRowIn(ws: ExcelJS.Worksheet, span: Span): number {
 /** A row as a person would read it across the table, for a message: its first few cells. */
 function rowAsRead(row: ExcelJS.Row, span: Span): string {
   const cells: string[] = [];
-  eachCellIn(row, span, (cell) => void (cells.length < 8 && cellText(cell) && cells.push(`${cell.address} "${cellText(cell)}"`)));
-  return cells.join(", ");
+  let more = false;
+  eachCellIn(row, span, (cell) => {
+    if (!cellText(cell)) return;
+    if (cells.length < 8) cells.push(`${cell.address} "${cellText(cell)}"`);
+    else more = true;
+  });
+  return cells.join(", ") + (more ? ", …" : "");
 }
 
 // --- Writing like the column ---------------------------------------------------
@@ -1269,9 +1274,11 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
   // beside the table and running further down. Which of those it is cannot
   // be told, and in none of them is the end of the sheet the foot of the
   // table.
-  const end = Math.max(lastValueRow(ws), header.row);
+  // (Headers merged down over two rows are one header: the table begins below them.)
+  const headBottom = Math.max(...cols0.map((c) => mergedBottom(ws, header.row, c)));
+  const end = Math.max(lastValueRow(ws), headBottom);
   const lastRow = ws.getRow(end);
-  for (let r = header.row + 1; r <= end; r++) {
+  for (let r = headBottom + 1; r <= end; r++) {
     if (!isBlankRow(ws.getRow(r), span)) continue;
     throw new DocOpError(
       r === end
@@ -1281,7 +1288,7 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
   }
   // The last row must be a row of the table, not what closes it.
   const inLastRow: string[] = [];
-  if (end > header.row) lastRow.eachCell({ includeEmpty: false }, (cell) => void (isFormula(cell) && inLastRow.push(cell.address)));
+  if (end > headBottom) lastRow.eachCell({ includeEmpty: false }, (cell) => void (isFormula(cell) && inLastRow.push(cell.address)));
   if (inLastRow.length > 0) {
     throw new DocOpError(
       `The last row of sheet "${ws.name}" that holds anything (row ${end}) has formulas (${inLastRow.slice(0, 4).join(", ")}${inLastRow.length > 4 ? ", …" : ""}). Either it is the sheet's totals, which rows added below would be left out of, or every row works a column out with a formula, which rows added here would not have. Nothing was added. ${NEW_WORKBOOK}`,
@@ -1304,10 +1311,10 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
     return typeof v === "string" && PLACEHOLDER.test(v.trim()) ? "none" : "text";
   };
   const quote = (r: number) => `row ${r} (${rowAsRead(ws.getRow(r), WHOLE_ROW) || "no text"})`;
-  const tableRows = Array.from({ length: end - header.row }, (_, i) => header.row + 1 + i);
+  const tableRows = Array.from({ length: end - headBottom }, (_, i) => headBottom + 1 + i);
   if (opts.afterRow !== undefined && opts.afterRow !== end) {
     throw new DocOpError(
-      `"afterRow" is ${JSON.stringify(opts.afterRow)}, and the last row of sheet "${ws.name}" that holds anything is ${end === header.row ? `the header row (${end})` : quote(end)}. Rows are added only after that row: if it is an ordinary row of the table, send "afterRow": ${end}; if it is a total, a note or part of something else, do not add rows here. Nothing was added. ${NEW_WORKBOOK}`,
+      `"afterRow" is ${JSON.stringify(opts.afterRow)}, and the last row of sheet "${ws.name}" that holds anything is ${end === headBottom ? `the header row (${end})` : quote(end)}. Rows are added only after that row: if it is an ordinary row of the table, send "afterRow": ${end}; if it is a total, a note or part of something else, do not add rows here. Nothing was added. ${NEW_WORKBOOK}`,
     );
   }
   // The headers again inside the rows: another table, for certain.
@@ -1321,6 +1328,15 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
   if (rows.some((_, i) => ws.getRow(end + 1 + i).hidden)) {
     throw new DocOpError(`The rows below the table on sheet "${ws.name}" (from row ${end + 1}) are hidden: rows added there would not be seen. Nothing was added. ${NEW_WORKBOOK}`);
   }
+  // A merged block where the rows would go keeps one value for all its cells:
+  // what is written into the others is lost when the file is saved.
+  for (let i = 0; i < rows.length; i++) {
+    const row = ws.findRow(end + 1 + i);
+    for (let c = run.c1; row && c <= run.c2; c++) {
+      if (!row.findCell(c)?.isMerged) continue;
+      throw new DocOpError(`The rows below the table on sheet "${ws.name}" hold merged cells (${addr(c, end + 1 + i)}): a value written into a merged block is lost, or spreads over all of it. Nothing was added. ${NEW_WORKBOOK}`);
+    }
+  }
   const columnKinds = cols0.map((c) => {
     const count = { number: 0, date: 0, text: 0, none: 0 };
     for (const r of tableRows) count[kindOf(ws.getRow(r).getCell(c))]++;
@@ -1331,7 +1347,10 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
   });
   for (const r of tableRows) {
     const f = figuresAt();
-    if (f.length >= 2 && f.every(({ c }) => kindOf(ws.getRow(r).getCell(c)) === "text")) {
+    // (Headings differ from one another. The same word under each column, "closed" and "closed", is
+    // a day with no figures: that is a sign, and asked about.)
+    const words = new Set(f.map(({ c }) => headerKey(cellText(ws.getRow(r).getCell(c)))));
+    if (f.length >= 2 && words.size === f.length && f.every(({ c }) => kindOf(ws.getRow(r).getCell(c)) === "text")) {
       throw new DocOpError(`Sheet "${ws.name}" holds words under every column of figures on ${quote(r)}: it reads like another table's headings, and rows added at the end of the sheet would go under that table, not at the foot of the one under row ${header.row}. Nothing was added. ${NEW_WORKBOOK}`);
     }
   }
@@ -1373,11 +1392,13 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
   const CLOSING_LABEL = /^((grand|sub|net)[- ]?)?totals?$|^kabuuan$|^(total|net) (of|for) /i;
   const CLOSING_WORD = /\btotals?\b|^(sub[- ]?total|sum|average|avg|ave|mean|kabuuan|overall|count|maximum|minimum|max|min|balance|target|variance|margin)\b|^%|^(prepared|checked|approved|noted|reviewed|received) by\b|^(note|notes|remarks?|source)\b|\b[cb]\/f\b/i;
   const labels: Array<{ cell: ExcelJS.Cell; whole: boolean }> = [];
-  if (end > header.row) {
+  if (end > headBottom) {
     lastRow.eachCell({ includeEmpty: false }, (cell) => {
-      if (typeof cell.value !== "string") return;
-      const whole = CLOSING_LABEL.test(strip(cell.value).replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ""));
-      if (whole || CLOSING_WORD.test(cell.value.trim())) labels.push({ cell, whole });
+      // Words however the cell holds them: plain, with part of them in bold, or as a link.
+      if (kindOf(cell) !== "text") return;
+      const text = cellText(cell).trim();
+      const whole = CLOSING_LABEL.test(strip(text).replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ""));
+      if (whole || CLOSING_WORD.test(text)) labels.push({ cell, whole });
     });
   }
   const said = (l: { cell: ExcelJS.Cell }) => `${l.cell.address} "${cellText(l.cell)}"`;
@@ -1391,10 +1412,11 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
   if (certain) {
     throw new DocOpError(`The last row of sheet "${ws.name}" that holds anything (row ${end}) is the table's total or closing line, by ${certain}. Rows added below it would be left out of it. Nothing was added. ${NEW_WORKBOOK}`);
   }
-  // What only raises a doubt.
+  // The signs. Those of the last row first.
   const doubts: string[] = [];
+  const wordsUnderFigures: Array<{ r: number; i: number; word: string }> = [];
   if (tableRows.length > 0) {
-    for (const l of labels) doubts.push(`${said(l)} reads like the label of a total, an average or a closing line`);
+    for (const l of labels.slice(0, 3)) doubts.push(`${said(l)} reads like the label of a total, an average or a closing line`);
     // One figure that is the sum of those above it may be chance, or the total of a row that also
     // holds an average or a rounded figure beside it: it raises the question either way.
     if (sums.length === 1) doubts.push(`${sums[0]} is the sum of the figures above it${figureColumns === 1 ? ", in the table's only column of figures" : ""}`);
@@ -1402,12 +1424,7 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
     let merged = false;
     eachCellIn(lastRow, run, (cell) => void (merged = merged || cell.isMerged));
     if (merged) doubts.push(`row ${end} has merged cells, as a banner or a footer has`);
-    for (const r of tableRows) {
-      // (For the question, a column is one of figures when figures are most of what it holds: a second
-      // table below it already makes several of its cells words.)
-      const odd = cols0.findIndex((c, i) => columnKinds[i].main !== "text" && columnKinds[i].count.number + columnKinds[i].count.date >= 2 && kindOf(ws.getRow(r).getCell(c)) === "text");
-      if (odd >= 0 && doubts.length < 6) doubts.push(`${quote(r)} holds words under "${names[odd]}", a column of ${columnKinds[odd].main === "date" ? "dates" : "figures"}: another table's headings, a note, or only an odd value`);
-    }
+    if (lastRow.hidden) doubts.push(`row ${end} is hidden`);
     if (tableRows.length >= 2) {
       const gap = cols0.findIndex((c, i) => {
         const k = columnKinds[i];
@@ -1426,11 +1443,36 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
     if (cols0.length > 1 && filledIn(end) <= 1 && (above.length === 0 || fuller * 5 >= above.length * 4)) {
       doubts.push(above.length === 0 ? `row ${end} is the only row under the headers and holds a value under one of them only` : `row ${end} holds a value under one header only, where the rows above it hold more`);
     }
+    // Then any row with words under a column of figures or dates: another table's headings, a note,
+    // or only an odd value. (For this, a column is one of figures when figures are most of what it
+    // holds: a second table below it already makes several of its cells words.)
+    for (const r of tableRows) {
+      const i = cols0.findIndex((c, k) => columnKinds[k].main !== "text" && columnKinds[k].count.number + columnKinds[k].count.date >= 2 && kindOf(ws.getRow(r).getCell(c)) === "text");
+      if (i >= 0) wordsUnderFigures.push({ r, i, word: headerKey(cellText(ws.getRow(r).getCell(cols0[i]))) });
+    }
   }
-  const signs = [...new Set(doubts)].slice(0, 5);
+  // A column that is to take figures and holds words on more rows than figures: two tables may share it.
+  cols0.forEach((_, k) => {
+    const n = columnKinds[k].count;
+    if (tableRows.length > 0 && columnKinds[k].main === "text" && n.number + n.date >= 2 && rows.some((r) => typeof toCellValue(r[names[k]]) === "number")) {
+      doubts.push(`the rows under "${names[k]}" hold words on ${n.text} rows and figures or dates on ${n.number + n.date}: more than one table may lie under those headers`);
+    }
+  });
+  // A heading is said once in its column, "pending" on many rows: the rows whose word is said once
+  // come first, the lowest first, and the rest are counted.
+  const times = (o: { i: number; word: string }) => wordsUnderFigures.filter((x) => x.i === o.i && x.word === o.word).length;
+  wordsUnderFigures.sort((x, y) => times(x) - times(y) || y.r - x.r);
+  for (const o of wordsUnderFigures.slice(0, 3)) {
+    doubts.push(`${quote(o.r)} holds words under "${names[o.i]}", a column of ${columnKinds[o.i].main === "date" ? "dates" : "figures"}: another table's headings, a note, or only an odd value`);
+  }
+  if (wordsUnderFigures.length > 3) {
+    const rest = wordsUnderFigures.slice(3).map((o) => o.r).sort((x, y) => x - y);
+    doubts.push(`${rest.length} more row${rest.length === 1 ? "" : "s"} hold${rest.length === 1 ? "s" : ""} words under a column of figures or dates (row${rest.length === 1 ? "" : "s"} ${rest.slice(0, 10).join(", ")}${rest.length > 10 ? ", …" : ""})`);
+  }
+  const signs = [...new Set(doubts)];
   const lastNew = end + rows.length;
   // Over these columns, over rows already there, and ending before the last row to be added.
-  const short = (g: Box) => cols0.some((c) => c >= g.c1 && c <= g.c2) && g.r2 > header.row && g.r1 <= end && g.r2 < lastNew;
+  const short = (g: Box) => cols0.some((c) => c >= g.c1 && c <= g.c2) && g.r2 > headBottom && g.r1 <= end && g.r2 < lastNew;
   const wb = ws.workbook;
   for (const sheet of wb?.worksheets ?? [ws]) {
     let found: string | undefined;
@@ -1467,7 +1509,7 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
     }
   }
   // What each column already holds, read from the rows nearest the foot of the table.
-  const above = Array.from({ length: end - header.row }, (_, i) => end - i);
+  const above = Array.from({ length: end - headBottom }, (_, i) => end - i);
   const fits = new Map(
     names.map((n) => {
       const col = header.cols.get(n)!;
@@ -1475,21 +1517,34 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
       return [n, fitColumn("append_rows", n, ws, col, above, into, rows.map((r) => toCellValue(r[n])))] as const;
     }),
   );
-  // Rows are added only once the caller has read the table's last rows and
+  // Rows are added only once the caller has read the sheet's last rows and
   // said which row to add after. The signs above are not complete, and cannot
   // be: a subtotal labelled only with its group, a footer in a table of
   // words, a second table headed by years look like rows of the table to
-  // anything that reads cells. A reader of the rows can tell. (A table that
-  // has only its headers has no last row to be mistaken about.) This comes
-  // after everything that refuses, so that a confirmed row is a written one.
-  if (tableRows.length > 0 && opts.afterRow !== end) {
-    const shown = tableRows.slice(-3).map(quote).join("; ");
+  // anything that reads cells, and a label at the foot of a sheet can be
+  // taken for the headers of an empty table. A reader of the rows can tell.
+  // This comes after everything that refuses, so that a confirmed row is a
+  // written one.
+  if (opts.afterRow !== end) {
+    const opening = `append_rows adds rows after the last row of the sheet, and only once that row has been read and confirmed. Nothing was added. The headers are on ${quote(header.row)}${headBottom > header.row ? `, merged down to row ${headBottom}` : ""}. `;
+    const otherwise = `do not: ${NEW_WORKBOOK.charAt(0).toLowerCase()}${NEW_WORKBOOK.slice(1)}`;
+    if (tableRows.length === 0) {
+      const over: number[] = [];
+      for (let r = header.row - 1; r >= 1 && over.length < 2; r--) if (rowAsRead(ws.getRow(r), WHOLE_ROW) !== "") over.unshift(r);
+      throw new DocOpError(
+        opening +
+          `Nothing on sheet "${ws.name}" lies below them. ` +
+          (over.length > 0 ? `Above them: ${over.map(quote).join("; ")}. ` : "") +
+          `If row ${header.row} is the header row of a table that has no rows yet, send the same op with "afterRow": ${end} and the rows are added from row ${end + 1}. ` +
+          `If it is a label or a line at the foot of something else, ${otherwise}`,
+      );
+    }
     throw new DocOpError(
-      `append_rows adds rows after the last row of the sheet, and only once that row has been read and confirmed to be a row of the table. Nothing was added. ` +
-        `The last rows of sheet "${ws.name}" are: ${shown}. ` +
-        (signs.length > 0 ? `Signs that row ${end} may not be an ordinary row: ${signs.join("; ")}. ` : "") +
-        `Read them. If row ${end} is an ordinary row of the table${signs.length > 0 ? " (and any row named above is only an odd value in it)" : ""}, send the same op with "afterRow": ${end} and the rows are added from row ${end + 1}. ` +
-        `If it is a total, a subtotal, an average, a note, a signature line or part of another table, do not: ${NEW_WORKBOOK.charAt(0).toLowerCase()}${NEW_WORKBOOK.slice(1)}`,
+      opening +
+        `The last rows of sheet "${ws.name}" are: ${tableRows.slice(-3).map(quote).join("; ")}. ` +
+        (signs.length > 0 ? `Signs that row ${end} may not be an ordinary row of the table under those headers: ${signs.join("; ")}. ` : "") +
+        `Read them. If row ${end} is an ordinary row of the table under those headers${signs.length > 0 ? " (and any row named above is only an odd value in it)" : ""}, send the same op with "afterRow": ${end} and the rows are added from row ${end + 1}. ` +
+        `If it is a total, a subtotal, an average, a note, a signature line or part of another table, ${otherwise}`,
     );
   }
   const written: Written = new Map();
@@ -1498,7 +1553,7 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
     const row = ws.getRow(end + 1 + i);
     // A row added to a table is laid out as the table's last row is: its
     // number formats, its borders. (A copy of the style, each cell its own.)
-    if (end > header.row) {
+    if (end > headBottom) {
       for (let c = run.c1; c <= run.c2; c++) {
         const like = lastRow.getCell(c).style;
         if (like && Object.keys(like).length > 0) row.getCell(c).style = { ...like };
@@ -1533,7 +1588,7 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
       range: `${addr(Math.min(...cols), end + 1)}:${addr(Math.max(...cols), end + rows.length)}`,
       rowsWritten: rows.length,
       cellsWritten: written.size,
-      ...(tableRows.length > 0 ? { addedAfter: quote(end) } : {}),
+      addedAfter: quote(end),
       ...(signs.length > 0 ? { lastRowSigns: signs } : {}),
       ...(Object.keys(writtenAs).length > 0 ? { writtenAs } : {}),
       ...(datesAsText.length > 0 ? { datesAsText } : {}),
