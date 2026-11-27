@@ -297,6 +297,7 @@ async function main(): Promise<void> {
     try {
       const small = new SmallHost({ enabled: true, dir: dir3 });
       await small.init();
+      small.limit = 1000; // room to build the workbook that is then too large to be copied
       const { manifest: nine } = await small.renderXlsx({ title: "nine", sheets: [{ name: "Items", source: { rows: [{ CODE: "A", NAME: "a", SOLD: null }, { CODE: "B", NAME: "b", SOLD: null }, { CODE: "C", NAME: "c", SOLD: null }] }, columns: [{ key: "CODE" }, { key: "NAME" }, { key: "SOLD" }] }] }, requester);
       const tooBig = async () => {
         try {
@@ -306,6 +307,7 @@ async function main(): Promise<void> {
           return `${(e as FileStoreError).statusCode} ${(e as Error).message}`;
         }
       };
+      small.limit = 3;
       check("refused from its rows and columns alone, before it is loaded, when it is far over the limit", /^422 This workbook is too large .*\(9 cells by its rows and columns; the limit here is 3 filled cells\)/.test(await tooBig()));
       small.limit = 8; // nine cells hold something (three headers, six values): over, but not by enough to tell without loading
       check("and refused after counting when it is just over", /^422 This workbook is too large .*\(9 filled cells, 0 of them formulas, which count for more; the limit here is 8 filled cells\)/.test(await tooBig()));
@@ -520,6 +522,19 @@ async function main(): Promise<void> {
           return `${(e as FileStoreError).statusCode} ${(e as Error).message}`;
         }
       };
+      // A new workbook is held to the same limit, over all of its sheets together.
+      const newBook = async () => {
+        try {
+          await heavy.renderXlsx({ title: "new", sheets: [{ name: "A", source: { rows: [{ a: 1, b: 2 }, { a: 3, b: 4 }] } }, { name: "B", source: { rows: [{ a: 5, b: 6 }, { a: 7, b: 8 }] } }] }, requester);
+          return "";
+        } catch (e) {
+          return `${(e as FileStoreError).statusCode} ${(e as Error).message}`;
+        }
+      };
+      heavy.limit = 7;
+      check("a new workbook over the limit across its sheets is refused, with what to do instead", /^422 This workbook would be too large to build on this server: 8 cells over 2 sheets; the limit here is 7\. Nothing was saved\. Save the full list as a table instead/.test(await newBook()));
+      heavy.limit = 8;
+      check("and one at the limit is built", (await newBook()) === "");
       heavy.limit = 13; // nine filled cells, three of them formulas: 9 + 3 × 1.5, rounded, is 14
       check("three formulas among nine cells put a workbook over a limit of thirteen", /^422 This workbook is too large .*\(9 filled cells, 3 of them formulas, which count for more; the limit here is 13 filled cells\)/.test(await tryFill()));
       heavy.limit = 14;

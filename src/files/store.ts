@@ -1413,6 +1413,20 @@ export class FileStore {
             style: s.style,
           });
         }
+        // A new workbook is built in memory and then read back for its
+        // queryable copy, at about the cost per cell of a copied one. Each
+        // sheet's source is bounded, the number of sheets is not: a list of
+        // 125,000 rows split over three sheets took a server's process past
+        // its ceiling. The whole workbook is held to the limit this server's
+        // memory allows.
+        const cells = sheets.reduce((n, sh) => n + sh.rows.length * Math.max(1, sh.columns?.length ?? Object.keys(sh.rows[0] ?? {}).length), 0);
+        const maxCells = this.copyForwardCellLimit();
+        if (cells > maxCells) {
+          throw new FileStoreError(
+            422,
+            `This workbook would be too large to build on this server: ${cells.toLocaleString("en-US")} cells over ${sheets.length} sheet${sheets.length === 1 ? "" : "s"}; the limit here is ${maxCells.toLocaleString("en-US")}. Nothing was saved. Save the full list as a table instead (it has no such limit and downloads as a CSV file), or narrow the workbook to fewer rows or columns, or split it into several workbooks.`,
+          );
+        }
         const wb = buildWorkbook(sheets, { theme: spec.theme });
         await wb.xlsx.writeFile(xlsxPath);
       }
@@ -1464,6 +1478,7 @@ export class FileStore {
    * The most filled cells a workbook may have to be copied and written into
    * on this host: its share of memory for one job, within fixed ends.
    */
+  /** How many cells a workbook built or copied here may hold: this server's share of memory for one job, over what a cell costs. */
   protected copyForwardCellLimit(): number {
     return Math.min(COPY_FORWARD_MAX_CELLS, Math.max(COPY_FORWARD_MIN_CELLS, Math.floor((this.bounds.memoryMb * 1024 * 1024) / COPY_FORWARD_BYTES_PER_CELL)));
   }

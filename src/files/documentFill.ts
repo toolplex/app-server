@@ -1277,31 +1277,93 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
       `The last row of sheet "${ws.name}" that holds anything (row ${end}) has formulas (${inLastRow.slice(0, 4).join(", ")}${inLastRow.length > 4 ? ", …" : ""}). Either it is the sheet's totals, which rows added below would be left out of, or every row works a column out with a formula, which rows added here would not have. Nothing was added. ${NEW_WORKBOOK}`,
     );
   }
-  if (end > header.row && cols0.length > 1 && cols0.filter((c) => !isEmptyValue(lastRow.getCell(c).value)).length <= 1) {
-    throw new DocOpError(
-      `The last row of sheet "${ws.name}" that holds anything (row ${end}: ${rowAsRead(lastRow, WHOLE_ROW) || "no text"}) has a value under at most one of the headers being filled: it reads like a note or a footer below the table, not like its last row, and rows added below it would not be at the foot of the table. Nothing was added. ${NEW_WORKBOOK}`,
-    );
+  // Every row from the headers down must read like a row of this table, and
+  // the last one like the rows above it. What a column holds is known from
+  // its own cells: a column of figures or dates is one where nearly all the
+  // filled cells are figures or dates.
+  type Kind = "number" | "date" | "text" | "none";
+  const kindOf = (cell: ExcelJS.Cell): Kind => {
+    const v = cell.value as unknown;
+    if (isEmptyValue(v) || isFormula(cell)) return "none";
+    if (typeof v === "number") return "number";
+    if (v instanceof Date) return "date";
+    return typeof v === "string" && PLACEHOLDER.test(v.trim()) ? "none" : "text";
+  };
+  const tableRows = Array.from({ length: end - header.row }, (_, i) => header.row + 1 + i);
+  const columnKinds = cols0.map((c) => {
+    const count = { number: 0, date: 0, text: 0, none: 0 };
+    for (const r of tableRows) count[kindOf(ws.getRow(r).getCell(c))]++;
+    const filled = count.number + count.date + count.text;
+    const main: Kind = count.number >= count.date && count.number >= count.text ? "number" : count.date >= count.text ? "date" : "text";
+    // Figures or dates but for the odd cell: one cell of words, or one in five, does not make it a column of words.
+    return { count, filled, main, figures: count.number + count.date >= 2 && main !== "text" && count.text <= Math.max(1, Math.floor(filled / 5)) };
+  });
+  for (const r of tableRows) {
+    const row = ws.getRow(r);
+    // The headers again, or words under a column of figures or dates: another
+    // table's headings, a note, a footer. Rows added at the end of the sheet
+    // would go under that, not at the foot of this table.
+    const again = cols0.every((c, i) => headerKey(cellText(row.getCell(c))) === headerKey(names[i]));
+    const odd = cols0.findIndex((c, i) => columnKinds[i].figures && kindOf(row.getCell(c)) === "text");
+    if (again || odd >= 0) {
+      throw new DocOpError(
+        `Row ${r} of sheet "${ws.name}" (${rowAsRead(row, WHOLE_ROW)}) does not read like a row of the table under row ${header.row}: ` +
+          (again ? "it holds the headers again" : `it holds words under "${names[odd]}", a column of ${columnKinds[odd].main === "date" ? "dates" : "figures"}`) +
+          `. It may be another table's headings, a note or a footer, and rows added at the end of the sheet would go under it instead of at the foot of the table. Nothing was added. ${NEW_WORKBOOK}`,
+      );
+    }
   }
-  // A total somebody typed has no formula to give it away: it is known by its label, or by being the sum of what is above it.
+  if (tableRows.length >= 2) {
+    // A total, an average, a subtotal for the last group or a signature line
+    // leaves empty what every row of the table fills, or fills it with
+    // another kind of thing.
+    const gap = cols0.findIndex((c, i) => {
+      const k = columnKinds[i];
+      const above = { ...k.count };
+      const last = kindOf(lastRow.getCell(c));
+      above[last]--;
+      return above.none === 0 && k.filled - (last === "none" ? 0 : 1) >= 1 && (last === "none" || (k.figures && last !== k.main));
+    });
+    if (gap >= 0) {
+      throw new DocOpError(
+        `The last row of sheet "${ws.name}" that holds anything (row ${end}: ${rowAsRead(lastRow, WHOLE_ROW) || "no text"}) does not read like the rows above it: every one of them holds ${columnKinds[gap].main === "text" ? "something" : columnKinds[gap].main === "date" ? "a date" : "a figure"} under "${names[gap]}", and it does not. ` +
+          `It reads like a total, an average or a closing line, and rows added below it would not be at the foot of the table. Nothing was added. ${NEW_WORKBOOK}`,
+      );
+    }
+  }
+  if (rows.some((_, i) => ws.getRow(end + 1 + i).hidden)) {
+    throw new DocOpError(`The rows below the table on sheet "${ws.name}" (from row ${end + 1}) are hidden: rows added there would not be seen. Nothing was added. ${NEW_WORKBOOK}`);
+  }
+  // A total somebody typed has no formula to give it away: it is known by its
+  // label, or by figures in more than one column that are each the sum of the
+  // figures above them (one such column can be chance, or a running number).
+  const CLOSING_LABEL = /^((grand|sub|net)[- ]?)?totals?$|^(sum|average|avg|mean|kabuuan|overall)$|^(total|net|average|sum) (of|for) /i;
   let total: string | undefined;
   if (end > header.row) {
     eachCellIn(lastRow, run, (cell) => {
-      if (!total && typeof cell.value === "string" && /\b(sub[- ]?|grand )?totals?\b|\bsum\b/i.test(cell.value)) total = `${cell.address} "${cellText(cell)}"`;
+      if (!total && typeof cell.value === "string" && CLOSING_LABEL.test(cell.value.trim().replace(/\s*[:(].*$/, ""))) total = `${cell.address} "${cellText(cell)}"`;
     });
+    const sums: string[] = [];
     for (let c = run.c1; c <= run.c2 && !total; c++) {
       const v = lastRow.getCell(c).value;
       if (typeof v !== "number" || v === 0) continue;
       let sum = 0;
       let n = 0;
-      for (let r = header.row + 1; r < end; r++) {
+      let counting = true; // 1, 2, 3, …: a running number, whose third value is always the sum of the first two
+      let before: number | undefined;
+      for (let r = header.row + 1; r <= end; r++) {
         const x = ws.getRow(r).getCell(c).value;
-        if (typeof x === "number") {
+        if (typeof x !== "number") continue;
+        if (before !== undefined && x !== before + 1) counting = false;
+        before = x;
+        if (r < end) {
           sum += x;
           n++;
         }
       }
-      if (n >= 2 && Math.abs(sum - v) <= 1e-6 * Math.max(1, Math.abs(v))) total = `${addr(c, end)} (${v}) is the sum of the ${n} figures above it`;
+      if (!counting && n >= 2 && Math.abs(sum - v) <= 1e-6 * Math.max(1, Math.abs(v))) sums.push(`${addr(c, end)} (${v})`);
     }
+    if (!total && sums.length >= 2) total = `${sums.join(" and ")} are each the sum of the figures above them`;
   }
   if (total) {
     throw new DocOpError(`The last row of sheet "${ws.name}" that holds anything (row ${end}) reads like the table's totals: ${total}. Rows added below it would be left out of them and the totals would no longer be the totals. Nothing was added. ${NEW_WORKBOOK}`);
