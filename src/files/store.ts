@@ -29,15 +29,19 @@ const MATERIALIZE_TOTAL_MS = 5 * 60_000;
 /** How long a query waits for one of the turns at running in the server itself before it is told to come back. */
 const IN_SERVER_WAIT_MS = 15_000;
 import {
+  DocOpError,
   applyOps,
   buildWorkbook,
   trimTrailingEmptyRows,
+  validateDocSpec,
   type DocSource,
+  type OpReport,
   type ResolvedOp,
   type ResolvedSheet,
   type XlsxDocSpec,
   type XlsxOpSpec,
 } from "./documents.js";
+import { compareWithBase, dropFormulaResults } from "./documentFill.js";
 import { resolveDocumentMime, extractDocumentText } from "./textExtract.js";
 
 
@@ -77,6 +81,13 @@ const DEFAULTS = {
 // An xlsx rendition is built in memory by ExcelJS, so it is capped; the CSV
 // rendition streams from DuckDB to disk a chunk at a time and has no cap.
 const EXPORT_XLSX_MAX_ROWS = 100_000;
+/**
+ * The most a workbook sheet may read from a query on a file. A source that
+ * is larger is refused, not cut: a sheet that stops at the limit looks
+ * complete to whoever opens it.
+ */
+const DOC_SOURCE_MAX_ROWS = 50_000;
+const DOC_SOURCE_MAX_BYTES = 32 * 1024 * 1024;
 // Per step (a chunk fetch) while streaming an export, not for the whole file.
 const EXPORT_STEP_TIMEOUT_MS = 60_000;
 // Scratch files (per-sheet CSVs, staged rows, record temp files) older than
@@ -1191,7 +1202,12 @@ export class FileStore {
    * any snapshot. The agent never emits OOXML — see files/documents.ts. The
    * base binary on disk is never mutated.
    */
-  async renderXlsx(spec: XlsxDocSpec, requester: Requester): Promise<FileManifest> {
+  async renderXlsx(spec: XlsxDocSpec, requester: Requester): Promise<{ manifest: FileManifest; report?: OpReport[] }> {
+    try {
+      validateDocSpec(spec);
+    } catch (err) {
+      throw new FileStoreError(400, err instanceof Error ? err.message : String(err));
+    }
     const hasBase = !!spec.base?.fileId;
     if (hasBase) {
       if (!spec.ops || spec.ops.length === 0) {
@@ -1214,6 +1230,7 @@ export class FileStore {
     const xlsxPath = join(this.cfg.dir, `${fileId}.xlsx`);
     const dbPath = join(this.cfg.dir, `${fileId}.duckdb`);
     const notes: string[] = [];
+    let report: OpReport[] | undefined;
 
     try {
       await mkdir(this.cfg.dir, { recursive: true });
@@ -1230,8 +1247,24 @@ export class FileStore {
         await copyFile(baseRec.uploadPath, xlsxPath);
         const wb = new ExcelJS.Workbook();
         await wb.xlsx.readFile(xlsxPath);
-        applyOps(wb, await this.resolveOps(spec.ops!, requester));
+        const done = applyOps(wb, await this.resolveOps(spec.ops!, requester));
+        // A total over the cells just filled must not go on showing its old figure.
+        if (dropFormulaResults(wb) > 0) {
+          notes.push("This workbook has formulas. They are calculated when it is opened in Excel; their results are not shown here.");
+        }
         await wb.xlsx.writeFile(xlsxPath);
+        // The saved file, read back, against the file it was copied from:
+        // what was written is there, and nothing else has changed. A workbook
+        // that fails this is not kept.
+        const base = new ExcelJS.Workbook();
+        await base.xlsx.readFile(baseRec.uploadPath);
+        const saved = new ExcelJS.Workbook();
+        await saved.xlsx.readFile(xlsxPath);
+        const wrong = compareWithBase(base, saved, done.written);
+        if (wrong.length > 0) {
+          throw new FileStoreError(500, `The workbook did not save as it was written, so it was not kept: ${wrong.join("; ")}.`);
+        }
+        report = done.reports;
       } else {
         const sheets: ResolvedSheet[] = [];
         for (const s of spec.sheets!) {
@@ -1274,10 +1307,12 @@ export class FileStore {
         pinned: true,
       };
       await this.writeRecord(fileId, record);
-      return manifest;
+      return { manifest, ...(report ? { report } : {}) };
     } catch (err) {
       await this.removeFiles(fileId, { uploadPath: xlsxPath, dbPath } as FileRecord).catch(() => {});
       if (err instanceof FileStoreError) throw err;
+      // Refused for a reason the caller can act on: said as it is.
+      if (err instanceof DocOpError) throw new FileStoreError(422, err.message);
       throw new FileStoreError(
         422,
         `Could not render document: ${err instanceof Error ? err.message : String(err)}`,
@@ -1303,10 +1338,24 @@ export class FileStore {
       if (!t) throw new FileStoreError(422, "Source snapshot has no table to read.");
       sql = `SELECT * FROM ${quoteIdent(t.name)}`;
     }
-    // NOTE: query() caps at maxQueryRows / maxResultBytes, so a document source
-    // currently reads up to ~1000 rows. A streaming reader for large exports is
-    // a follow-up (see DOCUMENT_ARTIFACTS_SCOPING.md §8).
-    const res = await this.query(source.fileId, sql, requester);
+    // Whole or refused. This used to go through query(), which stops at 1,000
+    // rows or 512 KB and says so in a flag nobody here looked at: the sheet
+    // was saved short and looked complete.
+    const record = await this.getOwnedRecord(source.fileId, requester);
+    const guard = validateReadOnlySql(sql);
+    if (!guard.ok) throw new FileStoreError(400, guard.error!);
+    const res = await this.untrusted(
+      "file.query",
+      { dbPath: record.dbPath, sql, maxRows: DOC_SOURCE_MAX_ROWS, maxBytes: DOC_SOURCE_MAX_BYTES, ...this.bounded(this.cfg.queryTimeoutMs) },
+      this.cfg.queryTimeoutMs,
+      `document source ${source.fileId}`,
+    );
+    if (res.truncated) {
+      throw new FileStoreError(
+        422,
+        `This source has more than a workbook sheet can take from one query (${DOC_SOURCE_MAX_ROWS.toLocaleString("en-US")} rows or ${DOC_SOURCE_MAX_BYTES / (1024 * 1024)} MB). Nothing was saved. Narrow the query, or split it across sheets.`,
+      );
+    }
     return res.rows;
   }
 
@@ -1318,11 +1367,24 @@ export class FileStore {
         case "set_cell":
           out.push({ op: "set_cell", sheet: op.sheet, cell: op.cell, value: op.value });
           break;
+        case "fill_by_key":
+          out.push({
+            op: "fill_by_key",
+            sheet: op.sheet,
+            key: op.key,
+            set: op.set,
+            unmatched: op.unmatched,
+            overwrite: op.overwrite,
+            rows: await this.resolveSource(op.source, requester),
+          });
+          break;
         case "populate_sheet":
           out.push({
             op: "populate_sheet",
             sheet: op.sheet,
             startCell: op.startCell,
+            columns: op.columns,
+            overwrite: op.overwrite,
             rows: await this.resolveSource(op.source, requester),
           });
           break;

@@ -14,9 +14,27 @@
 // copy-forward preserves cell content / styles / formulas / column layout but
 // can drop charts and pivot tables. Fine for data-grid trackers; the store
 // warns when a base carries those parts. See DOCUMENT_ARTIFACTS_SCOPING.md §8.
+//
+// Writing into an existing sheet is in documentFill.ts, with its rules: by
+// key or by header where the sheet can say where a value goes, by position
+// only into an empty area, everything checked before anything is written.
 // ---------------------------------------------------------------------------
 
 import ExcelJS from "exceljs";
+
+import {
+  DocOpError,
+  appendByHeader,
+  fillByKey,
+  parseSingleCell,
+  populateBlock,
+  toCellValue,
+  type KeyPair,
+  type OpReport,
+  type Written,
+} from "./documentFill.js";
+
+export { DocOpError, type OpReport, type Written };
 
 // --- Shared style/column vocabulary (used by both request + resolved specs) --
 
@@ -63,8 +81,22 @@ export interface XlsxSheetSpec {
   style?: XlsxSheetStyle;
 }
 
+/** What fill_by_key is told, apart from where its data comes from. */
+export interface FillByKeySpec {
+  sheet: string;
+  /** The column that identifies a row: its header in the sheet and its name in the data. Several make one key together. */
+  key: KeyPair | KeyPair[];
+  /** Header in the sheet → column in the data. */
+  set: Record<string, string>;
+  /** A sheet row with no data row: "leave" (default), "blank" or "zero". */
+  unmatched?: "leave" | "blank" | "zero";
+  /** Write over cells that already hold a value or a formula. */
+  overwrite?: boolean;
+}
+
 export type XlsxOpSpec =
-  | { op: "populate_sheet"; sheet: string; startCell?: string; source: DocSource }
+  | ({ op: "fill_by_key"; source: DocSource } & FillByKeySpec)
+  | { op: "populate_sheet"; sheet: string; startCell: string; columns?: XlsxColumnSpec[]; overwrite?: boolean; source: DocSource }
   | { op: "append_rows"; sheet: string; source: DocSource }
   | { op: "set_cell"; sheet: string; cell: string; value: unknown }
   | {
@@ -99,7 +131,8 @@ export interface ResolvedSheet {
 }
 
 export type ResolvedOp =
-  | { op: "populate_sheet"; sheet: string; startCell?: string; rows: Record<string, unknown>[] }
+  | ({ op: "fill_by_key"; rows: Record<string, unknown>[] } & FillByKeySpec)
+  | { op: "populate_sheet"; sheet: string; startCell?: string; columns?: XlsxColumnSpec[]; overwrite?: boolean; rows: Record<string, unknown>[] }
   | { op: "append_rows"; sheet: string; rows: Record<string, unknown>[] }
   | { op: "set_cell"; sheet: string; cell: string; value: unknown }
   | {
@@ -109,6 +142,73 @@ export type ResolvedOp =
       columns?: XlsxColumnSpec[];
       style?: XlsxSheetStyle;
     };
+
+// --- The request, checked whole before any of it is carried out --------------
+
+const present = (v: unknown): boolean => v !== undefined && v !== null;
+
+const SPEC_FIELDS = ["title", "theme", "base", "sheets", "ops", "downloadName"];
+const SOURCE_FIELDS = ["fileId", "sql", "rows"];
+const SHEET_FIELDS = ["name", "source", "columns", "style"];
+const OP_FIELDS: Record<string, { all: string[]; needs: string[] }> = {
+  fill_by_key: { all: ["op", "sheet", "key", "set", "unmatched", "overwrite", "source"], needs: ["sheet", "key", "set", "source"] },
+  populate_sheet: { all: ["op", "sheet", "startCell", "columns", "overwrite", "source"], needs: ["sheet", "startCell", "source"] },
+  append_rows: { all: ["op", "sheet", "source"], needs: ["sheet", "source"] },
+  set_cell: { all: ["op", "sheet", "cell", "value"], needs: ["sheet", "cell"] },
+  add_sheet: { all: ["op", "name", "source", "columns", "style"], needs: ["name", "source"] },
+};
+
+/**
+ * Everything wrong with a request, found before any of it runs. A field this
+ * builder does not use is an error, not something to drop: a caller who gave
+ * it meant something by it (a list of columns to write, a sort order), and a
+ * workbook built without it is not the one that was asked for.
+ */
+export function validateDocSpec(spec: XlsxDocSpec): void {
+  const wrong: string[] = [];
+  const extra = (where: string, o: object, allowed: string[]) => {
+    const unknown = Object.entries(o).filter(([k, v]) => present(v) && !allowed.includes(k)).map(([k]) => `"${k}"`);
+    if (unknown.length > 0) wrong.push(`${where}: ${unknown.join(", ")} ${unknown.length === 1 ? "is" : "are"} not used here (accepted: ${allowed.join(", ")})`);
+  };
+  const source = (where: string, src: unknown) => {
+    if (!src || typeof src !== "object") return void wrong.push(`${where} needs a "source"`);
+    const o = src as DocSource;
+    extra(`${where} source`, o, SOURCE_FIELDS);
+    const rows = Array.isArray(o.rows);
+    if (present(o.rows) && !rows) wrong.push(`${where} source: "rows" must be a list of rows`);
+    if (rows && present(o.fileId)) wrong.push(`${where} source: give "rows" or a file to read, not both`);
+    if (rows && present(o.sql)) wrong.push(`${where} source: "sql" does nothing with "rows" and would be ignored`);
+    if (!rows && !present(o.fileId)) wrong.push(`${where} source needs a file to read or "rows"`);
+    if (rows && o.rows!.some((r) => !r || typeof r !== "object" || Array.isArray(r))) wrong.push(`${where} source: every row must be an object of column → value`);
+  };
+
+  extra("The request", spec, SPEC_FIELDS);
+  const hasSheets = Array.isArray(spec.sheets) && spec.sheets.length > 0;
+  const hasOps = Array.isArray(spec.ops) && spec.ops.length > 0;
+  if (hasSheets && hasOps) wrong.push('give "sheets" (a new workbook) or "base" with "ops" (a copy of an existing one), not both: the sheets would be ignored');
+  if (hasSheets && present(spec.base)) wrong.push('"base" does nothing with "sheets": a new workbook is not a copy of anything');
+  if (hasOps && !present(spec.base?.fileId)) wrong.push('"ops" need a "base" workbook to be applied to');
+
+  (spec.sheets ?? []).forEach((sh, i) => {
+    const where = `Sheet ${i + 1}`;
+    if (!sh || typeof sh !== "object") return void wrong.push(`${where} is not an object`);
+    extra(where, sh, SHEET_FIELDS);
+    if (!present(sh.name)) wrong.push(`${where} needs a "name"`);
+    source(where, sh.source);
+  });
+  (spec.ops ?? []).forEach((op, i) => {
+    const where = `Op ${i + 1}`;
+    if (!op || typeof op !== "object") return void wrong.push(`${where} is not an object`);
+    const o = op as unknown as Record<string, unknown>;
+    const fields = OP_FIELDS[String(o.op)];
+    if (!fields) return void wrong.push(`${where}: "${String(o.op)}" is not an op (ops: ${Object.keys(OP_FIELDS).join(", ")})`);
+    extra(`${where} (${String(o.op)})`, o, fields.all);
+    const missing = fields.needs.filter((f) => !present(o[f])).map((f) => `"${f}"`);
+    if (missing.length > 0) wrong.push(`${where} (${String(o.op)}) needs ${missing.join(", ")}`);
+    if (fields.all.includes("source") && present(o.source)) source(`${where} (${String(o.op)})`, o.source);
+  });
+  if (wrong.length > 0) throw new DocOpError(`The workbook request cannot be carried out as written: ${wrong.join("; ")}.`);
+}
 
 // --- Themes: one-token defaults the agent can override per element -----------
 
@@ -143,37 +243,69 @@ export function buildWorkbook(
 // Copy-forward ops (applied to a workbook loaded from the base binary)
 // ---------------------------------------------------------------------------
 
-export function applyOps(wb: ExcelJS.Workbook, ops: ResolvedOp[]): void {
+/**
+ * Apply the ops in order. Returns what each did, and every cell that was
+ * written with the value it must now hold, by sheet: the caller reads the
+ * saved file back against that. An op that cannot be carried out safely
+ * throws DocOpError; the workbook in memory may then be part-written and is
+ * to be thrown away, not saved.
+ */
+export function applyOps(wb: ExcelJS.Workbook, ops: ResolvedOp[]): { reports: OpReport[]; written: Map<string, Written> } {
+  const reports: OpReport[] = [];
+  const written = new Map<string, Written>();
+  const record = (sheet: string, cells: Written) => {
+    const have = written.get(sheet) ?? new Map();
+    for (const [address, value] of cells) have.set(address, value);
+    written.set(sheet, have);
+  };
   for (const op of ops) {
     switch (op.op) {
       case "add_sheet": {
         const ws = wb.addWorksheet(sheetName(op.name, wb));
         writeSheet(ws, op.rows, op.columns, op.style?.header);
         applyFreeze(ws, op.style?.freeze);
+        reports.push({ op: op.op, sheet: ws.name, rowsWritten: op.rows.length });
+        break;
+      }
+      case "fill_by_key": {
+        const ws = sheetOrThrow(wb, op.sheet);
+        const done = fillByKey(ws, op);
+        record(ws.name, done.written);
+        reports.push(done.report);
         break;
       }
       case "populate_sheet": {
         const ws = sheetOrThrow(wb, op.sheet);
-        populateAt(ws, op.startCell ?? "A1", op.rows);
+        const done = populateBlock(ws, { startCell: op.startCell, columns: op.columns?.map((c) => c.key), overwrite: op.overwrite, rows: op.rows });
+        record(ws.name, done.written);
+        reports.push(done.report);
         break;
       }
       case "append_rows": {
         const ws = sheetOrThrow(wb, op.sheet);
-        appendRows(ws, op.rows);
+        const done = appendByHeader(ws, op.rows);
+        record(ws.name, done.written);
+        reports.push(done.report);
         break;
       }
       case "set_cell": {
         const ws = sheetOrThrow(wb, op.sheet);
-        ws.getCell(op.cell).value = toFormulaAwareValue(op.value);
+        const { col, row } = parseSingleCell(op.cell, 'set_cell "cell"');
+        const cell = ws.getRow(row).getCell(col);
+        const value = toFormulaAwareValue(op.value);
+        cell.value = value;
+        record(ws.name, new Map([[cell.address, value]]));
+        reports.push({ op: op.op, sheet: ws.name, range: cell.address, cellsWritten: 1 });
         break;
       }
       default: {
         // Exhaustiveness guard — a new op type must be handled above.
         const _never: never = op;
-        throw new Error(`Unknown op: ${JSON.stringify(_never)}`);
+        throw new DocOpError(`Unknown op: ${JSON.stringify((_never as { op?: unknown }).op)}`);
       }
     }
   }
+  return { reports, written };
 }
 
 // ---------------------------------------------------------------------------
@@ -188,6 +320,15 @@ function writeSheet(
 ): void {
   const cols = columns && columns.length > 0 ? columns : inferColumns(rows);
   if (cols.length === 0) return; // nothing to write (empty sheet)
+  if (columns && columns.length > 0 && rows.length > 0) {
+    // A column the data does not have used to come out as an empty column
+    // under its header, which reads as "no figures" rather than "wrong name".
+    const have = new Set(rows.flatMap((r) => Object.keys(r)));
+    const missing = columns.filter((c) => !have.has(c.key)).map((c) => `"${c.key}"`);
+    if (missing.length > 0) {
+      throw new DocOpError(`Sheet "${ws.name}": the data has no column ${missing.join(", ")}. Its columns are: ${[...have].map((h) => `"${h}"`).join(", ")}.`);
+    }
+  }
 
   const headerRow = ws.addRow(cols.map((c) => c.header ?? c.key));
   applyHeaderStyle(headerRow, header);
@@ -218,33 +359,6 @@ function writeSheet(
   });
 }
 
-/** Write rows (values only, no header) starting at a cell — for filling a template's data area. */
-function populateAt(
-  ws: ExcelJS.Worksheet,
-  startCell: string,
-  rows: Record<string, unknown>[],
-): void {
-  if (rows.length === 0) return;
-  const keys = Object.keys(rows[0]);
-  const { col: c0, row: r0 } = parseCell(startCell);
-  rows.forEach((r, ri) => {
-    const row = ws.getRow(r0 + ri);
-    keys.forEach((k, ci) => {
-      row.getCell(c0 + ci).value = toCellValue(r[k]);
-    });
-    row.commit?.();
-  });
-}
-
-/** Append rows after the sheet's current content — for logs / growing tables. */
-function appendRows(ws: ExcelJS.Worksheet, rows: Record<string, unknown>[]): void {
-  if (rows.length === 0) return;
-  const keys = Object.keys(rows[0]);
-  for (const r of rows) {
-    ws.addRow(keys.map((k) => toCellValue(r[k])));
-  }
-}
-
 function applyHeaderStyle(row: ExcelJS.Row, style: XlsxHeaderStyle | undefined): void {
   const s = style ?? { bold: true };
   row.eachCell((cell) => {
@@ -257,7 +371,7 @@ function applyHeaderStyle(row: ExcelJS.Row, style: XlsxHeaderStyle | undefined):
 
 function applyFreeze(ws: ExcelJS.Worksheet, freeze: string | undefined): void {
   if (!freeze) return;
-  const { col, row } = parseCell(freeze);
+  const { col, row } = parseSingleCell(freeze, 'style "freeze"');
   ws.views = [{ state: "frozen", xSplit: col - 1, ySplit: row - 1 }];
 }
 
@@ -338,18 +452,6 @@ function inferColumns(rows: Record<string, unknown>[]): XlsxColumnSpec[] {
   });
 }
 
-/** Coerce an arbitrary value to a valid exceljs cell value. */
-function toCellValue(v: unknown): ExcelJS.CellValue {
-  if (v === null || v === undefined) return null;
-  if (typeof v === "number" || typeof v === "boolean" || typeof v === "string") return v;
-  if (v instanceof Date) return v;
-  if (typeof v === "bigint") {
-    const n = Number(v);
-    return Number.isSafeInteger(n) ? n : v.toString();
-  }
-  return String(v);
-}
-
 /** Like toCellValue, but a leading "=" makes it a formula (set_cell only). */
 function toFormulaAwareValue(v: unknown): ExcelJS.CellValue {
   if (typeof v === "string" && v.startsWith("=")) {
@@ -364,23 +466,11 @@ function argb(hex: string): string {
   return h.length === 6 ? `FF${h}` : h;
 }
 
-function colToNum(letters: string): number {
-  let n = 0;
-  for (const ch of letters.toUpperCase()) n = n * 26 + (ch.charCodeAt(0) - 64);
-  return n;
-}
-
-function parseCell(ref: string): { col: number; row: number } {
-  const m = /^([A-Za-z]+)(\d+)$/.exec(ref.trim());
-  if (!m) return { col: 1, row: 1 };
-  return { col: colToNum(m[1]), row: parseInt(m[2], 10) };
-}
-
 function sheetOrThrow(wb: ExcelJS.Workbook, name: string): ExcelJS.Worksheet {
   const ws = wb.getWorksheet(name);
   if (!ws) {
     const have = wb.worksheets.map((w) => w.name).join(", ");
-    throw new Error(`Sheet "${name}" not found. Sheets: ${have || "(none)"}.`);
+    throw new DocOpError(`Sheet "${name}" not found. Sheets: ${have || "(none)"}.`);
   }
   return ws;
 }

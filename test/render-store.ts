@@ -40,7 +40,7 @@ async function main(): Promise<void> {
     );
 
     // 2. Blank build — a sheet sourced from a SQL read of that snapshot.
-    const built = await store.renderXlsx(
+    const { manifest: built } = await store.renderXlsx(
       {
         title: "SR Report",
         theme: "corporate",
@@ -70,15 +70,16 @@ async function main(): Promise<void> {
     check("projection has 2 rows", Number(count.rows[0].c) === 2);
 
     // 3. Copy-forward from the built workbook + append a row (inline source).
-    const fwd = await store.renderXlsx(
+    const { manifest: fwd, report: fwdReport } = await store.renderXlsx(
       {
         title: "SR Report v2",
         base: { fileId: built.fileId },
-        ops: [{ op: "append_rows", sheet: "Summary", source: { rows: [{ store: "Gamma", sold: 9 }] } }],
+        ops: [{ op: "append_rows", sheet: "Summary", source: { rows: [{ Sold: 9, Store: "Gamma" }] } }],
       },
       requester,
     );
     check("forward is a new fileId", fwd.fileId !== built.fileId);
+    check("copy-forward says what it wrote", fwdReport?.[0]?.op === "append_rows" && fwdReport[0].range === "A4:B4" && fwdReport[0].rowsWritten === 1);
     const fwdCount = await store.query(
       fwd.fileId,
       `SELECT count(*) AS c FROM "${fwd.tables[0].name}"`,
@@ -114,6 +115,56 @@ async function main(): Promise<void> {
       threw = true;
     }
     check("non-xlsx base rejected", threw);
+
+    // 5. Filling a copy by key, end to end: the report comes back, the
+    // queryable copy holds the figures against the right rows, and a total
+    // over them does not go on showing what it showed before.
+    const { manifest: tracker } = await store.renderXlsx(
+      {
+        title: "Tracker",
+        sheets: [{ name: "Items", source: { rows: [{ CODE: "A-1", NAME: "Shirt", SOLD: null }, { CODE: "B-2", NAME: "Polo", SOLD: null }, { CODE: "C-3", NAME: "Cap", SOLD: null }] }, columns: [{ key: "CODE" }, { key: "NAME" }, { key: "SOLD" }] }],
+      },
+      requester,
+    );
+    const { manifest: withTotal } = await store.renderXlsx(
+      { title: "Tracker with total", base: { fileId: tracker.fileId }, ops: [{ op: "set_cell", sheet: "Items", cell: "B5", value: "TOTAL" }, { op: "set_cell", sheet: "Items", cell: "C5", value: "=SUM(C2:C4)" }] },
+      requester,
+    );
+    const filled = await store.renderXlsx(
+      {
+        title: "Tracker filled",
+        base: { fileId: withTotal.fileId },
+        ops: [{ op: "fill_by_key", sheet: "Items", key: { sheet: "CODE", data: "code" }, set: { SOLD: "sold" }, source: { rows: [{ code: "C-3", sold: 9 }, { code: "A-1", sold: 5 }, { code: "B-2", sold: 6 }] } }],
+      },
+      requester,
+    );
+    check("fill_by_key reports the match", filled.report?.[0]?.matched === 3 && filled.report[0].cellsWritten === 3 && filled.report[0].targetColumns?.SOLD === "C");
+    const t = filled.manifest.tables[0].name;
+    const got = await store.query(filled.manifest.fileId, `SELECT "CODE" AS code, "SOLD" AS sold FROM "${t}" WHERE "CODE" IS NOT NULL ORDER BY "CODE"`, requester);
+    check("the queryable copy has each figure against its own code", JSON.stringify(got.rows.map((r) => [r.code, Number(r.sold)])) === JSON.stringify([["A-1", 5], ["B-2", 6], ["C-3", 9]]));
+    const totalRow = await store.query(filled.manifest.fileId, `SELECT "SOLD" AS sold FROM "${t}" WHERE "NAME" = 'TOTAL'`, requester);
+    check("the total shows no stale figure", totalRow.rows.length === 1 && (totalRow.rows[0].sold === null || totalRow.rows[0].sold === ""));
+    check("and the workbook says its formulas are calculated on opening", (filled.manifest.notes ?? []).some((n) => /calculated when it is opened/.test(n)));
+
+    // 6. Refusals reach the caller as they are, and nothing is saved.
+    const refusal = async (spec: Parameters<typeof store.renderXlsx>[0]): Promise<{ status?: number; message: string }> => {
+      try {
+        await store.renderXlsx(spec, requester);
+        return { message: "" };
+      } catch (e) {
+        return { status: (e as { statusCode?: number; status?: number }).statusCode ?? (e as { status?: number }).status, message: (e as Error).message };
+      }
+    };
+    const beside = await refusal({ title: "x", base: { fileId: tracker.fileId }, ops: [{ op: "populate_sheet", sheet: "Items", startCell: "C2", source: { rows: [{ sold: 1 }, { sold: 2 }, { sold: 3 }] } }] });
+    check("a positional fill beside existing rows is refused, with the way out", /writes by position.*Use fill_by_key/.test(beside.message));
+    const unknown = await refusal({ title: "x", base: { fileId: tracker.fileId }, ops: [{ op: "append_rows", sheet: "Items", source: { rows: [{ CODE: "D" }] }, columns: [{ key: "CODE" }] } as never] });
+    check("a field the op does not use is refused, not dropped", /"columns" is not used here/.test(unknown.message));
+    // A source larger than a sheet may read from one query: whole or refused.
+    const tooBig = await refusal({ title: "big", sheets: [{ name: "S", source: { fileId: src.fileId, sql: "SELECT i, 'x' AS pad FROM range(60000) t(i)" } }] });
+    check("a source over the limit is refused, not cut short", /more than a workbook sheet can take.*Nothing was saved/.test(tooBig.message));
+    const justUnder = await store.renderXlsx({ title: "many", sheets: [{ name: "S", source: { fileId: src.fileId, sql: "SELECT i FROM range(1500) t(i)" } }] }, requester);
+    const manyCount = await store.query(justUnder.manifest.fileId, `SELECT count(*) AS c FROM "${justUnder.manifest.tables[0].name}"`, requester);
+    check("a source past the old 1,000-row cut is now whole (1,500 rows)", Number(manyCount.rows[0].c) === 1500);
 
     console.log(`\n✓ render-store: ${passed} checks passed`);
   } finally {

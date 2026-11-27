@@ -281,8 +281,10 @@ export function registerFileRoutes(
       if (!spec || typeof spec !== "object") {
         return reply.code(400).send({ error: "Body must include a 'spec' object." });
       }
-      const manifest = await store.renderXlsx(spec, requesterOf(request));
-      return reply.send({ manifest });
+      // `report` says what each op of a copy-forward did (cells written, rows
+      // matched and not): the caller's account of the workbook it now has.
+      const { manifest, report } = await store.renderXlsx(spec, requesterOf(request));
+      return reply.send({ manifest, ...(report ? { report } : {}) });
     },
   );
 

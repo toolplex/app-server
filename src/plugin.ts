@@ -38,6 +38,14 @@ const CAPABILITIES = {
   history: true,
   /** storage numbers are reported alongside capabilities. */
   storage: true,
+  /**
+   * POST /documents: an existing workbook is filled by key (fill_by_key) or
+   * by header, a positional fill beside existing rows is refused, the request
+   * is checked whole, and the answer carries a report of what was written.
+   * A server without this drops ops it does not know, so the caller must not
+   * send fill_by_key to it.
+   */
+  documentFill: true,
 } as const;
 
 async function appServerPlugin(

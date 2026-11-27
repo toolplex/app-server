@@ -98,7 +98,8 @@ async function main(): Promise<void> {
     // -----------------------------------------------------------------------
     const baseCopy = await readBack(basePath);
     const ops: ResolvedOp[] = [
-      { op: "append_rows", sheet: "Summary", rows: [{ store: "Gamma", sold: 9, sell_through: 0.1 }] },
+      // Appended rows go under the header of the same name, whatever order the data's columns are in.
+      { op: "append_rows", sheet: "Summary", rows: [{ "Units Sold": 9, "Sell-through": 0.1, Store: "Gamma" }] },
       { op: "set_cell", sheet: "Summary", cell: "E1", value: "Refreshed" },
       { op: "set_cell", sheet: "Summary", cell: "E2", value: "=B2+B3" },
       { op: "add_sheet", name: "Notes", rows: [{ note: "hello" }] },
