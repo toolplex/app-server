@@ -1274,8 +1274,11 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
   // beside the table and running further down. Which of those it is cannot
   // be told, and in none of them is the end of the sheet the foot of the
   // table.
-  // (Headers merged down over two rows are one header: the table begins below them.)
-  const headBottom = Math.max(...cols0.map((c) => mergedBottom(ws, header.row, c)));
+  // (Headers merged down over two rows are one header: the table begins below
+  // them. Only as far as every named header goes: one merged down beside the
+  // whole table, a "Remarks" column kept as one block, does not make the
+  // table's rows part of the headers.)
+  const headBottom = Math.min(...cols0.map((c) => mergedBottom(ws, header.row, c)));
   const end = Math.max(lastValueRow(ws), headBottom);
   const lastRow = ws.getRow(end);
   for (let r = headBottom + 1; r <= end; r++) {
@@ -1314,7 +1317,7 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
   const tableRows = Array.from({ length: end - headBottom }, (_, i) => headBottom + 1 + i);
   if (opts.afterRow !== undefined && opts.afterRow !== end) {
     throw new DocOpError(
-      `"afterRow" is ${JSON.stringify(opts.afterRow)}, and the last row of sheet "${ws.name}" that holds anything is ${end === headBottom ? `the header row (${end})` : quote(end)}. Rows are added only after that row: if it is an ordinary row of the table, send "afterRow": ${end}; if it is a total, a note or part of something else, do not add rows here. Nothing was added. ${NEW_WORKBOOK}`,
+      `"afterRow" is ${JSON.stringify(opts.afterRow)}, and the last row of sheet "${ws.name}" that holds anything is ${end === headBottom ? (headBottom > header.row ? `the bottom of the merged headers (row ${end})` : `the header row (${end})`) : quote(end)}. Rows are added only after that row: if it is an ordinary row of the table, send "afterRow": ${end}; if it is a total, a note or part of something else, do not add rows here. Nothing was added. ${NEW_WORKBOOK}`,
     );
   }
   // The headers again inside the rows: another table, for certain.
@@ -1346,6 +1349,9 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
     return { count, filled, main, figures: count.number + count.date >= 2 && main !== "text" && count.text <= Math.max(1, Math.floor(filled / 5)) };
   });
   for (const r of tableRows) {
+    // (The row directly under the headers is this table's own: units, "(pcs)" and "(PHP)", or
+    // sub-headings. It is shown as a sign, not refused.)
+    if (r === headBottom + 1) continue;
     const f = figuresAt();
     // (Headings differ from one another. The same word under each column, "closed" and "closed", is
     // a day with no figures: that is a sign, and asked about.)
@@ -1454,7 +1460,9 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
   // A column that is to take figures and holds words on more rows than figures: two tables may share it.
   cols0.forEach((_, k) => {
     const n = columnKinds[k].count;
-    if (tableRows.length > 0 && columnKinds[k].main === "text" && n.number + n.date >= 2 && rows.some((r) => typeof toCellValue(r[names[k]]) === "number")) {
+    // (Figures however the data gives them: as numbers, or as text that reads as a number or a date.)
+    const figure = (v: unknown) => typeof v === "number" || v instanceof Date || (typeof v === "string" && (READS_AS_A_NUMBER.test(v.trim()) || READS_AS_A_DATE.test(v.trim())));
+    if (tableRows.length > 0 && columnKinds[k].main === "text" && n.number + n.date >= 2 && rows.some((r) => figure(toCellValue(r[names[k]])))) {
       doubts.push(`the rows under "${names[k]}" hold words on ${n.text} rows and figures or dates on ${n.number + n.date}: more than one table may lie under those headers`);
     }
   });

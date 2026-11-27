@@ -1273,8 +1273,31 @@ async function main(): Promise<void> {
         ws.mergeCells("A1:A2");
         ws.mergeCells("B1:B2");
       });
+      refused("headers merged down with no rows yet: the row to confirm is their bottom", tallBare, one([{ Item: "c", Qty: 3 }]), /The headers are on row 1 \(A1 "Item", B1 "Qty"\), merged down to row 2\. Nothing on sheet "S" lies below them\. If row 1 is the header row of a table that has no rows yet, send the same op with "afterRow": 2 and the rows are added from row 3\./);
+      refused("and the header row's own number is not it", tallBare, [{ ...one([{ Item: "c", Qty: 3 }])[0], afterRow: 1 }], /"afterRow" is 1, and the last row of sheet "S" that holds anything is the bottom of the merged headers \(row 2\)/);
       applyOps(tallBare, [{ ...one([{ Item: "c", Qty: 3 }])[0], afterRow: 2 }]);
       check("with no rows yet, the first goes below the merged headers", tallBare.getWorksheet("S")!.getCell("A3").value === "c");
+
+      // One header merged down beside the whole table (a block kept for remarks) does not make the table's rows part of the headers.
+      const beside = (last: unknown[]) => sheetOf([["Item", "Qty", "Remarks"], ["a", 1], ["b", 2], ["c", 3], last], (ws) => ws.mergeCells("C1:C5"));
+      const withRemarks = one([{ Item: "d", Qty: 4, Remarks: "late" }]);
+      refused("a total under a table with one header merged down beside it", beside(["Total", 6]), withRemarks, /is the table's total or closing line, by its label, A5 "Total"/);
+      refused("a formula in the last row of such a table", sheetOf([["Item", "Qty", "Remarks"], ["a", 1], ["b", 2], ["c", 3], ["d", 4]], (ws) => {
+        ws.mergeCells("C1:C5");
+        ws.getCell("B5").value = { formula: "SUM(B2:B4)", result: 6 };
+      }), withRemarks, /The last row of sheet "S" that holds anything \(row 5\) has formulas \(B5\)/);
+      refused("and its rows are shown when the last one is ordinary", beside(["d", 4]), withRemarks, /The headers are on row 1 \(A1 "Item", B1 "Qty", C1 "Remarks"\)\. The last rows of sheet "S" are: row 3 /);
+      // Headers merged to different depths: the table begins below the shallowest, and the row between is shown as a sign.
+      const uneven = sheetOf([["Item", "Qty", "Note"], [null, null, null], ["a", 1, "x"], ["b", 2, "y"], ["c", 3, "z"]], (ws) => {
+        ws.mergeCells("A1:A2");
+        ws.mergeCells("B1:B2");
+      });
+      const noted = one([{ Item: "d", Qty: 4, Note: "w" }]);
+      refused("headers merged to different depths", uneven, noted, /The headers are on row 1 \(A1 "Item", B1 "Qty", C1 "Note"\)\. The last rows of sheet "S" are: .*Signs that row 5 may not be an ordinary row of the table under those headers: row 2 \(.*\) holds words under "Qty", a column of figures/);
+      applyOps(uneven, [{ ...noted[0], afterRow: 5 }]);
+      check("and confirmed, the rows go below the last one", uneven.getWorksheet("S")!.getCell("B6").value === 4);
+      // Every label in the last row is named, not only the first.
+      refused("two labels in the last row", sheetOf([["Item", "Note", "Qty"], ["a", "x", 3], ["b", "y", 4], ["c", "z", 5], ["Month total", "Share of total", 99]]), one([{ Item: "d", Note: "w", Qty: 1 }]), /A5 "Month total" reads like the label of a total, an average or a closing line; B5 "Share of total" reads like the label of a total, an average or a closing line/);
 
       // A label held as rich text (part of it in bold) or as a link is a label all the same.
       const bold = sheetOf([["Item", "Amount"], ["a", 100.25], ["b", 110.2], ["c", 100.3], [null, 310.75]], (ws) => void (ws.getCell("A5").value = { richText: [{ font: { bold: true }, text: "TOTAL" }] }));
@@ -1289,6 +1312,10 @@ async function main(): Promise<void> {
 
       // Words under every column of figures: headings when they differ, a day without figures when they are the same word.
       refused("another table's headings under two columns of figures", sheetOf([["Item", "Qty", "Amount"], ["a", 3, 30], ["b", 4, 41], ["c", 5, 52], ["Region", "Target", "Actual"], ["North", 10, 12]]), one([{ Item: "d", Qty: 1, Amount: 2 }]), /holds words under every column of figures on row 5 \(A5 "Region", B5 "Target", C5 "Actual"\): it reads like another table's headings/);
+      const units = sheetOf([["Item", "Qty", "Amount"], [null, "(pcs)", "(PHP)"], ["a", 4, 10], ["b", 2, 25], ["c", 7, 31]]);
+      refused("a row of units directly under the headers is the table's own, and shown", units, one([{ Item: "d", Qty: 1, Amount: 2 }]), /Signs that row 5 may not be an ordinary row of the table under those headers: row 2 \(B2 "\(pcs\)", C2 "\(PHP\)"\) holds words under "Qty", a column of figures: another table's headings, a note, or only an odd value\. Read them/);
+      applyOps(units, [{ ...one([{ Item: "d", Qty: 1, Amount: 2 }])[0], afterRow: 5 }]);
+      check("and such a table takes rows once its last row is confirmed", units.getWorksheet("S")!.getCell("C6").value === 2);
       const shut = sheetOf([["Day", "Qty", "Amount"], ["Mon", 3, 30], ["Tue", "closed", "closed"], ["Wed", 5, 52], ["Thu", 6, 61]]);
       refused("a day with the same word under each column of figures", shut, one([{ Day: "Fri", Qty: 1, Amount: 2 }]), /Signs that row 5 may not be an ordinary row of the table under those headers: row 3 \(A3 "Tue", B3 "closed", C3 "closed"\) holds words under "Qty", a column of figures: another table's headings, a note, or only an odd value\. Read them/);
       applyOps(shut, [{ ...one([{ Day: "Fri", Qty: 1, Amount: 2 }])[0], afterRow: 5 }]);
@@ -1298,6 +1325,7 @@ async function main(): Promise<void> {
       const busy = sheetOf([["Item", "Amount"], ["a", 1], ["b", "pending"], ["c", "pending"], ["d", "pending"], ["e", 5], ["f", 6], ["g", 7], ["h", "pending"], ["i", "pending"], ["j", "pending"], ["k", 11], ["l", 12], ["m", 13], ["n", 14], ["o", 15], ["Region", "Sales"], ["North", 10], ["South", 12]]);
       refused("another table's headings among rows that hold an odd word", busy, one([{ Item: "z", Amount: 1 }]), /under those headers: row 17 \(A17 "Region", B17 "Sales"\) holds words under "Amount", a column of figures: another table's headings, a note, or only an odd value; row 11 \(A11 "j", B11 "pending"\) holds words under "Amount"[^;]*; row 10 \(A10 "i", B10 "pending"\) holds words under "Amount"[^;]*; 4 more rows hold words under a column of figures or dates \(rows 3, 4, 5, 9\)\. Read them/);
       const shared = sheetOf([["Item", "Amount"], ["a", 1], ["b", 2], ["Region", "Sales"], ["North", "high"], ["South", "low"], ["East", "low"]]);
+      refused("the same when the figure to add arrives as text", shared, one([{ Item: "z", Amount: "20" }]), /the rows under "Amount" hold words on 4 rows and figures or dates on 2/);
       refused("a column to take figures that holds more words than figures", shared, one([{ Item: "z", Amount: 1 }]), /under those headers: the rows under "Amount" hold words on 4 rows and figures or dates on 2: more than one table may lie under those headers\. Read them/);
 
       // A hidden last row is said to be hidden; a long row is said to be cut.
