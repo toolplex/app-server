@@ -129,13 +129,19 @@ export function registerFileRoutes(
   // POST /files/:id/query — run one read-only SQL statement against the file.
   // An artifact is a file in the same store, so /artifacts/:id/query is the
   // same handler under its older name.
+  // `whole: true` is for a reader that turns the rows into something a person
+  // receives: the whole result in one execution, or a refusal, never a result
+  // cut at the small cap that suits showing rows to the assistant.
   const queryHandler = async (
-    request: FastifyRequest<{ Params: { id: string }; Body: { sql?: string } }>,
+    request: FastifyRequest<{ Params: { id: string }; Body: { sql?: string; whole?: boolean } }>,
     reply: FastifyReply,
   ) => {
     const sql = request.body?.sql;
     if (typeof sql !== "string") {
       return reply.code(400).send({ error: "Body must include a 'sql' string." });
+    }
+    if (request.body?.whole === true) {
+      return reply.send({ ...(await store.queryWhole(request.params.id, sql, requesterOf(request))), whole: true });
     }
     return reply.send(await store.query(request.params.id, sql, requesterOf(request)));
   };

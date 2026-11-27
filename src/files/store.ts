@@ -1341,22 +1341,17 @@ export class FileStore {
     // Whole or refused. This used to go through query(), which stops at 1,000
     // rows or 512 KB and says so in a flag nobody here looked at: the sheet
     // was saved short and looked complete.
-    const record = await this.getOwnedRecord(source.fileId, requester);
-    const guard = validateReadOnlySql(sql);
-    if (!guard.ok) throw new FileStoreError(400, guard.error!);
-    const res = await this.untrusted(
-      "file.query",
-      { dbPath: record.dbPath, sql, maxRows: DOC_SOURCE_MAX_ROWS, maxBytes: DOC_SOURCE_MAX_BYTES, ...this.bounded(this.cfg.queryTimeoutMs) },
-      this.cfg.queryTimeoutMs,
-      `document source ${source.fileId}`,
-    );
-    if (res.truncated) {
-      throw new FileStoreError(
-        422,
-        `This source has more than a workbook sheet can take from one query (${DOC_SOURCE_MAX_ROWS.toLocaleString("en-US")} rows or ${DOC_SOURCE_MAX_BYTES / (1024 * 1024)} MB). Nothing was saved. Narrow the query, or split it across sheets.`,
-      );
+    try {
+      return (await this.queryWhole(source.fileId, sql, requester)).rows;
+    } catch (err) {
+      if (err instanceof FileStoreError && err.statusCode === 422 && /more rows than can be read whole/.test(err.message)) {
+        throw new FileStoreError(
+          422,
+          `This source has more than a workbook sheet can take from one query (${DOC_SOURCE_MAX_ROWS.toLocaleString("en-US")} rows or ${DOC_SOURCE_MAX_BYTES / (1024 * 1024)} MB). Nothing was saved. Narrow the query, or split it across sheets.`,
+        );
+      }
+      throw err;
     }
-    return res.rows;
   }
 
   /** Resolve each op's data source to rows for the pure applyOps builder. */
@@ -1577,6 +1572,32 @@ export class FileStore {
       this.cfg.queryTimeoutMs * 2,
       `${records.length} snapshot${records.length === 1 ? "" : "s"} of a page, newest ${records[0].fileId}`,
     );
+  }
+
+  /**
+   * A query's whole result, or a refusal: for a reader that turns the rows
+   * into something a person receives (a workbook sheet, a report's dataset),
+   * where a result cut at query()'s small cap would look complete. One
+   * execution, so there are no pages to disagree with one another. Not for
+   * showing rows to the assistant; query() is, and it says when it cuts.
+   */
+  async queryWhole(fileId: string, sql: string, requester: Requester): Promise<FileQueryResult> {
+    const record = await this.getOwnedRecord(fileId, requester);
+    const guard = validateReadOnlySql(sql);
+    if (!guard.ok) throw new FileStoreError(400, guard.error!);
+    const res = await this.untrusted(
+      "file.query",
+      { dbPath: record.dbPath, sql, maxRows: DOC_SOURCE_MAX_ROWS, maxBytes: DOC_SOURCE_MAX_BYTES, ...this.bounded(this.cfg.queryTimeoutMs) },
+      this.cfg.queryTimeoutMs,
+      `whole read of ${fileId}`,
+    );
+    if (res.truncated) {
+      throw new FileStoreError(
+        422,
+        `The query returns more rows than can be read whole (${DOC_SOURCE_MAX_ROWS.toLocaleString("en-US")} rows or ${DOC_SOURCE_MAX_BYTES / (1024 * 1024)} MB). Nothing was read. Aggregate or narrow it.`,
+      );
+    }
+    return res;
   }
 
   async query(

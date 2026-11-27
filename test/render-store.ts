@@ -166,6 +166,19 @@ async function main(): Promise<void> {
     const manyCount = await store.query(justUnder.manifest.fileId, `SELECT count(*) AS c FROM "${justUnder.manifest.tables[0].name}"`, requester);
     check("a source past the old 1,000-row cut is now whole (1,500 rows)", Number(manyCount.rows[0].c) === 1500);
 
+    // 7. A whole read for the platform's own readers: all of it in one go, or a refusal.
+    const capped = await store.query(src.fileId, "SELECT i FROM range(1500) t(i)", requester);
+    check("the assistant's query still stops at its small cap, and says so", capped.rows.length === 1000 && capped.truncated === true);
+    const whole = await store.queryWhole(src.fileId, "SELECT i FROM range(1500) t(i) ORDER BY i DESC", requester);
+    check("a whole read returns every row, in the query's own order", whole.rows.length === 1500 && whole.truncated === false && Number(whole.rows[0].i) === 1499 && Number(whole.rows[1499].i) === 0);
+    let wholeRefused = "";
+    try {
+      await store.queryWhole(src.fileId, "SELECT i FROM range(60000) t(i)", requester);
+    } catch (e) {
+      wholeRefused = (e as Error).message;
+    }
+    check("a whole read over its limit is refused, not cut", /more rows than can be read whole.*Nothing was read/.test(wholeRefused));
+
     console.log(`\n✓ render-store: ${passed} checks passed`);
   } finally {
     await rm(dir, { recursive: true, force: true });
