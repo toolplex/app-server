@@ -33,6 +33,8 @@ import {
   type KeyPair,
   type OpReport,
   type Written,
+  sharedFormulaProblems,
+  releaseSharedFormulas,
 } from "./documentFill.js";
 
 export { DocOpError, type OpReport, type Written };
@@ -95,6 +97,10 @@ export interface FillByKeySpec {
   overwrite?: boolean;
   /** Sheet rows carrying the same key: "refuse" (default) or "fill_each". */
   sharedKeys?: "refuse" | "fill_each";
+  /** The sheet row the table's headers are on, when the sheet has more than one table. */
+  headerRow?: number;
+  /** The table's last sheet row, when where it ends has to be said. */
+  lastRow?: number;
 }
 
 export type XlsxOpSpec =
@@ -157,7 +163,7 @@ const COLUMN_FIELDS = ["key", "header", "numFmt", "width"];
 const STYLE_FIELDS = ["header", "freeze"];
 const HEADER_STYLE_FIELDS = ["bold", "fill", "color"];
 const OP_FIELDS: Record<string, { all: string[]; needs: string[] }> = {
-  fill_by_key: { all: ["op", "sheet", "key", "set", "unmatched", "overwrite", "sharedKeys", "source"], needs: ["sheet", "key", "set", "source"] },
+  fill_by_key: { all: ["op", "sheet", "key", "set", "unmatched", "overwrite", "sharedKeys", "headerRow", "lastRow", "source"], needs: ["sheet", "key", "set", "source"] },
   populate_sheet: { all: ["op", "sheet", "startCell", "columns", "overwrite", "source"], needs: ["sheet", "startCell", "source"] },
   append_rows: { all: ["op", "sheet", "source"], needs: ["sheet", "source"] },
   set_cell: { all: ["op", "sheet", "cell", "value"], needs: ["sheet", "cell"] },
@@ -244,6 +250,16 @@ export function validateDocSpec(spec: XlsxDocSpec): void {
     if (o.op === "fill_by_key") {
       if (present(o.unmatched) && !["leave", "zero"].includes(String(o.unmatched))) wrong.push(`${where} (fill_by_key): "unmatched" is "leave" or "zero"`);
       if (present(o.sharedKeys) && !["refuse", "fill_each"].includes(String(o.sharedKeys))) wrong.push(`${where} (fill_by_key): "sharedKeys" is "refuse" or "fill_each"`);
+      for (const f of ["headerRow", "lastRow"]) {
+        if (present(o[f]) && !(Number.isInteger(o[f]) && (o[f] as number) >= 1)) wrong.push(`${where} (fill_by_key): "${f}" is the number of a sheet row (1 or more)`);
+      }
+      const pairs = Array.isArray(o.key) ? o.key : [o.key];
+      if (present(o.key) && pairs.some((k) => !k || typeof k !== "object" || typeof (k as KeyPair).sheet !== "string" || typeof (k as KeyPair).data !== "string")) {
+        wrong.push(`${where} (fill_by_key): "key" is { "sheet": <header in the sheet>, "data": <column in the data> }, both as text, or a list of those`);
+      }
+      if (present(o.set) && (typeof o.set !== "object" || Array.isArray(o.set) || Object.values(o.set as object).some((d) => typeof d !== "string"))) {
+        wrong.push(`${where} (fill_by_key): "set" is { <header in the sheet>: <column in the data>, … }, each a column name as text`);
+      }
     }
     // Without a value the cell would be blanked: that has to be said, not left out.
     if (o.op === "set_cell" && !("value" in o)) wrong.push(`${where} (set_cell) needs "value" (null to empty the cell)`);
@@ -335,6 +351,15 @@ export function applyOps(wb: ExcelJS.Workbook, ops: ResolvedOp[]): { reports: Op
         // A cell inside a merged range shows the range's one value: that is the cell that is set.
         const cell = masterOf(ws.getRow(row).getCell(col));
         const value = toFormulaAwareValue(op.value);
+        // The first cell of a filled-down formula: the cells that take their
+        // formula from it get their own first, or the write is refused.
+        const one = new Set([cell.address]);
+        if (sharedFormulaProblems(ws, one).length > 0) {
+          throw new DocOpError(
+            `set_cell: ${cell.address} on sheet "${ws.name}" is the first cell of a filled-down formula, and the cells that take their formula from it cannot safely be given their own here (it names another sheet, a name, text in quotes or a whole column). Nothing was written. Leave that cell to the sheet, or write every cell that shares the formula.`,
+          );
+        }
+        releaseSharedFormulas(ws, one);
         cell.value = value;
         record(ws.name, new Map([[cell.address, value]]));
         reports.push({ op: op.op, sheet: ws.name, range: cell.address, cellsWritten: 1 });

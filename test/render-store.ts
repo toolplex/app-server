@@ -7,7 +7,7 @@
  */
 
 import assert from "node:assert";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 
 import ExcelJS from "exceljs";
@@ -333,6 +333,67 @@ async function main(): Promise<void> {
     const sharedOut = await store.renderXlsx({ title: "shared, first cell set", base: { fileId: sharedUp.fileId }, ops: [{ op: "set_cell", sheet: "F", cell: "D2", value: 99 }] }, requester);
     const so = (await book(sharedOut.manifest.fileId)).getWorksheet("F")!;
     check("the first cell of a filled-down formula takes a value and the cells below keep their formulas", so.getCell("D2").value === 99 && so.getCell("D3").formula === "B3*C3" && so.getCell("D4").formula === "B4*C4");
+
+    // 15. Found by a third review: a fill of one sheet must leave every formula of every other sheet as it was
+    // in the file, text in quotes and sheet names included. (A version that rewrote filled-down formulas on
+    // loading turned "Q1" into "Q2" and 'Jan26' into 'Jan27' on sheets it was never asked to touch.)
+    const quarterly = new ExcelJS.Workbook();
+    const qd = quarterly.addWorksheet("Data");
+    qd.addRows([["CODE", "QTR", "SOLD"], ["A-1", "Q1", null], ["A-2", "Q1", null], ["A-3", "Q2", null]]);
+    const qs = quarterly.addWorksheet("Summary");
+    qs.addRows([["Quarter", "Units", "Other"], ["Q1"], ["Q2"], ["Q3"]]);
+    qs.fillFormula("B2:B4", 'SUMIFS(Data!C:C,Data!B:B,"Q1")', [0, 0, 0]);
+    qs.fillFormula("C2:C4", "'Jan26'!B2+Data!C2", [0, 0, 0]);
+    quarterly.addWorksheet("Jan26").getCell("B2").value = 1;
+    const quarterlyUp = await store.ingest("quarterly.xlsx", Buffer.from(await quarterly.xlsx.writeBuffer()), requester, { pinned: true });
+    const quarterlyOut = await store.renderXlsx(
+      { title: "quarterly, filled", base: { fileId: quarterlyUp.fileId }, ops: [{ op: "fill_by_key", sheet: "Data", key: { sheet: "CODE", data: "c" }, set: { SOLD: "q" }, source: { rows: [{ c: "A-1", q: 5 }, { c: "A-2", q: 6 }, { c: "A-3", q: 7 }] } }] },
+      requester,
+    );
+    const sheetXml = async (fileId: string, n: number) =>
+      (await (await JSZip.loadAsync(await readFile((await store.getBinaryInfo(fileId, requester)).path))).file(`xl/worksheets/sheet${n}.xml`)!.async("string")).replace(/&quot;/g, '"').replace(/&apos;/g, "'");
+    const summaryBefore = (await sheetXml(quarterlyUp.fileId, 2)).match(/<f[^>]*>[^<]*<\/f>|<f[^>]*\/>/g) ?? [];
+    const summaryAfter = (await sheetXml(quarterlyOut.manifest.fileId, 2)).match(/<f[^>]*>[^<]*<\/f>|<f[^>]*\/>/g) ?? [];
+    check("the formulas of a sheet no op touched are in the saved file exactly as they were in the original", summaryBefore.length === 6 && JSON.stringify(summaryAfter) === JSON.stringify(summaryBefore));
+    check('"Q1" is still "Q1" and the sheet is still \'Jan26\'', summaryAfter.join(" ").includes('SUMIFS(Data!C:C,Data!B:B,"Q1")') && summaryAfter.join(" ").includes("'Jan26'!B2+Data!C2") && !/Q2"|Jan27/i.test(summaryAfter.join(" ")));
+    check("and the sheet that was filled holds the figures", (await book(quarterlyOut.manifest.fileId)).getWorksheet("Data")!.getCell("C4").value === 7);
+
+    // 16. Numbers that arrive as text: figures become numbers, what may be an id does not.
+    const typedRows = [{ id20: "12345678901234567890", small: "42", sixteen: "1234567890123456", places: "1234567.500000000000", wide: "12345678901234567890.000000000000", huge: "1e999", f: "2.5" }];
+    const typedOut = numbersFromText(
+      [{ name: "id20", type: "DECIMAL(20,0)" }, { name: "small", type: "DECIMAL(18,0)" }, { name: "sixteen", type: "BIGINT" }, { name: "places", type: "DECIMAL(38,12)" }, { name: "wide", type: "DECIMAL(38,12)" }, { name: "huge", type: "DOUBLE" }, { name: "f", type: "DOUBLE" }],
+      typedRows,
+    )[0];
+    check("a decimal with no places is a whole number: twenty digits stay text, two become a number", typedOut.id20 === "12345678901234567890" && typedOut.small === 42);
+    check("a whole number of sixteen digits stays text", typedOut.sixteen === "1234567890123456");
+    check("a decimal with places is a figure, unless its whole part is longer than a number holds", typedOut.places === 1234567.5 && typedOut.wide === "12345678901234567890.000000000000");
+    check("what is not a finite number stays as it came", typedOut.huge === "1e999" && typedOut.f === 2.5);
+    check("a barcode written out as text stays text", JSON.stringify(plainNumbersFromText([{ code: "4800016644801", qty: "3" }, { code: "4800016644802", qty: "12" }])) === JSON.stringify([{ code: "4800016644801", qty: 3 }, { code: "4800016644802", qty: 12 }]));
+
+    // 17. The size limit follows this server's memory; it is not one number for every server.
+    class Limit extends FileStore {
+      shown(): { limit: number; memoryMb: number } {
+        return { limit: this.copyForwardCellLimit(), memoryMb: (this as unknown as { bounds: { memoryMb: number } }).bounds.memoryMb };
+      }
+    }
+    const lim = new Limit({ enabled: true, dir: dir }).shown();
+    check("the size limit is this server's memory share divided by what a cell costs, within its two ends", lim.limit === Math.min(1_000_000, Math.max(100_000, Math.floor((lim.memoryMb * 1024 * 1024) / 1300))) && lim.limit < 1_000_000);
+
+    // 18. Pivot tables are named too; an op cannot carry rows of its own beside its source.
+    const pz = await JSZip.loadAsync(await plain.xlsx.writeBuffer());
+    pz.file("xl/pivotTables/pivotTable1.xml", "<pivotTableDefinition/>");
+    const withPivot = await store.ingest("pivoted.xlsx", await pz.generateAsync({ type: "nodebuffer" }), requester, { pinned: true });
+    const pivoted = await store.renderXlsx({ title: "pivoted, filled", base: { fileId: withPivot.fileId }, ops: [{ op: "fill_by_key", sheet: "Items", key: { sheet: "CODE", data: "c" }, set: { SOLD: "q" }, source: { rows: [{ c: "A-1", q: 2 }] } }] }, requester);
+    check("the result notes that the original's pivot tables are not in the copy", (pivoted.manifest.notes ?? []).some((n) => /original workbook has pivot tables\. They are not carried into this copy/.test(n)));
+    const smuggled = await failure({ title: "x", base: { fileId: dup.fileId }, ops: [{ op: "fill_by_key", sheet: "Items", key: { sheet: "CODE", data: "c" }, set: { SOLD: "q" }, rows: null, source: { rows: [{ c: "A-1", q: 1 }] } } as never] });
+    const smuggled2 = await failure({ title: "x", base: { fileId: dup.fileId }, ops: [{ op: "fill_by_key", sheet: "Items", key: { sheet: "CODE", data: "c" }, set: { SOLD: "q" }, rows: [{ c: "B-2", q: 99 }], source: { rows: [{ c: "A-1", q: 1 }] } } as never] });
+    check('rows given on the op itself, beside its "source", are refused, not used', smuggled2.status === 400 && /"rows" is not used here/.test(smuggled2.message));
+    const headerRowBad = await failure({ title: "x", base: { fileId: dup.fileId }, ops: [{ op: "fill_by_key", sheet: "Items", headerRow: 0, key: { sheet: "CODE", data: "c" }, set: { SOLD: "q" }, source: { rows: [{ c: "A-1", q: 1 }] } }] });
+    check("a header row that is not a row number is a bad request", headerRowBad.status === 400 && /"headerRow" is the number of a sheet row/.test(headerRowBad.message));
+    // An empty "rows" beside the source is no rows of its own: the source is what is read.
+    const emptyRows = await failure({ title: "x", base: { fileId: dup.fileId }, ops: [{ op: "fill_by_key", sheet: "Items", sharedKeys: "fill_each", key: { sheet: "CODE", data: "c" }, set: { SOLD: "q" }, rows: null, source: { rows: [{ c: "A-1", q: 1 }] } } as never] });
+    check('an empty "rows" on an op does not stand in for its source', emptyRows.message === "");
+    void smuggled;
 
     console.log(`\n✓ render-store: ${passed} checks passed`);
   } finally {

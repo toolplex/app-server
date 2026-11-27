@@ -54,6 +54,17 @@ export interface FillByKeyArgs {
    * apart; or "fill_each", when it is one thing listed twice.
    */
   sharedKeys?: "refuse" | "fill_each";
+  /**
+   * The sheet row that holds the headers, for a sheet with more than one
+   * table: the one the op is about is named by where its headers are.
+   * Without it, the first row that holds all the named headers is the one.
+   */
+  headerRow?: number;
+  /**
+   * The last sheet row of the table. With it nothing is guessed about where
+   * the table ends: every row from the headers down to this one is read.
+   */
+  lastRow?: number;
   rows: Record<string, unknown>[];
 }
 
@@ -80,8 +91,9 @@ export interface OpReport {
   unmatchedCellsSet?: number;
   /** Formulas in rows with no data, which are never written over. */
   formulasKept?: number;
-  /** Cells in rows with no data that kept the value they already held, and the keys of those rows. */
+  /** Cells in rows with no data that kept the value they already held; how many rows; and the keys of those rows (the first few hundred). */
   unmatchedValuesKept?: number;
+  rowsThatKeptTheirValues?: number;
   keysThatKeptTheirValues?: string[];
   dataRowsNotInSheet?: number;
   dataKeysNotInSheet?: string[];
@@ -91,9 +103,16 @@ export interface OpReport {
   unreadableKeys?: string[];
   /** Rows passed over because only part of a several-column key was there. */
   rowsWithPartialKey?: number;
+  /** The sheet rows that were read as the table: from the first below the headers to the last. */
+  firstRow?: number;
+  lastRow?: number;
   /** Another table begins here (its header row), and nothing from this row down was touched. */
   stoppedAtRow?: number;
   stoppedBecause?: string;
+  /** Keys of the data that are found below that row, in the other table. */
+  dataKeysBelowStop?: number;
+  /** Rows inside the table that only repeat its headers (a header printed on every page), passed over. */
+  headerRowsPassed?: number;
   emptyValuesLeft?: number;
   /** The first rows as they now read: key, then each target. */
   firstRows?: Array<Record<string, unknown>>;
@@ -103,8 +122,9 @@ export interface OpReport {
 export type Written = Map<string, ExcelJS.CellValue>;
 
 const SEP = "\u0001";
-const HEADER_SEARCH_ROWS = 50;
 const SAMPLE = 10;
+/** Keys of rows that kept an earlier figure: the caller has to be able to act on every one of them. */
+const KEPT_SAMPLE = 300;
 
 // --- Cell addresses ----------------------------------------------------------
 
@@ -190,11 +210,8 @@ function columnLetter(name: string): number | null {
  * refused, since "the SOLD column" would then be a guess, and the refusal
  * says how to name the one that is meant.
  */
-export function findHeaderRow(ws: ExcelJS.Worksheet, all: string[]): { row: number; cols: Map<string, number> } {
+export function findHeaderRow(ws: ExcelJS.Worksheet, all: string[], at?: number): { row: number; cols: Map<string, number> } {
   const names = all.filter((n) => columnLetter(n) === null);
-  if (names.length === 0) {
-    throw new DocOpError(`Sheet "${ws.name}": at least one column must be named by its header (the key column is the natural one), so that the header row can be found. Nothing was written.`);
-  }
   const withLetters = (row: number, cols: Map<string, number>) => {
     for (const n of all) {
       const c = columnLetter(n);
@@ -202,45 +219,81 @@ export function findHeaderRow(ws: ExcelJS.Worksheet, all: string[]): { row: numb
     }
     return { row, cols };
   };
-  const wanted = names.map(headerKey);
-  let best: { row: number; found: number; texts: string[] } | null = null;
-  let widest: { row: number; texts: string[] } | null = null;
-  const last = Math.min(lastValueRow(ws), HEADER_SEARCH_ROWS);
-  for (let r = 1; r <= last; r++) {
-    const row = ws.getRow(r);
+  const quoted = (list: string[]) => list.map((n) => `"${n}"`).join(", ");
+  const read = (r: number) => {
     const seen = new Map<string, number[]>();
     const texts: string[] = [];
-    row.eachCell({ includeEmpty: false }, (cell, c) => {
+    ws.getRow(r).eachCell({ includeEmpty: false }, (cell, c) => {
       const t = cellText(cell);
       if (!t) return;
       texts.push(t);
       const k = headerKey(t);
       seen.set(k, [...(seen.get(k) ?? []), c]);
     });
+    return { seen, texts };
+  };
+  const twiceIn = (r: number, seen: Map<string, number[]>) => {
+    const twice = names.filter((n) => (seen.get(headerKey(n)) ?? []).length > 1);
+    if (twice.length === 0) return;
+    const where = twice.map((t) => `"${t}" heads columns ${seen.get(headerKey(t))!.map(numToCol).join(" and ")}`).join("; ");
+    throw new DocOpError(`Sheet "${ws.name}" row ${r} uses one header for more than one column: ${where}. Name the column that is meant by its letter instead, as "column:${numToCol(seen.get(headerKey(twice[0]))![0])}". Nothing was written.`);
+  };
+  const list = (texts: string[]) => texts.slice(0, 40).map((t) => `"${t}"`).join(", ");
+  const missing = (texts: string[]) => names.filter((n) => !texts.map(headerKey).includes(headerKey(n)));
+
+  // The caller has said which row.
+  if (at !== undefined) {
+    if (!Number.isInteger(at) || at < 1) throw new DocOpError(`"headerRow" is the number of the sheet row that holds the headers (got ${JSON.stringify(at)}). Nothing was written.`);
+    const { seen, texts } = read(at);
+    const lacks = missing(texts);
+    if (lacks.length > 0) {
+      throw new DocOpError(`Row ${at} of sheet "${ws.name}" does not hold ${quoted(lacks)}. It holds: ${texts.length > 0 ? list(texts) : "nothing"}. Give the row the headers are on, or leave "headerRow" out to have it found. Nothing was written.`);
+    }
+    twiceIn(at, seen);
+    return withLetters(at, new Map(names.map((n) => [n, seen.get(headerKey(n))![0]])));
+  }
+  if (names.length === 0) {
+    throw new DocOpError(`Sheet "${ws.name}": with every column named by its letter, the header row cannot be found. Name at least one column by its header (the key column is the natural one), or say which row holds the headers with "headerRow". Nothing was written.`);
+  }
+  const wanted = names.map(headerKey);
+  let best: { row: number; found: number; texts: string[] } | null = null;
+  let widest: { row: number; texts: string[] } | null = null;
+  // The whole sheet: a second table can begin anywhere below the first.
+  const last = lastValueRow(ws);
+  for (let r = 1; r <= last; r++) {
+    const { seen, texts } = read(r);
     const found = wanted.filter((w) => seen.has(w)).length;
     if (found === wanted.length) {
-      const twice = names.filter((n) => (seen.get(headerKey(n)) ?? []).length > 1);
-      if (twice.length > 0) {
-        const where = twice.map((t) => `"${t}" heads columns ${seen.get(headerKey(t))!.map(numToCol).join(" and ")}`).join("; ");
-        throw new DocOpError(`Sheet "${ws.name}" row ${r} uses one header for more than one column: ${where}. Name the column that is meant by its letter instead, as "column:${numToCol(seen.get(headerKey(twice[0]))![0])}". Nothing was written.`);
-      }
+      twiceIn(r, seen);
       return withLetters(r, new Map(names.map((n) => [n, seen.get(headerKey(n))![0]])));
     }
+    // What the sheet's header row probably is, for the message, is judged near the top.
+    if (r > 200) continue;
     if (found > 0 && (!best || found > best.found)) best = { row: r, found, texts };
     if (!widest || texts.length > widest.texts.length) widest = { row: r, texts };
   }
-  const list = (texts: string[]) => texts.slice(0, 40).map((t) => `"${t}"`).join(", ");
-  const missing = (texts: string[]) => names.filter((n) => !texts.map(headerKey).includes(headerKey(n)));
   if (best) {
     throw new DocOpError(
-      `Sheet "${ws.name}" has no row with all of these headers: ${names.map((n) => `"${n}"`).join(", ")}. Row ${best.row} comes closest but lacks ${missing(best.texts).map((n) => `"${n}"`).join(", ")}; its headers are: ${list(best.texts)}. Use the headers as they are written there; if the sheet's headings run over two rows (a month above "Qty" and "Amount"), name the key column by its header and each other column by its letter, as "column:D". Nothing was written.`,
+      `Sheet "${ws.name}" has no row with all of these headers: ${quoted(names)}. Row ${best.row} comes closest but lacks ${quoted(missing(best.texts))}; its headers are: ${list(best.texts)}. Use the headers as they are written there; if the sheet's headings run over two rows (a month above "Qty" and "Amount"), name the key column by its header and each other column by its letter, as "column:D". Nothing was written.`,
     );
   }
   throw new DocOpError(
-    `Sheet "${ws.name}" has none of these headers in its first ${HEADER_SEARCH_ROWS} rows: ${names.map((n) => `"${n}"`).join(", ")}.` +
+    `Sheet "${ws.name}" has none of these headers: ${quoted(names)}.` +
       (widest && widest.texts.length > 0 ? ` Its header row looks like row ${widest.row}: ${list(widest.texts)}. Use the headers as they are written there.` : " The sheet looks empty.") +
       " Nothing was written.",
   );
+}
+
+/** The last row of the merged cell a header sits in (its own row when it is not merged). */
+function mergedBottom(ws: ExcelJS.Worksheet, row: number, col: number): number {
+  const top = masterOf(ws.getRow(row).getCell(col));
+  let r = row;
+  while (r < ws.rowCount) {
+    const below = ws.getRow(r + 1).getCell(col);
+    if (!(below.isMerged && below.master.address === top.address)) break;
+    r++;
+  }
+  return r;
 }
 
 // --- Keys --------------------------------------------------------------------
@@ -336,6 +389,8 @@ function blocked(cell: ExcelJS.Cell, overwrite: boolean): string | null {
   return null;
 }
 
+const FIRST_OF_FILLED_DOWN = "the first cell of a filled-down formula";
+
 function refuseBlocked(problems: Array<{ address: string; why: string }>, what: string, filled?: string): void {
   if (problems.length === 0) return;
   const by = new Map<string, string[]>();
@@ -345,6 +400,7 @@ function refuseBlocked(problems: Array<{ address: string; why: string }>, what: 
   if (by.has("merged")) advice.push("Merged cells cannot be filled row by row: build a new workbook that lists each key with its figures instead.");
   if (by.has("a formula")) advice.push('The formulas are the sheet\'s own calculations (totals, computed columns) and are almost never meant to be replaced: check that the right column is being filled. Only if the user asked for those formulas to be replaced, pass "overwrite": true.');
   if (by.has("already filled")) advice.push(filled ?? 'If the existing figures of these rows are to be replaced (a refresh), pass "overwrite": true.');
+  if (by.has(FIRST_OF_FILLED_DOWN)) advice.push("That cell holds a formula which the cells below or beside it take theirs from, written in a way that cannot be carried over to them safely here (it names another sheet, a name, text in quotes or a whole column). Leave that column to the sheet's own formulas, or write every cell that shares the formula.");
   throw new DocOpError(`${what} would write over cells that are not free: ${parts.join("; ")}. Nothing was written. ${advice.join(" ")}`);
 }
 
@@ -379,38 +435,46 @@ function requireColumns(rows: Record<string, unknown>[], columns: string[], what
 
 // --- fill_by_key -------------------------------------------------------------
 
-const looksNumeric = (s: string): boolean => /^[-+(]?[\d.,\s%]+\)?$/.test(s.trim());
+/** What people write in a cell that has no figure yet. Not a heading. */
+const PLACEHOLDER = /^(n\/?a|n\.a\.?|nil|none|null|tbd|tba|tbc|x|[-–—.?]+)$/i;
+
+const isText = (v: unknown): boolean => typeof v === "string" || (typeof v === "object" && v !== null && "richText" in v);
 
 /**
- * A row of headings: words under every column that is to receive figures,
- * no number, date or formula anywhere in the row, and nothing in the key
- * column that the data has a row for.
+ * A row of headings, as far as a row can show it: a word under every column
+ * that is to receive figures, and nothing else in the row but words, dates
+ * and years (a heading can be "2026" or a month). A figure, a formula or a
+ * placeholder such as "N/A" where the figures go makes it an ordinary row.
  */
-function looksLikeHeaderRow(row: ExcelJS.Row, keyCols: number[], targetCols: number[], known: (key: string) => boolean): boolean {
-  for (const c of targetCols) {
-    const v = row.getCell(c).value as unknown;
-    if (typeof v !== "string" && !(typeof v === "object" && v !== null && "richText" in v)) return false;
+function looksLikeHeadings(row: ExcelJS.Row, figureCols: number[]): boolean {
+  if (figureCols.length === 0) return false;
+  for (const c of figureCols) {
+    if (!isText(row.getCell(c).value)) return false;
     const t = cellText(row.getCell(c));
-    if (t === "" || looksNumeric(t)) return false;
+    // A heading is a word: at least two letters, which a figure written as text ("1,250", "(5%)") has not.
+    if (PLACEHOLDER.test(t) || (t.match(/\p{L}/gu) ?? []).length < 2) return false;
   }
   let words = 0;
   let other = false;
   row.eachCell({ includeEmpty: false }, (cell) => {
     const v = cell.value as unknown;
     if (isEmptyValue(v)) return;
-    if (typeof v === "string" || (typeof v === "object" && v !== null && "richText" in v)) words++;
+    if (isText(v)) words++;
+    else if (v instanceof Date || (typeof v === "number" && Number.isInteger(v) && v >= 1900 && v <= 2100)) return;
     else other = true;
   });
-  if (other || words < 2) return false;
-  const key = keyCols.map((c) => cellText(row.getCell(c))).join(SEP);
-  return !known(key);
+  return !other && words >= 2;
 }
 
 export function fillByKey(ws: ExcelJS.Worksheet, a: FillByKeyArgs): { report: OpReport; written: Written } {
   const keys = Array.isArray(a.key) ? a.key : [a.key];
   const targets = Object.entries(a.set ?? {});
-  if (keys.length === 0 || keys.some((k) => !k?.sheet || !k?.data)) throw new DocOpError('fill_by_key needs "key": { "sheet": <header in the sheet>, "data": <column in the data> }.');
-  if (targets.length === 0) throw new DocOpError('fill_by_key needs "set": { <header in the sheet>: <column in the data>, … }.');
+  if (keys.length === 0 || keys.some((k) => typeof k?.sheet !== "string" || typeof k?.data !== "string" || !k.sheet.trim() || !k.data.trim())) {
+    throw new DocOpError('fill_by_key needs "key": { "sheet": <header in the sheet>, "data": <column in the data> }, both as text. Nothing was written.');
+  }
+  if (targets.length === 0 || targets.some(([h, d]) => !h.trim() || typeof d !== "string" || !d.trim())) {
+    throw new DocOpError('fill_by_key needs "set": { <header in the sheet>: <column in the data>, … }, each a column name as text. Nothing was written.');
+  }
   const unmatched = a.unmatched ?? "leave";
   if (!["leave", "zero"].includes(unmatched)) throw new DocOpError('"unmatched" is "leave" or "zero". Nothing was written.');
   const sharedKeys = a.sharedKeys ?? "refuse";
@@ -424,9 +488,22 @@ export function fillByKey(ws: ExcelJS.Worksheet, a: FillByKeyArgs): { report: Op
   requireColumns(a.rows, [...keys.map((k) => k.data), ...targets.map(([, d]) => d)], "fill_by_key");
   refuseMixedTypes(a.rows, targets.map(([, d]) => d));
 
-  const header = findHeaderRow(ws, [...keyHeaders, ...targetHeaders]);
+  const header = findHeaderRow(ws, [...keyHeaders, ...targetHeaders], a.headerRow);
   const keyCols = keyHeaders.map((h) => header.cols.get(h)!);
   const targetCols = targetHeaders.map((h) => header.cols.get(h)!);
+  // Two names for one column (a header and its letter, or a letter that is
+  // the key column) would have one value written over the other, or the keys
+  // themselves written over.
+  const namedBy = new Map<number, string>();
+  [...keyHeaders, ...targetHeaders].forEach((h, i) => {
+    const c = [...keyCols, ...targetCols][i];
+    const other = namedBy.get(c);
+    if (other !== undefined) {
+      const isKey = keyHeaders.includes(other);
+      throw new DocOpError(`"${other}" and "${h}" are the same column of sheet "${ws.name}" (${numToCol(c)})${isKey ? ", and it holds the keys" : ""}. Name each column once. Nothing was written.`);
+    }
+    namedBy.set(c, h);
+  });
 
   // The data, by key. Two data rows with one key would make the value a coin toss.
   const data = new Map<string, Record<string, unknown>>();
@@ -455,31 +532,54 @@ export function fillByKey(ws: ExcelJS.Worksheet, a: FillByKeyArgs): { report: Op
   const sheetRows: Array<{ row: number; id: string }> = [];
   const unreadable: string[] = [];
   let partial = 0;
+  let headerRowsPassed = 0;
   let stoppedAtRow: number | undefined;
   let stoppedBecause: string | undefined;
-  const end = lastValueRow(ws);
+  let stoppedOnALikeness = false;
+  const sheetEnd = lastValueRow(ws);
+  // A header merged over two rows (the key above a row of "Qty", "Amount")
+  // ends where its merged cell ends: the rows of the table begin below that.
+  const first = Math.max(...[...keyCols, ...targetCols].map((c) => mergedBottom(ws, header.row, c))) + 1;
+  if (a.lastRow !== undefined && (!Number.isInteger(a.lastRow) || a.lastRow < first)) {
+    throw new DocOpError(`"lastRow" is the number of the last sheet row of the table (got ${JSON.stringify(a.lastRow)}; the headers are on row ${header.row}). Nothing was written.`);
+  }
+  const end = Math.min(sheetEnd, a.lastRow ?? sheetEnd);
   const dataLoose = new Set([...data.keys()].map(looseKey));
-  // Figures are being written when every mapped data column holds numbers.
-  const figures = targets.every(([, d]) => a.rows.some((r) => typeof r[d] === "number" || typeof r[d] === "bigint"));
-  for (let r = header.row + 1; r <= end; r++) {
+  const knows = (k: string) => data.has(k) || dataLoose.has(looseKey(k));
+  // The headings as the sheet has them on the header row, whether a column was named by them or by its letter.
+  const keyHeadings = keyCols.map((c) => headerKey(cellText(ws.getRow(header.row).getCell(c))));
+  const ownHeadings = targetCols.map((c) => headerKey(cellText(ws.getRow(header.row).getCell(c))));
+  // The columns that are to receive figures: a column of numbers in the data,
+  // or any column when rows without data are to be given 0.
+  const figureCols = targetCols.filter((_, t) => unmatched === "zero" || a.rows.some((r) => typeof r[targets[t][1]] === "number" || typeof r[targets[t][1]] === "bigint"));
+  for (let r = first; r <= end; r++) {
     const row = ws.getRow(r);
-    // The header again: another table starts here, with rows of its own that
+    // The header again. When the caller has said where the table ends, it is
+    // a header printed again inside the table (one per page) and is passed
+    // over. Otherwise another table starts here, with rows of its own that
     // this key was not asked about.
-    if (keyCols.every((c, i) => headerKey(cellText(row.getCell(c))) === headerKey(keyHeaders[i]))) {
+    if (keyHeadings.some((h) => h !== "") && keyCols.every((c, i) => headerKey(cellText(row.getCell(c))) === keyHeadings[i])) {
+      if (a.lastRow !== undefined) {
+        headerRowsPassed++;
+        continue;
+      }
       stoppedAtRow = r;
-      stoppedBecause = "the header row repeats";
+      stoppedBecause = "the same headers again";
       break;
     }
-    // Or another table under different headers. Its columns mean something
-    // else, so a figure written under this table's column letter would sit
-    // under that table's heading. Such a row has words where the figures go,
-    // nothing but words anywhere, and a key the data does not know. Before
-    // the first row of the table itself such a row is only the second line of
-    // this table's own headings (a month above "Qty" and "Amount").
-    if (figures && sheetRows.length > 0 && looksLikeHeaderRow(row, keyCols, targetCols, (k) => data.has(k) || dataLoose.has(looseKey(k)))) {
-      stoppedAtRow = r;
-      stoppedBecause = "a row of headings";
-      break;
+    // Or another table under other headings. Its columns mean something else,
+    // so a figure written under this table's column letter would sit under
+    // that table's heading. Nothing here can be sure of that from one row; so
+    // a row that looks like headings ends the table only when the caller has
+    // not said where it ends, and never silently (see below).
+    if (a.lastRow === undefined && sheetRows.length > 0 && !knows(keyCols.map((c) => cellText(row.getCell(c))).join(SEP))) {
+      const ownAgain = ownHeadings.some((h) => h !== "") && targetCols.every((c, t) => ownHeadings[t] === "" || headerKey(cellText(row.getCell(c))) === ownHeadings[t]);
+      if (ownAgain || looksLikeHeadings(row, figureCols)) {
+        stoppedAtRow = r;
+        stoppedBecause = ownAgain ? "this table's column headings again, under another key heading" : "a row of headings";
+        stoppedOnALikeness = true;
+        break;
+      }
     }
     let parts: Array<string | null>;
     try {
@@ -496,13 +596,43 @@ export function fillByKey(ws: ExcelJS.Worksheet, a: FillByKeyArgs): { report: Op
     }
     sheetRows.push({ row: r, id: parts.join(SEP) });
   }
+  // Keys of the data below a stop: they are in the sheet, in the other table.
+  const below = new Set<string>();
+  if (stoppedAtRow !== undefined) {
+    for (let r = stoppedAtRow + 1; r <= sheetEnd; r++) {
+      let parts: Array<string | null>;
+      try {
+        parts = keyCols.map((c) => sheetKey(ws.getRow(r).getCell(c)));
+      } catch {
+        continue;
+      }
+      if (parts.some((p) => p === null)) continue;
+      if (knows(parts.join(SEP))) below.add(shown(parts.join(SEP)));
+    }
+  }
+  // A row that only looks like headings, with keys of the data below it: the
+  // rows below are either another table (and must not be filled) or the rest
+  // of this one (and must be). Guessing either way gives a workbook that is
+  // wrong without looking wrong, so the caller says which.
+  if (stoppedAtRow !== undefined && stoppedOnALikeness && below.size > 0) {
+    const cells: string[] = [];
+    ws.getRow(stoppedAtRow).eachCell({ includeEmpty: false }, (cell) => void (cells.length < 8 && cellText(cell) && cells.push(`${cell.address} "${cellText(cell)}"`)));
+    throw new DocOpError(
+      `Row ${stoppedAtRow} of sheet "${ws.name}" looks like the headings of another table (${cells.join(", ")}), and ${below.size} of the data's keys are found below it (for example ${[...below].slice(0, 3).map((k) => `"${k}"`).join(", ")}). ` +
+        `Whether those rows belong to the table being filled cannot be told from the sheet, so nothing was written. Say where the table ends: ` +
+        `if it ends above that row, send the same op with "lastRow": ${stoppedAtRow - 1}; ` +
+        `if row ${stoppedAtRow} is an ordinary row and the table goes on, send it with "lastRow": the table's last row (the sheet's last row with anything in it is ${sheetEnd}).`,
+    );
+  }
   if (sheetRows.length === 0) {
     const formulas = unreadable.some((u) => /formula with no stored result/.test(u));
     throw new DocOpError(
-      `Sheet "${ws.name}" has no rows with a readable key under ${keyHeaders.map((h) => `"${h}"`).join(" + ")} below row ${header.row}${unreadable.length > 0 ? ` (${unreadable.slice(0, 3).join("; ")})` : ""}. Nothing was written.` +
+      `Sheet "${ws.name}" has no rows with a readable key under ${keyHeaders.map((h) => `"${h}"`).join(" + ")} in rows ${first}–${stoppedAtRow !== undefined ? stoppedAtRow - 1 : end}${unreadable.length > 0 ? ` (${unreadable.slice(0, 3).join("; ")})` : ""}. Nothing was written.` +
         (formulas
           ? " The keys in this workbook are formulas, and a workbook this tool has already written does not store their results (they are worked out when it is opened in Excel). Fill the file the user originally gave instead of an earlier filled copy, or use another column that holds plain values as the key."
-          : " Use a column that holds a plain value in each row as the key."),
+          : stoppedAtRow !== undefined
+            ? ` Row ${stoppedAtRow} holds the headers again, so the table under row ${header.row} is empty; to fill the table that begins at row ${stoppedAtRow}, pass "headerRow": ${stoppedAtRow}.`
+            : ' Use a column that holds a plain value in each row as the key; if the table is somewhere else on the sheet, say which row holds its headers with "headerRow".'),
     );
   }
 
@@ -513,7 +643,8 @@ export function fillByKey(ws: ExcelJS.Worksheet, a: FillByKeyArgs): { report: Op
     throw new DocOpError(
       `${shared.length} key${shared.length === 1 ? " appears" : "s appear"} on more than one row of sheet "${ws.name}" (${shared.slice(0, 4).map(([k, rows]) => `"${shown(k)}" on rows ${rows.slice(0, 4).join(", ")}`).join("; ")}${shared.length > 4 ? "; …" : ""}). ` +
         `If those rows belong to different groups (the same item under two stores, two sections), the key needs the column that tells them apart: give "key" as a list of two columns. ` +
-        `If it is one thing listed twice and each row should get the same figures, pass "sharedKeys": "fill_each". Nothing was written.`,
+        `If they are two tables one below the other, fill each on its own: "headerRow" is the row its headers are on and "lastRow" its last row. ` +
+        `Only if it is one thing listed twice and each row should get the same figures, pass "sharedKeys": "fill_each". Nothing was written.`,
     );
   }
 
@@ -547,7 +678,11 @@ export function fillByKey(ws: ExcelJS.Worksheet, a: FillByKeyArgs): { report: Op
     }
   }
   if (match.size === 0) {
-    throw new DocOpError(`No row of sheet "${ws.name}" has a key found in the data. Sheet keys look like ${sheetRows.slice(0, 5).map((s) => `"${shown(s.id)}"`).join(", ")}; data keys look like ${[...data.keys()].slice(0, 5).map((k) => `"${shown(k)}"`).join(", ")}. Nothing was written.`);
+    throw new DocOpError(
+      `No row of sheet "${ws.name}" in rows ${first}–${stoppedAtRow !== undefined ? stoppedAtRow - 1 : end} has a key found in the data. Sheet keys look like ${sheetRows.slice(0, 5).map((s) => `"${shown(s.id)}"`).join(", ")}; data keys look like ${[...data.keys()].slice(0, 5).map((k) => `"${shown(k)}"`).join(", ")}.` +
+        (stoppedAtRow !== undefined ? ` Another table begins at row ${stoppedAtRow} (${stoppedBecause})${below.size > 0 ? `, and ${below.size} of the data's keys are found below it` : ""}: to fill that one, pass "headerRow": ${stoppedAtRow} with its own headers.` : "") +
+        " Nothing was written.",
+    );
   }
 
   // Everything is checked before anything is written.
@@ -558,6 +693,7 @@ export function fillByKey(ws: ExcelJS.Worksheet, a: FillByKeyArgs): { report: Op
   let formulasKept = 0;
   let unmatchedValuesKept = 0;
   const keptKeys = new Set<string>();
+  const keptRows = new Set<number>();
   for (const s of sheetRows) {
     const d = match.get(s.row);
     const row = ws.getRow(s.row);
@@ -589,6 +725,7 @@ export function fillByKey(ws: ExcelJS.Worksheet, a: FillByKeyArgs): { report: Op
       if (!isEmptyValue(cell.value)) {
         unmatchedValuesKept++;
         keptKeys.add(shown(s.id));
+        keptRows.add(s.row);
         continue;
       }
       if (unmatched === "zero") {
@@ -597,8 +734,11 @@ export function fillByKey(ws: ExcelJS.Worksheet, a: FillByKeyArgs): { report: Op
       }
     }
   }
+  const planned = new Set(plan.map((p) => p.cell.address));
+  problems.push(...sharedFormulaProblems(ws, planned));
   refuseBlocked(problems, "fill_by_key");
 
+  releaseSharedFormulas(ws, planned);
   const written: Written = new Map();
   for (const p of plan) {
     p.cell.value = p.value;
@@ -612,6 +752,8 @@ export function fillByKey(ws: ExcelJS.Worksheet, a: FillByKeyArgs): { report: Op
     op: "fill_by_key",
     sheet: ws.name,
     headerRow: header.row,
+    firstRow: first,
+    lastRow: stoppedAtRow !== undefined ? stoppedAtRow - 1 : end,
     keyColumns: Object.fromEntries(keyHeaders.map((h, i) => [h, numToCol(keyCols[i])])),
     targetColumns: Object.fromEntries(targetHeaders.map((h, i) => [h, numToCol(targetCols[i])])),
     sheetRowsWithKey: sheetRows.length,
@@ -620,13 +762,14 @@ export function fillByKey(ws: ExcelJS.Worksheet, a: FillByKeyArgs): { report: Op
     sheetRowsWithoutData: without.length,
     ...(without.length > 0 ? { sheetKeysWithoutData: without.slice(0, SAMPLE).map((s) => shown(s.id)), unmatched, ...(unmatched !== "leave" ? { unmatchedCellsSet } : {}) } : {}),
     ...(formulasKept > 0 ? { formulasKept } : {}),
-    ...(unmatchedValuesKept > 0 ? { unmatchedValuesKept, keysThatKeptTheirValues: [...keptKeys].slice(0, SAMPLE) } : {}),
+    ...(unmatchedValuesKept > 0 ? { unmatchedValuesKept, rowsThatKeptTheirValues: keptRows.size, keysThatKeptTheirValues: [...keptKeys].slice(0, KEPT_SAMPLE) } : {}),
     dataRowsNotInSheet: unusedData.length,
     ...(unusedData.length > 0 ? { dataKeysNotInSheet: unusedData.slice(0, SAMPLE).map(shown) } : {}),
     sheetRowsSharingAKey: shared.reduce((x, [, rows]) => x + rows.length, 0),
     ...(unreadable.length > 0 ? { rowsWithUnreadableKey: unreadable.length, unreadableKeys: unreadable.slice(0, SAMPLE) } : {}),
     ...(partial > 0 ? { rowsWithPartialKey: partial } : {}),
-    ...(stoppedAtRow ? { stoppedAtRow, stoppedBecause } : {}),
+    ...(stoppedAtRow !== undefined ? { stoppedAtRow, stoppedBecause, dataKeysBelowStop: below.size } : {}),
+    ...(headerRowsPassed > 0 ? { headerRowsPassed } : {}),
     ...(emptyValuesLeft > 0 ? { emptyValuesLeft } : {}),
     rowsWritten: rowsTouched.size,
     cellsWritten: plan.length,
@@ -646,8 +789,11 @@ export function fillByKey(ws: ExcelJS.Worksheet, a: FillByKeyArgs): { report: Op
 
 /**
  * Rows added after the sheet's content, each value under the header of its
- * own name. A sheet that ends in formulas ends in totals: rows added below
- * them would be outside every total, so that is refused.
+ * own name. Whatever adds the existing rows up (a total, a named range, an
+ * Excel table) and would not take the new rows in makes the sheet wrong
+ * without looking wrong, so that is refused. What can be seen is seen: a
+ * range written out in a formula on any sheet, a name, a table. A total
+ * written as B2+B3+B4, or reached through OFFSET or INDIRECT, cannot be.
  */
 export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unknown>[]): { report: OpReport; written: Written } {
   requireColumns(rows, [], "append_rows");
@@ -657,30 +803,52 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
   refuseMixedTypes(rows, names);
   const header = findHeaderRow(ws, names);
   const end = Math.max(lastValueRow(ws), header.row);
-  let formulas = 0;
-  if (end > header.row) ws.getRow(end).eachCell({ includeEmpty: false }, (cell) => void (isFormula(cell) && formulas++));
-  if (formulas > 0) {
-    throw new DocOpError(`Sheet "${ws.name}" ends in a row of formulas (row ${end}), which is usually its totals. Rows appended below it would be left out of them, so nothing was added. Build a new workbook from the full data instead.`);
+  const NEW_WORKBOOK = "Build a new workbook from the full data instead.";
+  const inLastRow: string[] = [];
+  if (end > header.row) ws.getRow(end).eachCell({ includeEmpty: false }, (cell) => void (isFormula(cell) && inLastRow.push(cell.address)));
+  if (inLastRow.length > 0) {
+    throw new DocOpError(
+      `The last row of sheet "${ws.name}" that holds anything (row ${end}) has formulas (${inLastRow.slice(0, 4).join(", ")}${inLastRow.length > 4 ? ", …" : ""}). Either it is the sheet's totals, which rows added below would be left out of, or every row works a column out with a formula, which rows added here would not have. Nothing was added. ${NEW_WORKBOOK}`,
+    );
   }
-  // A total need not be the last row: it can sit above the data, or be
-  // followed by a line of text. Any formula on the sheet that adds up a range
-  // of these columns over the rows already there, and stops short of the rows
-  // to be added, would leave them out.
   const cols0 = names.map((n) => header.cols.get(n)!);
   const lastNew = end + rows.length;
-  let shortTotal: string | undefined;
-  ws.eachRow({ includeEmpty: false }, (row) =>
-    row.eachCell({ includeEmpty: false }, (cell) => {
-      if (shortTotal || !isFormula(cell)) return;
-      for (const g of rangesIn(formulaText(cell))) {
-        const overColumns = cols0.some((c) => c >= g.c1 && c <= g.c2);
-        const overData = g.r2 > header.row && g.r1 <= end;
-        if (overColumns && overData && g.r2 < lastNew) shortTotal = `${cell.address} (=${formulaText(cell)})`;
+  // Over these columns, over rows already there, and ending before the last row to be added.
+  const short = (g: Box) => cols0.some((c) => c >= g.c1 && c <= g.c2) && g.r2 > header.row && g.r1 <= end && g.r2 < lastNew;
+  const wb = ws.workbook;
+  for (const sheet of wb?.worksheets ?? [ws]) {
+    let found: string | undefined;
+    sheet.eachRow({ includeEmpty: false }, (row) =>
+      row.eachCell({ includeEmpty: false }, (cell) => {
+        if (found || !isFormula(cell)) return;
+        const text = formulaText(cell);
+        for (const g of rangesOn(text, ws.name, sheet === ws)) {
+          // A range inside the formula's own row works that row out (=SUM(B2:C2)): it adds up no rows.
+          if (sheet === ws && g.r1 === g.r2 && g.r1 === Number(cell.row)) continue;
+          if (short(g)) found = `${sheet === ws ? "" : `${sheet.name}!`}${cell.address} (=${text})`;
+        }
+      }),
+    );
+    if (found) {
+      throw new DocOpError(`A formula over the rows already on sheet "${ws.name}" would not take in the rows to be added: ${found}. Appended rows would be left out of it, so nothing was added. ${NEW_WORKBOOK}`);
+    }
+  }
+  const namesModel = (wb?.definedNames as unknown as { model?: Array<{ name?: string; ranges?: string[] }> } | undefined)?.model ?? [];
+  for (const n of namesModel) {
+    if (/^_xlnm\./i.test(String(n.name))) continue; // print areas and filters, which Excel keeps itself
+    for (const range of n.ranges ?? []) {
+      if (rangesOn(String(range), ws.name, false).some(short)) {
+        throw new DocOpError(`The name "${String(n.name)}" (${String(range)}) covers the rows already on sheet "${ws.name}" and would not take in the rows to be added: whatever uses it would leave them out. Nothing was added. ${NEW_WORKBOOK}`);
       }
-    }),
-  );
-  if (shortTotal) {
-    throw new DocOpError(`Sheet "${ws.name}" has a formula over the rows already there that would not take in the rows to be added: ${shortTotal}. Appended rows would be left out of it, so nothing was added. Build a new workbook from the full data instead.`);
+    }
+  }
+  const tables = Object.values((ws as unknown as { tables?: Record<string, { model?: { name?: string; tableRef?: string; ref?: string } }> }).tables ?? {});
+  for (const t of tables) {
+    const ref = String(t?.model?.tableRef ?? t?.model?.ref ?? "");
+    const g = rangesOn(`'${ws.name.replace(/'/g, "''")}'!${ref}`, ws.name, false)[0];
+    if (g && short(g)) {
+      throw new DocOpError(`The rows of sheet "${ws.name}" are an Excel table ("${String(t?.model?.name ?? "")}", ${ref}). Rows added below it here would not be part of the table, and its totals and whatever reads the table would leave them out. Nothing was added. ${NEW_WORKBOOK}`);
+    }
   }
   const written: Written = new Map();
   rows.forEach((r, i) => {
@@ -742,8 +910,33 @@ export function populateBlock(
 
   const rEnd = r0 + a.rows.length - 1;
   const cEnd = c0 + names.length - 1;
+
+  // The block's columns go in the data's order. Where the sheet has headers
+  // above the block that carry the data's own column names, the two must
+  // agree: a "qty" written under "PRICE" is a wrong figure that looks right.
+  const position = new Map(names.map((n, i) => [headerKey(n), i]));
+  for (let r = r0 - 1; r >= Math.max(1, r0 - 500); r--) {
+    const row = ws.getRow(r);
+    const under: Array<{ c: number; text: string; i: number }> = [];
+    for (let c = c0; c <= cEnd; c++) {
+      const text = cellText(row.getCell(c));
+      const i = text ? position.get(headerKey(text)) : undefined;
+      if (i !== undefined) under.push({ c, text, i });
+    }
+    if (under.length === 0) continue;
+    const off = under.filter((u) => u.i !== u.c - c0);
+    if (off.length > 0) {
+      throw new DocOpError(
+        `populate_sheet writes the data's columns in their own order, which is not the order of the headers on row ${r} of sheet "${ws.name}": ${off.slice(0, 4).map((u) => `column ${numToCol(u.c)} is headed "${u.text}" but would receive "${names[u.c - c0]}"`).join("; ")}. ` +
+          `Give "columns" in the order of the sheet's headers, or use append_rows, which places each value under the header of its own name. Nothing was written.`,
+      );
+    }
+    break;
+  }
+
   const beside: string[] = [];
   const problems: Array<{ address: string; why: string }> = [];
+  const block = new Set<string>();
   for (let r = r0; r <= rEnd; r++) {
     const row = ws.getRow(r);
     row.eachCell({ includeEmpty: false }, (cell, c) => {
@@ -751,10 +944,11 @@ export function populateBlock(
       // A formula that works the row out from the block's own cells (a value
       // column, =B2*C2) gives the row no identity. One that brings something
       // in from elsewhere (=Items!A2, a looked-up name) does.
-      if (isFormula(cell) ? !readsColumns(formulaText(cell), c0, cEnd) : !isEmptyValue(cell.value)) beside.push(cell.address);
+      if (isFormula(cell) ? !readsColumns(formulaText(cell), ws.name, c0, cEnd) : !isEmptyValue(cell.value)) beside.push(cell.address);
     });
     for (let c = c0; c <= cEnd; c++) {
       const cell = row.getCell(c);
+      block.add(cell.address);
       const why = blocked(cell, a.overwrite === true);
       if (why) problems.push({ address: cell.address, why });
     }
@@ -762,15 +956,18 @@ export function populateBlock(
   if (beside.length > 0) {
     throw new DocOpError(
       `populate_sheet writes by position, and rows ${r0}–${rEnd} of sheet "${ws.name}" already hold data in other columns (${beside.slice(0, 5).join(", ")}${beside.length > 5 ? ", …" : ""}). Values placed by position there can land against the wrong rows. ` +
-        `Use fill_by_key: name the column that identifies a row (an item code, a name; a column that only numbers the rows 1, 2, 3 will do, with the same numbers in the data) and the columns to fill. Nothing was written.`,
+        `Use fill_by_key: name the column that identifies a row (an item code, a name; a column that only numbers the rows 1, 2, 3 will do, with the same numbers in the data) and the columns to fill. ` +
+        `If nothing in those rows identifies them, build a new workbook that lists each row with its figures instead. Nothing was written.`,
     );
   }
+  problems.push(...sharedFormulaProblems(ws, block));
   refuseBlocked(
     problems,
     "populate_sheet",
     'The block would run into cells that already hold something: usually the data has more rows than the empty area has room for (what lies below it, such as totals, would be written over), or the area was filled before. Only if this same area is being filled again, pass "overwrite": true.',
   );
 
+  releaseSharedFormulas(ws, block);
   const written: Written = new Map();
   a.rows.forEach((r, ri) => {
     const row = ws.getRow(r0 + ri);
@@ -797,56 +994,149 @@ function formulaText(cell: ExcelJS.Cell): string {
   }
 }
 
-const OTHER_SHEET_REF = /(?:'[^']*'|[A-Za-z0-9_.]+)!\$?[A-Za-z]{1,3}\$?\d+(?::\$?[A-Za-z]{1,3}\$?\d+)?/g;
+type Box = { c1: number; r1: number; c2: number; r2: number };
 
-/** The A1:B2 ranges a formula names on its own sheet. */
-function rangesIn(formula: string): Array<{ c1: number; r1: number; c2: number; r2: number }> {
-  const out: Array<{ c1: number; r1: number; c2: number; r2: number }> = [];
-  const own = formula.replace(OTHER_SHEET_REF, "");
-  for (const m of own.matchAll(/\$?([A-Za-z]{1,3})\$?(\d+):\$?([A-Za-z]{1,3})\$?(\d+)/g)) {
-    const [c1, c2] = [colToNum(m[1]), colToNum(m[3])].sort((x, y) => x - y);
-    const [r1, r2] = [Number(m[2]), Number(m[4])].sort((x, y) => x - y);
-    out.push({ c1, r1, c2, r2 });
+/** Text in quotes says nothing about cells. */
+const withoutStrings = (f: string): string => f.replace(/"(?:[^"]|"")*"/g, '""');
+
+// Sheet!A1 or 'My Sheet'!A1:B2: the sheet, then one cell or a range.
+const ON_A_SHEET = /(?:'((?:[^']|'')*)'|([A-Za-z0-9_.]+))!\$?([A-Za-z]{1,3})\$?(\d+)(?::\$?([A-Za-z]{1,3})\$?(\d+))?/g;
+// Sheet!A:B, whole columns.
+const COLUMNS_ON_A_SHEET = /(?:'((?:[^']|'')*)'|([A-Za-z0-9_.]+))!\$?([A-Za-z]{1,3}):\$?([A-Za-z]{1,3})(?![A-Za-z0-9_(])/g;
+const A_RANGE = /(?<![A-Za-z0-9_.$!'])\$?([A-Za-z]{1,3})\$?(\d+):\$?([A-Za-z]{1,3})\$?(\d+)(?![A-Za-z0-9_(])/g;
+const A_CELL = /(?<![A-Za-z0-9_.$!'])\$?([A-Za-z]{1,3})\$?\d+(?![A-Za-z0-9_(!])/g;
+const WHOLE_COLUMNS = /(?<![A-Za-z0-9_.$!'])\$?([A-Za-z]{1,3}):\$?([A-Za-z]{1,3})(?![A-Za-z0-9_(!])/g;
+
+const sameSheet = (quoted: string | undefined, plain: string | undefined, sheet: string): boolean =>
+  (quoted !== undefined ? quoted.replace(/''/g, "'") : (plain ?? "")).toLowerCase() === sheet.toLowerCase();
+
+const box = (ca: string, ra: string, cb: string, rb: string): Box => {
+  const [c1, c2] = [colToNum(ca), colToNum(cb)].sort((x, y) => x - y);
+  const [r1, r2] = [Number(ra), Number(rb)].sort((x, y) => x - y);
+  return { c1, r1, c2, r2 };
+};
+
+/**
+ * The A1:B2 ranges a formula names on the sheet called `sheet`: those written
+ * with that sheet's name, and, when the formula sits on that sheet itself
+ * (`own`), those written with no sheet name.
+ */
+export function rangesOn(formula: string, sheet: string, own: boolean): Box[] {
+  const out: Box[] = [];
+  const f = withoutStrings(formula);
+  for (const m of f.matchAll(ON_A_SHEET)) {
+    if (m[6] !== undefined && sameSheet(m[1], m[2], sheet)) out.push(box(m[3], m[4], m[5], m[6]));
+  }
+  if (own) {
+    for (const m of f.replace(ON_A_SHEET, "").replace(COLUMNS_ON_A_SHEET, "").matchAll(A_RANGE)) out.push(box(m[1], m[2], m[3], m[4]));
   }
   return out;
 }
 
-/** Does the formula read a cell of its own sheet in one of these columns? */
-function readsColumns(formula: string, c0: number, cEnd: number): boolean {
-  const own = formula.replace(OTHER_SHEET_REF, "");
-  for (const m of own.matchAll(/\$?([A-Za-z]{1,3})\$?\d+/g)) {
-    const c = colToNum(m[1]);
-    if (c >= c0 && c <= cEnd) return true;
+/**
+ * Does a formula on sheet `sheet` read a cell of that sheet in one of these
+ * columns? A formula that speaks of "this row" of an Excel table
+ * ([@Qty], [#This Row]) works the row out from the row itself, and counts.
+ */
+export function readsColumns(formula: string, sheet: string, c0: number, cEnd: number): boolean {
+  const f = withoutStrings(formula);
+  const within = (a: number, b: number) => Math.min(a, b) <= cEnd && Math.max(a, b) >= c0;
+  if (/\[@|\[#this row\]/i.test(f) && !f.includes("!")) return true;
+  for (const m of f.matchAll(ON_A_SHEET)) {
+    if (sameSheet(m[1], m[2], sheet) && within(colToNum(m[3]), colToNum(m[5] ?? m[3]))) return true;
   }
+  for (const m of f.matchAll(COLUMNS_ON_A_SHEET)) {
+    if (sameSheet(m[1], m[2], sheet) && within(colToNum(m[3]), colToNum(m[4]))) return true;
+  }
+  const own = f.replace(ON_A_SHEET, "").replace(COLUMNS_ON_A_SHEET, "");
+  for (const m of own.matchAll(A_CELL)) if (within(colToNum(m[1]), colToNum(m[1]))) return true;
+  for (const m of own.matchAll(WHOLE_COLUMNS)) if (within(colToNum(m[1]), colToNum(m[2]))) return true;
   return false;
 }
 
-/**
- * A formula filled down a column is stored once, in its first cell, with the
- * cells below only pointing at it. Writing that first cell (a figure into
- * it, or another formula) would change or break every cell below, in ways
- * the caller never asked for. Each such cell is given its own formula before
- * anything is written; the sheet calculates exactly as before.
- */
-export function unshareFormulas(wb: ExcelJS.Workbook): number {
+// A formula filled down a column (or across a row) is stored once, in its
+// first cell; the others only point at it, and Excel works each one's own
+// formula out from the first. Left alone, such cells are saved exactly as
+// they were. Only writing the FIRST cell needs care: the others would be left
+// pointing at a formula that is no longer there. Then, and only then, each of
+// them is given its own formula, and only when that can be worked out here
+// without doubt: a formula made of plain cell references, numbers, operators
+// and functions. Anything else (another sheet, a name, text in quotes, a
+// whole column, a table column) is refused rather than guessed at. An
+// earlier version rewrote every such cell on loading, with the library's
+// pattern-based rewriting: it turned "Q1" in quotes into "Q2" and a sheet
+// called 'Jan26' into 'Jan27', on sheets no op had touched.
+
+const A1_REF = /^\$?([A-Za-z]{1,3})\$?[1-9]\d{0,6}$/;
+
+/** Can the library's rewriting of this formula for another cell be relied on? Only for the plainest formulas. */
+export function translatesSafely(formula: string): boolean {
+  if (formula === "" || /[^A-Za-z0-9_.$:,;+\-*/^%()<>=& ]/.test(formula)) return false;
+  for (const m of formula.matchAll(/[A-Za-z0-9_.$]+/g)) {
+    const t = m[0];
+    const before = formula[m.index! - 1];
+    const after = formula[m.index! + t.length];
+    if (after === "(") {
+      // A function. No part of its name before the last may read as a cell (the rewriting would move it).
+      if (!/^[A-Za-z_][A-Za-z0-9_.]*$/.test(t) || t.split(".").slice(0, -1).some((part) => /^[A-Za-z]+[1-9]\d*$/.test(part))) return false;
+      continue;
+    }
+    const ref = A1_REF.exec(t);
+    if (ref && colToNum(ref[1]) <= 16384) continue;
+    // A colon beside anything but a cell is a whole column or a whole row.
+    if (before === ":" || after === ":") return false;
+    if (/^(\d+\.?\d*|\.\d+)([eE]\d*)?$/.test(t) || /^(true|false)$/i.test(t)) continue;
+    return false;
+  }
+  return true;
+}
+
+/** The cells that take their formula from this one, when it is the first cell of a filled-down formula. */
+function pointingAt(ws: ExcelJS.Worksheet, first: ExcelJS.Cell): ExcelJS.Cell[] {
+  const v = first.value as { shareType?: unknown; ref?: unknown } | null;
+  if (!v || typeof v !== "object" || v.shareType !== "shared") return [];
+  const out: ExcelJS.Cell[] = [];
+  const take = (cell: ExcelJS.Cell | undefined) => {
+    const cv = cell?.value as { sharedFormula?: unknown } | null | undefined;
+    if (cell && cv && typeof cv === "object" && cv.sharedFormula === first.address) out.push(cell);
+  };
+  const m = typeof v.ref === "string" ? /^\$?([A-Za-z]{1,3})\$?(\d+)(?::\$?([A-Za-z]{1,3})\$?(\d+))?$/.exec(v.ref) : null;
+  if (m) {
+    const g = box(m[1], m[2], m[3] ?? m[1], m[4] ?? m[2]);
+    for (let r = g.r1; r <= g.r2; r++) for (let c = g.c1; c <= g.c2; c++) take(ws.findCell(r, c));
+  } else {
+    ws.eachRow({ includeEmpty: false }, (row) => row.eachCell({ includeEmpty: false }, take));
+  }
+  return out;
+}
+
+/** Of the cells about to be written, the first cells of filled-down formulas whose other cells are NOT about to be written. */
+function leftPointing(ws: ExcelJS.Worksheet, addresses: Set<string>): Array<{ first: ExcelJS.Cell; others: ExcelJS.Cell[] }> {
+  const out: Array<{ first: ExcelJS.Cell; others: ExcelJS.Cell[] }> = [];
+  for (const address of addresses) {
+    const first = ws.getCell(address);
+    const others = pointingAt(ws, first).filter((c) => !addresses.has(c.address));
+    if (others.length > 0) out.push({ first, others });
+  }
+  return out;
+}
+
+/** What stands in the way of writing these cells: a first cell whose formula cannot safely be carried to the cells that take theirs from it. */
+export function sharedFormulaProblems(ws: ExcelJS.Worksheet, addresses: Set<string>): Array<{ address: string; why: string }> {
+  return leftPointing(ws, addresses)
+    .filter((g) => !translatesSafely(String((g.first.value as { formula?: unknown }).formula ?? "")))
+    .map((g) => ({ address: g.first.address, why: FIRST_OF_FILLED_DOWN }));
+}
+
+/** Before those cells are written: every cell left pointing at one of them gets its own formula. Returns how many. */
+export function releaseSharedFormulas(ws: ExcelJS.Worksheet, addresses: Set<string>): number {
   const todo: Array<{ cell: ExcelJS.Cell; formula: string; result: unknown }> = [];
-  for (const ws of wb.worksheets) {
-    ws.eachRow({ includeEmpty: false }, (row) =>
-      row.eachCell({ includeEmpty: false }, (cell) => {
-        const v = cell.value as { sharedFormula?: unknown; shareType?: unknown; formula?: unknown; result?: unknown } | null;
-        if (!v || typeof v !== "object") return;
-        if (v.sharedFormula !== undefined || v.shareType === "shared") {
-          const text = formulaText(cell);
-          if (text) todo.push({ cell, formula: text, result: v.result });
-        }
-      }),
-    );
+  for (const g of leftPointing(ws, addresses)) {
+    for (const cell of g.others) todo.push({ cell, formula: formulaText(cell), result: (cell.value as { result?: unknown }).result });
   }
-  // The cells that point first, their master last: a pointer is read through its master.
-  for (const t of todo.filter((x) => (x.cell.value as { sharedFormula?: unknown }).sharedFormula !== undefined)) {
-    t.cell.value = { formula: t.formula, ...(t.result !== undefined ? { result: t.result } : {}) } as ExcelJS.CellValue;
-  }
-  for (const t of todo.filter((x) => (x.cell.value as { shareType?: unknown }).shareType === "shared")) {
+  // All of them are read before any is changed: each is read through the first cell.
+  for (const t of todo) {
+    if (!t.formula) throw new DocOpError(`The formula of ${t.cell.address} on sheet "${ws.name}" could not be read. Nothing was written.`);
     t.cell.value = { formula: t.formula, ...(t.result !== undefined ? { result: t.result } : {}) } as ExcelJS.CellValue;
   }
   return todo.length;

@@ -42,7 +42,7 @@ import {
   type XlsxOpSpec,
 } from "./documents.js";
 import JSZip from "jszip";
-import { compareWithBase, dropFormulaResults, signaturesOf, unshareFormulas } from "./documentFill.js";
+import { compareWithBase, dropFormulaResults, signaturesOf } from "./documentFill.js";
 import { resolveDocumentMime, extractDocumentText } from "./textExtract.js";
 
 
@@ -112,19 +112,24 @@ const COPY_FORWARD_BYTES_PER_CELL = 1300;
  * so an id of twenty digits stays text, and so does its whole column.
  */
 const DECIMAL_TYPE = /^(DECIMAL|NUMERIC|DOUBLE|FLOAT|REAL)\b/i;
+/**
+ * More digits before the point than a number holds exactly: an id, whatever
+ * its column is called (DECIMAL(20,0) is a whole number under another name).
+ */
+const LONG_WHOLE_PART = /^-?\d{16,}(\.|$)/;
 const WHOLE_TYPE = /^(HUGEINT|UHUGEINT|UBIGINT|BIGINT|INTEGER|UINTEGER|SMALLINT|USMALLINT|TINYINT|UTINYINT)\b/i;
 const DECIMAL_TEXT = /^-?\d+(\.\d+)?([eE][-+]?\d+)?$/;
-const WHOLE_TEXT = /^-?(0|[1-9]\d{0,14})$/;
+const WHOLE_TEXT = /^-?(0|[1-9]\d*)$/; // how long it may be is LONG_WHOLE_PART, below
 export function numbersFromText(columns: Array<{ name: string; type: string }>, rows: Record<string, unknown>[]): Record<string, unknown>[] {
   const convert = columns
     .filter((c) => {
-      const pattern = DECIMAL_TYPE.test(c.type) ? DECIMAL_TEXT : WHOLE_TYPE.test(c.type) ? WHOLE_TEXT : null;
+      const pattern = WHOLE_TYPE.test(c.type) ? WHOLE_TEXT : DECIMAL_TYPE.test(c.type) ? DECIMAL_TEXT : null;
       if (!pattern) return false;
       let any = false;
       for (const r of rows) {
         const v = r[c.name];
         if (typeof v !== "string") continue;
-        if (!pattern.test(v) || !Number.isFinite(Number(v))) return false;
+        if (!pattern.test(v) || LONG_WHOLE_PART.test(v) || !Number.isFinite(Number(v))) return false;
         any = true;
       }
       return any;
@@ -143,9 +148,12 @@ export function numbersFromText(columns: Array<{ name: string; type: string }>, 
  * same rule as for rows read from a client's database: a column becomes
  * numbers only when every value in it is a plain number as written, with no
  * leading zeros (a code such as "0222" keeps its whole column as text) and
- * no more digits than a number holds exactly.
+ * no more digits than a number holds exactly. A column with a whole number
+ * of twelve digits or more is taken for what such a thing nearly always is
+ * when written out as text, a barcode or an account number, and stays text.
  */
 const PLAIN_NUMBER_TEXT = /^-?(0|[1-9]\d{0,14})(\.\d+)?$/;
+const LOOKS_LIKE_A_CODE = /^-?\d{12,}$/;
 export function plainNumbersFromText(rows: Record<string, unknown>[]): Record<string, unknown>[] {
   if (rows.length === 0) return rows;
   const names = [...new Set(rows.flatMap((r) => Object.keys(r)))];
@@ -154,7 +162,7 @@ export function plainNumbersFromText(rows: Record<string, unknown>[]): Record<st
     for (const r of rows) {
       const v = r[c];
       if (v === null || v === undefined) continue;
-      if (typeof v !== "string" || !PLAIN_NUMBER_TEXT.test(v)) return false;
+      if (typeof v !== "string" || !PLAIN_NUMBER_TEXT.test(v) || LOOKS_LIKE_A_CODE.test(v)) return false;
       any = true;
     }
     return any;
@@ -1348,9 +1356,7 @@ export class FileStore {
         }
         let wb: ExcelJS.Workbook | null = new ExcelJS.Workbook();
         await wb.xlsx.readFile(xlsxPath);
-        // Filled-down formulas are given a formula each, so that writing one
-        // cell cannot change or break the cells below it.
-        unshareFormulas(wb);
+        // The base exactly as it was loaded: nothing is rewritten before an op asks for it.
         const before = signaturesOf(wb);
         if (before.cells > maxCells) throw tooLarge(`${before.cells.toLocaleString("en-US")} filled cells`);
         const done = applyOps(wb, ops);
