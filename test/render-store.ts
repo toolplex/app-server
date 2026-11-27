@@ -479,6 +479,14 @@ async function main(): Promise<void> {
       }),
     );
     check("a hidden name that a formula uses is refused: the formula would show an error", usedHidden.status === 422 && /cannot carry: the name "TaxRate" \(0\.12\), which is not a plain range of cells and which a formula uses \(Calc!B3\)/.test(usedHidden.message));
+    const usedOtherwise = await fillOf(
+      await crafted("usedhidden2", async (zip) => {
+        await withNames('<definedName name="TaxRate" hidden="true">0.12</definedName>')(zip);
+        await change(zip, "xl/worksheets/sheet2.xml", /<f>Data!B3\*2<\/f>/, "<f>Data!B3*taxrate</f>");
+      }),
+    );
+    check('hidden written as "true", and the name used in another case, are the same thing', usedOtherwise.status === 422 && /the name "TaxRate" \(0\.12\), which is not a plain range of cells and which a formula uses \(Calc!B3\)/.test(usedOtherwise.message));
+    check("text with nothing in it does not stop a column of figures written as text from being figures", JSON.stringify(plainNumbersFromText([{ a: "1250.50", b: "x" }, { a: "", b: "" }, { a: " ", b: "y" }, { a: "12.25", b: "z" }])) === JSON.stringify([{ a: 1250.5, b: "x" }, { a: "", b: "" }, { a: " ", b: "y" }, { a: 12.25, b: "z" }]));
     const spelled = await fillOf(await crafted("spelled", (zip) => change(zip, "xl/workbook.xml", "<calcPr ", "<calcPr iterate='true' fullPrecision=\"false\" ")));
     check("the settings are read however they are spelled", spelled.status === 422 && /precision as displayed/.test(spelled.message) && /iterative calculation/.test(spelled.message));
     // What Excel keeps for itself, and a sheet name that needs quotes, are no obstacle.

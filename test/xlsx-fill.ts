@@ -992,7 +992,7 @@ async function main(): Promise<void> {
       through("a figure written as text with a percent sign and brackets", ["A-9", "Cap", "(5%)"]);
       through("a unit, in a row that also holds a figure", ["A-9", 12, "pcs"]);
       // A figure outside the columns the op names is not part of the row as it is read: that list may be something else's.
-      refused("a unit row, with a figure only beyond the columns named", table(["A-9", "Cap", "pcs", 12]), fill(), /Row 3 \(A3 "A-9", B3 "Cap", C3 "pcs"\) has what reads like column headings/);
+      refused("a unit row, with a figure only beyond the columns named", table(["A-9", "Cap", "pcs", 12]), fill(), /Row 3 \(A3 "A-9", B3 "Cap", C3 "pcs", D3 "12"\) has what reads like column headings/);
       through("words in one cell only", [null, null, "see note"]);
       through("a row the data has, though it holds words", ["A-9", "Cap, old line", "pending"], { overwrite: true }, [...two, { c: "A-9", q: 9 }]);
       // Words where the figure goes, nothing but words in the row, a key the data does not have, and keys below: asked.
@@ -1004,7 +1004,7 @@ async function main(): Promise<void> {
       refused("headings with a year among them", table(["ITEM", 2026, "RETURNED"]), fill(), /Where the table under row 1 of sheet "S" ends cannot be told from the sheet\. Row 3 /);
       refused("headings with a date among them", table(["ITEM", new Date(Date.UTC(2026, 0, 1)), "RETURNED"]), fill(), /ends cannot be told from the sheet\. Row 3 /);
       // This table's own column headings under another key heading.
-      refused("the same column headings under another key heading", table(["ITEM", "Name", "SOLD", "STATUS"]), fill(), /Row 3 \(A3 "ITEM", B3 "Name", C3 "SOLD"\) has this table's column headings again, under another key heading/);
+      refused("the same column headings under another key heading", table(["ITEM", "Name", "SOLD", "STATUS"]), fill(), /Row 3 \(A3 "ITEM", B3 "Name", C3 "SOLD", D3 "STATUS"\) has this table's column headings again, under another key heading/);
       // A fill of words only: nothing can be judged by figures, but the table's own headings still show.
       refused("a fill of words meeting the same column headings under another key heading", table(["ITEM", "Name", "SOLD", "STATUS"]), [{ ...fill()[0], set: { STATUS: "s" }, rows: [{ c: "A-1", s: "ok" }, { c: "A-2", s: "late" }] }], /Where the table under row 1 of sheet "S" ends cannot be told from the sheet\. Row 3 /);
       // A fill of a figure and of words: the figure column is the one that is judged.
@@ -1384,8 +1384,108 @@ async function main(): Promise<void> {
       });
       const r = applyOps(wb, [{ op: "append_rows", sheet: "S", rows: [{ CODE: "C", QTY: 3 }] }]).reports[0];
       check("rows are added at the foot of the table, though a list beside it runs further down", wb.getWorksheet("S")!.getCell("A4").value === "C" && r.range === "A4:B4");
-      refused("an empty row of the table, with a list beside it and more below", sheetOf([["CODE", "QTY", "List"], ["A", 1, "x"], [null, null, "y"], ["ITEM", "RET", "z"], ["X", 2, "w"]]), [{ op: "append_rows", sheet: "S", rows: [{ CODE: "C", QTY: 3 }] }], /has an empty row \(row 3\) between its headers \(row 1\) and the last row that holds anything \(row 5: A5 "X", B5 "2"\)/);
+      refused("an empty row of the table, with a list beside it and more below", sheetOf([["CODE", "QTY", "List"], ["A", 1, "x"], [null, null, "y"], ["ITEM", "RET", "z"], ["X", 2, "w"]]), [{ op: "append_rows", sheet: "S", rows: [{ CODE: "C", QTY: 3 }] }], /has an empty row \(row 3\) between its headers \(row 1\) and the last row that holds anything \(row 5: A5 "X", B5 "2", C5 "w"\)/);
       check("a filter and a print area that do not take the new rows in are said", r.doesNotCover?.join() === "the sheet's filter,the sheet's print area");
+    }
+
+    // -----------------------------------------------------------------------
+    // Found by the last narrow check before a live test.
+    // -----------------------------------------------------------------------
+    {
+      const day = (d: number) => new Date(Date.UTC(2026, 10, d));
+      // Adding rows never writes into the table's last row because the op does not name the column that fills it.
+      const totals = (last: unknown) => sheetOf([["Date", "Store", "Qty", "Amount"], ["d1", "N", 1, 10], ["d2", "S", 2, 20], ["d3", "E", 3, 30], [null, null, null, last]]);
+      const three = [{ op: "append_rows" as const, sheet: "S", rows: [{ Date: "d4", Store: "W", Qty: 9 }] }];
+      refused("a total in a column the append does not name", totals({ formula: "SUM(D2:D4)", result: 60 }), three, /The last row of sheet "S" that holds anything \(row 5\) has formulas \(D5\)/);
+      refused("a typed total in a column the append does not name", totals(60), three, /\(row 5: D5 "60"\) has a value under at most one of the headers being filled/);
+
+      // A label in a column of the table the op does not name is not an empty row.
+      const grouped = sheetOf([["Cat", "CODE", "QTY"], [null, "A", null], ["Veg", null, null], [null, "Z", null], [null, "B", null]]);
+      const rg = applyOps(grouped, byCode({ QTY: "q" }, [{ c: "A", q: 1 }, { c: "B", q: 2 }])).reports[0];
+      check("a category written beside the items is read across, not taken for a gap", grouped.getWorksheet("S")!.getCell("C5").value === 2 && rg.stoppedAtRow === undefined && rg.sheetKeysWithoutData?.join() === "Z");
+
+      // What a column holds is what most of its cells are; a label or a total among them changes nothing.
+      const dated = (extra: unknown[]) => sheetOf([["CODE", "Due"], ["A", day(1)], ["B", day(2)], ["C", day(3)], ...extra.map((x, i) => [`X${i}`, x]), ["T", null]]);
+      const due = (wb: ExcelJS.Workbook, d: unknown, extra: object = {}) => applyOps(wb, byCode({ Due: "d" }, [{ c: "T", d }], extra));
+      for (const [label, odd] of [["a label", "Subtotal"], ["a count", 3]] as const) {
+        const wb = dated([odd]);
+        due(wb, "2026-11-09");
+        check(`three dates and ${label}: still a column of dates`, wb.getWorksheet("S")!.getCell("B6").value instanceof Date);
+      }
+      const tie = dated(["one", "two", "three"]);
+      const rt = due(tie, "2026-11-09", { lastRow: 8 }).reports[0];
+      check("as many words as dates: no longer a column of dates, and the date goes in as text, which is said", tie.getWorksheet("S")!.getCell("B8").value === "2026-11-09" && rt.datesAsText?.join() === "Due");
+      const mostlyNumbers = sheetOf([["CODE", "Amt"], ["A", 1], ["B", 2], ["C", 3], ["D", "pending"], ["T", null]]);
+      applyOps(mostlyNumbers, byCode({ Amt: "q" }, [{ c: "T", q: "1250.50" }], { lastRow: 6 }));
+      check("three numbers and a word: still a column of numbers", mostlyNumbers.getWorksheet("S")!.getCell("B6").value === 1250.5);
+      const computed = sheetOf([["CODE", "Amt"], ["A", { formula: "DATE(2026,1,1)", result: day(1) }], ["B", { formula: "DATE(2026,1,2)", result: day(2) }], ["C", 5], ["T", null]]);
+      applyOps(computed, byCode({ Amt: "q" }, [{ c: "T", q: "7" }]));
+      check("what formulas work out is not what the column is typed as", computed.getWorksheet("S")!.getCell("B5").value === 7);
+
+      // A moment (…Z) is not a day as someone wrote it, unless it is midnight.
+      const z = dated([]);
+      due(z, "2026-11-04T00:00:00.000Z");
+      check("midnight Z is that day", (z.getWorksheet("S")!.getCell("B5").value as Date).toISOString() === "2026-11-04T00:00:00.000Z");
+      refused("a time of day with Z, which is another day somewhere", dated([]), byCode({ Due: "d" }, [{ c: "T", d: "2026-11-03T16:00:00.000Z" }]), /the data gives "2026-11-03T16:00:00\.000Z" for it, which is not a date as this reads one.*without a Z/);
+      const blank = dated([]);
+      const rb = due(blank, "  ").reports[0];
+      check("text with nothing in it is no value: nothing is written and that is counted", blank.getWorksheet("S")!.getCell("B5").value === null && rb.emptyValuesLeft === 1 && rb.cellsWritten === 0);
+      refused("text with nothing in it against a figure, in a refresh", sheetOf([["CODE", "QTY"], ["A", 7]]), byCode({ QTY: "q" }, [{ c: "A", q: "" }], { overwrite: true }), /the data has no value \(NULL\) for 1 cell that hold a figure now/);
+      const noDue = sheetOf([["CODE", "Due", "Qty"], ["A", null, null], ["B", null, null], ["C", day(2), 2], ["D", day(3), 3]]);
+      applyOps(noDue, byCode({ Due: "d", Qty: "q" }, [{ c: "A", d: null, q: 9 }], { unmatched: "zero" }));
+      check("a 0 is not put under dates even when the data gives that column nothing", noDue.getWorksheet("S")!.getCell("B3").value === null && noDue.getWorksheet("S")!.getCell("C3").value === 0 && noDue.getWorksheet("S")!.getCell("C2").value === 9);
+
+      // Times of day are not dates.
+      const time = (h: number, m: number) => new Date(Date.UTC(1899, 11, 30, h, m));
+      const shifts = () =>
+        sheetOf([["CODE", "Start"], ["A", time(7, 30)], ["B", time(8, 0)], ["C", null]], (ws) => {
+          for (const a of ["B2", "B3"]) ws.getCell(a).numFmt = "hh:mm";
+        });
+      refused("text under a column of times", shifts(), byCode({ Start: "t" }, [{ c: "C", t: "13:30" }]), /the column "Start" holds times of day in the sheet \(B2\), and the data gives "13:30" for it.*Give a time as a number, the fraction of a day it is/);
+      refused("a date as text under a column of times", shifts(), byCode({ Start: "t" }, [{ c: "C", t: "2026-11-04" }]), /holds times of day in the sheet/);
+      const sh = shifts();
+      const beforeShift = signaturesOf(sh);
+      const doneShift = applyOps(sh, byCode({ Start: "t" }, [{ c: "C", t: 0.5625 }]));
+      const savedShift = await save(sh, out);
+      check("a time given as a number is a time, shown as the column's times are", savedShift.getWorksheet("S")!.getCell("B4").numFmt === "hh:mm" && (savedShift.getWorksheet("S")!.getCell("B4").value as Date).toISOString() === "1899-12-30T13:30:00.000Z");
+      check("and the read-back takes the number and the time it shows for the same thing", compareWithBase(beforeShift.sheets, savedShift, doneShift.written).length === 0);
+
+      // An empty column: the format of its cells is all there is to go by.
+      const template = (fmt: string | undefined, rows = 3) =>
+        sheetOf([["CODE", "Amt"], ...Array.from({ length: rows }, (_, i) => [`K${i}`])], (ws) => {
+          if (fmt) for (let r = 2; r <= rows + 1; r++) ws.getCell(`B${r}`).numFmt = fmt;
+        });
+      const amounts = (wb: ExcelJS.Workbook, values: unknown[]) => applyOps(wb, byCode({ Amt: "q" }, values.map((q, i) => ({ c: `K${i}`, q }))));
+      const formatted = template("#,##0.00");
+      const rn = amounts(formatted, ["1250.50", "", "12.25"]).reports[0];
+      check("figures given as text for cells formatted for numbers are numbers; an empty one is no value", formatted.getWorksheet("S")!.getCell("B2").value === 1250.5 && formatted.getWorksheet("S")!.getCell("B3").value === null && formatted.getWorksheet("S")!.getCell("B4").value === 12.25 && rn.writtenAs?.Amt === "numbers" && rn.numbersAsText === undefined);
+      const withNa = template("#,##0.00");
+      amounts(withNa, ["1250.50", "N/A", "12.25"]);
+      check("and a placeholder among them stays the placeholder it is", withNa.getWorksheet("S")!.getCell("B2").value === 1250.5 && withNa.getWorksheet("S")!.getCell("B3").value === "N/A");
+      refused("text that is not a plain number for cells formatted for numbers", template("#,##0.00"), byCode({ Amt: "q" }, [{ c: "K0", q: "1,250.50" }, { c: "K1", q: "2" }]), /the cells of the column "Amt" are formatted for numbers \(B2: #,##0\.00\), and the data gives "1,250\.50" for it/);
+      const plain = template(undefined);
+      const rp = amounts(plain, ["1250.50", "N/A", "12.25"]).reports[0];
+      check("with no format and nothing in the column, text goes in as text, and that is said", plain.getWorksheet("S")!.getCell("B2").value === "1250.50" && rp.numbersAsText?.join() === "Amt" && rp.writtenAs === undefined);
+      const half = template(undefined, 2);
+      half.getWorksheet("S")!.getCell("B2").numFmt = "dd/mm/yyyy";
+      applyOps(half, byCode({ Amt: "q" }, [{ c: "K0", q: "2026-11-09" }, { c: "K1", q: "2026-11-10" }]));
+      check("only some of the cells formatted for dates is not a column for dates", half.getWorksheet("S")!.getCell("B2").value === "2026-11-09");
+      const worded = sheetOf([["CODE", "Amt"], ["A", "to follow"], ["K0", null]], (ws) => void (ws.getCell("B3").numFmt = "dd/mm/yyyy"));
+      applyOps(worded, byCode({ Amt: "q" }, [{ c: "K0", q: "2026-11-09" }]));
+      check("a column that already holds words is not judged by one cell's format", worded.getWorksheet("S")!.getCell("B3").value === "2026-11-09");
+      const red = sheetOf([["CODE", "When"], ["A", day(1)], ["B", null]], (ws) => {
+        ws.getCell("B2").numFmt = "dd/mm/yyyy";
+        ws.getCell("B3").numFmt = "[Red]0.00";
+      });
+      applyOps(red, byCode({ When: "d" }, [{ c: "B", d: "2026-11-10" }]));
+      check("a colour named in a number format is not a date format", red.getWorksheet("S")!.getCell("B3").numFmt === "dd/mm/yyyy" && red.getWorksheet("S")!.getCell("B3").value instanceof Date);
+
+      // Codes kept as text take whole numbers as text; anything else among the values and they are left as given.
+      const codes = () => sheetOf([["CODE", "Branch"], ["A", "101"], ["B", "0222"], ["C", null], ["D", null]]);
+      const neg = codes();
+      applyOps(neg, byCode({ Branch: "n" }, [{ c: "C", n: 103 }, { c: "D", n: -4 }]));
+      check("a minus sign among the values means figures", neg.getWorksheet("S")!.getCell("B4").value === 103 && neg.getWorksheet("S")!.getCell("B5").value === -4);
+      refused("a number and a word for one column", codes(), byCode({ Branch: "n" }, [{ c: "C", n: 103 }, { c: "D", n: "HQ" }]), /Data column "n" is a number in 1 rows and text in 1/);
     }
 
     console.log(`\n✓ xlsx-fill: ${passed} checks passed`);

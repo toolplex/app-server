@@ -162,7 +162,8 @@ export function plainNumbersFromText(rows: Record<string, unknown>[]): Record<st
     let any = false;
     for (const r of rows) {
       const v = r[c];
-      if (v === null || v === undefined) continue;
+      // Text with nothing in it is no value, and decides nothing about its column.
+      if (v === null || v === undefined || (typeof v === "string" && v.trim() === "")) continue;
       if (typeof v !== "string" || !PLAIN_NUMBER_TEXT.test(v) || LOOKS_LIKE_A_CODE.test(v)) return false;
       any = true;
     }
@@ -171,7 +172,7 @@ export function plainNumbersFromText(rows: Record<string, unknown>[]): Record<st
   if (convert.length === 0) return rows;
   return rows.map((r) => {
     const o = { ...r };
-    for (const c of convert) if (typeof o[c] === "string") o[c] = Number(o[c]);
+    for (const c of convert) if (typeof o[c] === "string" && (o[c] as string).trim() !== "") o[c] = Number(o[c]);
     return o;
   });
 }
