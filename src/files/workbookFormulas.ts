@@ -30,6 +30,8 @@ export interface WorkbookFormulas {
   names: Map<string, string>;
   /** What this file holds that a copy made here cannot carry at all. */
   cannotCarry: string[];
+  /** What a copy leaves behind that changes no figure, for whoever gets the copy to be told. */
+  notes: string[];
   formulas: number;
 }
 
@@ -71,7 +73,8 @@ export function formulasInSheetXml(xml: string, sheet: string, cannotCarry: stri
     if (!selfClosed) {
       const close = xml.indexOf("</f>", tagEnd);
       if (close === -1) break;
-      text = decode(xml.slice(tagEnd + 1, close));
+      // A line break inside a formula is stored one way whichever way it was written.
+      text = decode(xml.slice(tagEnd + 1, close)).replace(/\r\n?/g, "\n");
       after = close + 4;
     }
     const cStart = xml.lastIndexOf("<c ", pos);
@@ -128,22 +131,44 @@ export async function formulasInFile(file: Buffer): Promise<WorkbookFormulas> {
     // Chart sheets and the like hold no cells.
     if (!/worksheets\//.test(path)) continue;
     const xml = await read(path);
-    const found = xml.includes("<f") ? formulasInSheetXml(xml, name, cannotCarry) : new Map<string, string>();
+    const found = xml.includes("<f") || /<[A-Za-z0-9]+:worksheet[\s>]/.test(xml) ? formulasInSheetXml(xml, name, cannotCarry) : new Map<string, string>();
     sheets.set(name, found);
     formulas += found.size;
   }
+  // Names. The copy carries a name that stands for a plain range of cells.
+  // One that is a constant, a formula or a whole column it drops or cuts
+  // short, and whatever uses the name then shows an error or another figure:
+  // that is said before the workbook is loaded. A name that is already dead
+  // (#REF!) has nothing to lose. A hidden name belongs to a feature of Excel
+  // or an add-in (Solver's settings); it is left behind, and that is noted.
   const names = new Map<string, string>();
+  const notes: string[] = [];
+  const PLAIN_RANGES = /^[^!,]+!\$?[A-Za-z]{1,3}\$?\d+(:\$?[A-Za-z]{1,3}\$?\d+)?(,[^!,]+!\$?[A-Za-z]{1,3}\$?\d+(:\$?[A-Za-z]{1,3}\$?\d+)?)*$/;
+  let hidden = 0;
   for (const m of workbook.matchAll(/<definedName\s([^>]*)>([^<]*)<\/definedName>/g)) {
     const name = decode(attr(m[1], "name") ?? "");
     if (/^_xlnm\./i.test(name)) continue; // print areas, print titles, filters: Excel's own
+    // A sheet name is written with or without quotes; the two mean the same.
+    const refersTo = decode(m[2]).replace(/'([^'!]+)'!/g, "$1!");
+    if (refersTo.includes("#REF!")) continue;
+    if (attr(m[1], "hidden") === "1") {
+      hidden++;
+      continue;
+    }
+    if (!PLAIN_RANGES.test(refersTo)) cannotCarry.push(`the name "${name}" (${refersTo.slice(0, 60)}), which is not a plain range of cells`);
     // A name may belong to one sheet only. The copy keeps one name of each
     // spelling for the whole workbook, which is the same thing unless two
     // sheets each have their own.
     if (names.has(name)) cannotCarry.push(`the name "${name}", which more than one sheet defines for itself`);
-    // A sheet name is written with or without quotes; the two mean the same.
-    names.set(name, decode(m[2]).replace(/'([^'!]+)'!/g, "$1!"));
+    names.set(name, refersTo);
   }
-  return { sheets, names, cannotCarry, formulas };
+  if (hidden > 0) notes.push(`The original workbook has ${hidden} hidden name${hidden === 1 ? "" : "s"} (settings of an Excel feature or an add-in, such as Solver). They are not carried into this copy.`);
+  // How the workbook calculates. The copy is set to calculate in full when it
+  // is opened; two settings change what a formula's result IS, and are lost.
+  const calc = /<calcPr\s[^>]*>/.exec(workbook)?.[0] ?? "";
+  if (attr(calc, "fullPrecision") === "0") cannotCarry.push('the setting "precision as displayed", under which figures are rounded to what their cells show');
+  if (attr(calc, "iterate") === "1") cannotCarry.push("iterative calculation, which formulas that refer to themselves depend on");
+  return { sheets, names, cannotCarry, notes, formulas };
 }
 
 /**

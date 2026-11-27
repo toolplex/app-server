@@ -308,7 +308,7 @@ async function main(): Promise<void> {
       };
       check("refused from its rows and columns alone, before it is loaded, when it is far over the limit", /^422 This workbook is too large .*\(9 cells by its rows and columns; the limit here is 3 filled cells\)/.test(await tooBig()));
       small.limit = 8; // nine cells hold something (three headers, six values): over, but not by enough to tell without loading
-      check("and refused after counting when it is just over", /^422 This workbook is too large .*\(9 filled cells; the limit here is 8 filled cells\)/.test(await tooBig()));
+      check("and refused after counting when it is just over", /^422 This workbook is too large .*\(9 filled cells, 0 of them formulas, which count for more; the limit here is 8 filled cells\)/.test(await tooBig()));
       small.limit = 9;
       check("a workbook at the limit is filled", (await tooBig()) === "");
     } finally {
@@ -422,7 +422,7 @@ async function main(): Promise<void> {
     const spill = await fillOf(await crafted("spill", (zip) => change(zip, "xl/worksheets/sheet2.xml", '<c r="B2"', '<c r="B2" cm="1"')));
     check("a formula that spills is not copied: refused before the workbook is loaded", spill.status === 422 && /cannot carry: a formula that spills into the cells around it \(Calc!B2\)\. Nothing was saved\. Build a new workbook/.test(spill.message));
     const constant = await fillOf(await crafted("constant", (zip) => change(zip, "xl/workbook.xml", "</sheets>", '</sheets><definedNames><definedName name="Rate">0.12</definedName></definedNames>')));
-    check("a name the copy would lose is found by comparing the files", constant.status === 422 && /would not keep its formulas as they are, so it was not kept: the name "Rate" \(0\.12\) is not in the copy/.test(constant.message));
+    check("a name that is a constant, which the copy would drop, is refused before the workbook is loaded", constant.status === 422 && /cannot carry: the name "Rate" \(0\.12\), which is not a plain range of cells/.test(constant.message));
     const twoScopes = await fillOf(await crafted("scopes", (zip) => change(zip, "xl/workbook.xml", "</sheets>", '</sheets><definedNames><definedName name="Local" localSheetId="0">Data!$B$2</definedName><definedName name="Local" localSheetId="1">Calc!$B$2</definedName></definedNames>')));
     check("a name two sheets each define for themselves is refused", twoScopes.status === 422 && /the name "Local", which more than one sheet defines for itself/.test(twoScopes.message));
     const linked = await fillOf(
@@ -457,6 +457,72 @@ async function main(): Promise<void> {
     const diffs = formulaDifferences(fa, fb, new Map([["Calc", new Set(["Z9"])]]), new Map());
     check("a changed formula and a lost one are both named; a cell an op wrote is not held to the original", diffs.length === 2 && /the formula at Calc!B2 reads "=Data!B2\*2" in the original and "=Data!B2\*3" in the copy/.test(diffs.join(" ")) && /Calc!B3 holds a formula in the original/.test(diffs.join(" ")));
     check("a cell that was to keep a formula of its own must hold one", formulaDifferences(fa, fb, new Map(), new Map([["Calc", new Set(["B3"])]])).some((d) => /Calc!B3 was to keep its formula and holds none/.test(d)) && fa.formulas === 5);
+
+    // 20. Found by a fifth review: more that a copy does not carry, and what it may leave behind with a note.
+    const withNames = (names: string) => (zip: JSZip) => change(zip, "xl/workbook.xml", "</sheets>", `</sheets><definedNames>${names}</definedNames>`);
+    const linkedOut = await fillOf(await crafted("external", (zip) => void zip.file("xl/externalLinks/externalLink1.xml", "<externalLink/>")));
+    check("a workbook that reads figures from another workbook is refused", linkedOut.status === 422 && /cannot carry: links to other workbooks, which its formulas read figures through/.test(linkedOut.message));
+    const asShown = await fillOf(await crafted("asshown", (zip) => change(zip, "xl/workbook.xml", "<calcPr ", '<calcPr fullPrecision="0" ')));
+    check('"precision as displayed" is refused: it changes what a figure is', asShown.status === 422 && /cannot carry: the setting "precision as displayed"/.test(asShown.message));
+    const circular = await fillOf(await crafted("iterate", (zip) => change(zip, "xl/workbook.xml", "<calcPr ", '<calcPr iterate="1" ')));
+    check("iterative calculation is refused", circular.status === 422 && /cannot carry: iterative calculation/.test(circular.message));
+    const wholeColumn = await fillOf(await crafted("wholecol", withNames('<definedName name="Codes">Data!$A:$A</definedName>')));
+    check("a name for a whole column is refused before the workbook is loaded", wholeColumn.status === 422 && /cannot carry: the name "Codes" \(Data!\$A:\$A\), which is not a plain range of cells/.test(wholeColumn.message));
+    check("a name that is already dead has nothing to lose", (await fillOf(await crafted("dead", withNames('<definedName name="Old">#REF!</definedName><definedName name="Older">Data!#REF!</definedName>')))).message === "");
+    const solverId = await crafted("solver", withNames('<definedName name="solver_adj" hidden="1">Data!$B$2</definedName><definedName name="solver_opt" hidden="1">0.5</definedName>'));
+    const solver = await store.renderXlsx({ title: "solver", base: { fileId: solverId }, ops: [{ op: "fill_by_key", sheet: "Data", key: { sheet: "CODE", data: "c" }, set: { SOLD: "q" }, source: { rows: [{ c: "A-1", q: 5 }] } }] }, requester);
+    check("hidden names are left behind with a note, not a refusal", (solver.manifest.notes ?? []).some((n) => /original workbook has 2 hidden names .*They are not carried into this copy/.test(n)));
+    // What Excel keeps for itself, and a sheet name that needs quotes, are no obstacle.
+    const ordinary = new ExcelJS.Workbook();
+    const od = ordinary.addWorksheet("My Data");
+    od.addRows([["CODE", "SOLD"], ["A-1", null], ["A-2", null]]);
+    od.autoFilter = "A1:B3";
+    od.pageSetup.printArea = "A1:B3";
+    ordinary.definedNames.add("'My Data'!$B$2:$B$3", "Sold");
+    const ordinaryUp = await store.ingest("ordinary.xlsx", Buffer.from(await ordinary.xlsx.writeBuffer()), requester, { pinned: true });
+    const ordinaryOut = await failure({ title: "ordinary", base: { fileId: ordinaryUp.fileId }, ops: [{ op: "fill_by_key", sheet: "My Data", key: { sheet: "CODE", data: "c" }, set: { SOLD: "q" }, source: { rows: [{ c: "A-1", q: 5 }, { c: "A-2", q: 6 }] } }] });
+    check("a filter, a print area and a name on a sheet whose name needs quotes are carried", ordinaryOut.message === "");
+    const excelsOwn = await fillOf(await crafted("printtitles", withNames('<definedName name="_xlnm.Print_Titles" localSheetId="0">Data!$1:$1</definedName><definedName name="Sold">\'Data\'!$B$2:$B$3</definedName>')));
+    check("rows to repeat on each printed page, and a sheet name written in quotes it does not need, are no obstacle", excelsOwn.message === "");
+
+    // Formulas weigh more than values against the size limit.
+    const dir4 = await mkdtemp(SCRATCH_PREFIX);
+    try {
+      const heavy = new SmallHost({ enabled: true, dir: dir4 });
+      await heavy.init();
+      const hw = new ExcelJS.Workbook();
+      const hs = hw.addWorksheet("Items");
+      hs.addRows([["CODE", "SOLD", "TWICE"], ["A", null], ["B", null], ["C", null]]);
+      for (const r of [2, 3, 4]) hs.getCell(`C${r}`).value = { formula: `B${r}*2`, result: 0 };
+      const heavyUp = await heavy.ingest("heavy.xlsx", Buffer.from(await hw.xlsx.writeBuffer()), requester, { pinned: true });
+      const tryFill = async () => {
+        try {
+          await heavy.renderXlsx({ title: "x", base: { fileId: heavyUp.fileId }, ops: [{ op: "fill_by_key", sheet: "Items", key: { sheet: "CODE", data: "c" }, set: { SOLD: "q" }, source: { rows: [{ c: "A", q: 1 }] } }] }, requester);
+          return "";
+        } catch (e) {
+          return `${(e as FileStoreError).statusCode} ${(e as Error).message}`;
+        }
+      };
+      heavy.limit = 13; // nine filled cells, three of them formulas: 9 + 3 × 1.5, rounded, is 14
+      check("three formulas among nine cells put a workbook over a limit of thirteen", /^422 This workbook is too large .*\(9 filled cells, 3 of them formulas, which count for more; the limit here is 13 filled cells\)/.test(await tryFill()));
+      heavy.limit = 14;
+      check("and not over a limit of fourteen", (await tryFill()) === "");
+    } finally {
+      await rm(dir4, { recursive: true, force: true });
+    }
+
+    // The comparison itself, and the reading of the XML, where a slip would let a difference through.
+    const base2 = { sheets: new Map([["A", new Map([["B1", "=1"]])], ["B", new Map<string, string>()]]), names: new Map([["One", "A!$A$1"], ["Two", "A!$A$2"]]), cannotCarry: [], notes: [], formulas: 1 };
+    const copy2 = { sheets: new Map([["A", new Map([["B1", "=1"], ["C1", "=2"]])]]), names: new Map([["One", "A!$A$1"], ["Two", "A!$A$3"]]), cannotCarry: [], notes: [], formulas: 2 };
+    const d2 = formulaDifferences(base2, copy2, new Map(), new Map()).join(" | ");
+    check("a formula only the copy has, a sheet the copy lacks and a second name that changed are each named", /A!C1 holds a formula in the copy \(=2\) that the original does not have/.test(d2) && /sheet "B" is not in the copy/.test(d2) && /the name "Two" refers to "A!\$A\$2" in the original and to "A!\$A\$3" in the copy/.test(d2) && !/"One"/.test(d2));
+    const stray: string[] = [];
+    const odd = formulasInSheetXml(
+      '<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c><c nr="Q9" r="B1"><f>A1&#38;&#34;x&#34;&#x41;\r\n+1</f></c><c r="C1"><v>2</v></c></row></sheetData><extLst><ext><f>Z9</f></ext></extLst></worksheet>',
+      "S",
+      stray,
+    );
+    check("a formula outside any cell belongs to none; an attribute is read by its whole name; character references are decoded; a line break is one thing", JSON.stringify([...odd]) === JSON.stringify([["B1", '=A1&"x"A\n+1']]));
 
     console.log(`\n✓ render-store: ${passed} checks passed`);
   } finally {

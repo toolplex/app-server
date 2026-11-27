@@ -1361,6 +1361,10 @@ export class FileStore {
         // carry is refused here, before the workbook is loaded at all.
         const NEW_WORKBOOK = "Build a new workbook that lists each key with its figures instead, and tell the user why their own file could not be written into.";
         const baseFormulas = await formulasInFile(baseFile);
+        // Formulas that read another workbook keep their text in a copy, but
+        // the link itself and the figures last read through it do not.
+        if (parts.some((f) => f.startsWith("xl/externalLinks/"))) baseFormulas.cannotCarry.push("links to other workbooks, which its formulas read figures through");
+        notes.push(...baseFormulas.notes);
         if (baseFormulas.cannotCarry.length > 0) {
           const what = [...new Set(baseFormulas.cannotCarry)];
           throw new FileStoreError(422, `This workbook holds what a copy made here cannot carry: ${what.slice(0, 4).join("; ")}${what.length > 4 ? "; …" : ""}. Nothing was saved. ${NEW_WORKBOOK}`);
@@ -1369,7 +1373,9 @@ export class FileStore {
         await wb.xlsx.readFile(xlsxPath);
         // The base exactly as it was loaded: nothing is rewritten before an op asks for it.
         const before = signaturesOf(wb);
-        if (before.cells > maxCells) throw tooLarge(`${before.cells.toLocaleString("en-US")} filled cells`);
+        // A formula costs more memory than a value does (about two and a half times, measured).
+        const weighed = before.cells + Math.round(baseFormulas.formulas * 1.5);
+        if (weighed > maxCells) throw tooLarge(`${before.cells.toLocaleString("en-US")} filled cells, ${baseFormulas.formulas.toLocaleString("en-US")} of them formulas, which count for more`);
         const done = applyOps(wb, ops);
         // A total over the cells just filled must not go on showing its old figure.
         if (dropFormulaResults(wb) > 0) {
