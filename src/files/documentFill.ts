@@ -1349,9 +1349,9 @@ export function appendByHeader(ws: ExcelJS.Worksheet, rows: Record<string, unkno
     return { count, filled, main, figures: count.number + count.date >= 2 && main !== "text" && count.text <= Math.max(1, Math.floor(filled / 5)) };
   });
   for (const r of tableRows) {
-    // (The row directly under the headers is this table's own: units, "(pcs)" and "(PHP)", or
-    // sub-headings. It is shown as a sign, not refused.)
-    if (r === headBottom + 1) continue;
+    // (This also refuses a table that keeps a row of units, "(pcs)" and "(PHP)", under its headers:
+    // read by its cells, that row is another table's headings directly below ours, and rows have
+    // been written under such a table when it was only asked about.)
     const f = figuresAt();
     // (Headings differ from one another. The same word under each column, "closed" and "closed", is
     // a day with no figures: that is a sign, and asked about.)

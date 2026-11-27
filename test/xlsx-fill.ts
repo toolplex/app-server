@@ -1312,10 +1312,9 @@ async function main(): Promise<void> {
 
       // Words under every column of figures: headings when they differ, a day without figures when they are the same word.
       refused("another table's headings under two columns of figures", sheetOf([["Item", "Qty", "Amount"], ["a", 3, 30], ["b", 4, 41], ["c", 5, 52], ["Region", "Target", "Actual"], ["North", 10, 12]]), one([{ Item: "d", Qty: 1, Amount: 2 }]), /holds words under every column of figures on row 5 \(A5 "Region", B5 "Target", C5 "Actual"\): it reads like another table's headings/);
-      const units = sheetOf([["Item", "Qty", "Amount"], [null, "(pcs)", "(PHP)"], ["a", 4, 10], ["b", 2, 25], ["c", 7, 31]]);
-      refused("a row of units directly under the headers is the table's own, and shown", units, one([{ Item: "d", Qty: 1, Amount: 2 }]), /Signs that row 5 may not be an ordinary row of the table under those headers: row 2 \(B2 "\(pcs\)", C2 "\(PHP\)"\) holds words under "Qty", a column of figures: another table's headings, a note, or only an odd value\. Read them/);
-      applyOps(units, [{ ...one([{ Item: "d", Qty: 1, Amount: 2 }])[0], afterRow: 5 }]);
-      check("and such a table takes rows once its last row is confirmed", units.getWorksheet("S")!.getCell("C6").value === 2);
+      // A row of units under the headers cannot be told from another table's headings directly below ours: refused, the safe way round.
+      refused("a row of units directly under the headers", sheetOf([["Item", "Qty", "Amount"], [null, "(pcs)", "(PHP)"], ["a", 4, 10], ["b", 2, 25], ["c", 7, 31]]), one([{ Item: "d", Qty: 1, Amount: 2 }]), /holds words under every column of figures on row 2 \(B2 "\(pcs\)", C2 "\(PHP\)"\): it reads like another table's headings/);
+      refused("another table's headings directly under ours", sheetOf([["Item", "Qty", "Amount"], ["Region", "Target", "Actual"], ["North", 4, 10], ["South", 2, 25], ["East", 7, 31]]), one([{ Item: "d", Qty: 1, Amount: 2 }]), /holds words under every column of figures on row 2 \(A2 "Region", B2 "Target", C2 "Actual"\): it reads like another table's headings/);
       const shut = sheetOf([["Day", "Qty", "Amount"], ["Mon", 3, 30], ["Tue", "closed", "closed"], ["Wed", 5, 52], ["Thu", 6, 61]]);
       refused("a day with the same word under each column of figures", shut, one([{ Day: "Fri", Qty: 1, Amount: 2 }]), /Signs that row 5 may not be an ordinary row of the table under those headers: row 3 \(A3 "Tue", B3 "closed", C3 "closed"\) holds words under "Qty", a column of figures: another table's headings, a note, or only an odd value\. Read them/);
       applyOps(shut, [{ ...one([{ Day: "Fri", Qty: 1, Amount: 2 }])[0], afterRow: 5 }]);
@@ -1326,6 +1325,7 @@ async function main(): Promise<void> {
       refused("another table's headings among rows that hold an odd word", busy, one([{ Item: "z", Amount: 1 }]), /under those headers: row 17 \(A17 "Region", B17 "Sales"\) holds words under "Amount", a column of figures: another table's headings, a note, or only an odd value; row 11 \(A11 "j", B11 "pending"\) holds words under "Amount"[^;]*; row 10 \(A10 "i", B10 "pending"\) holds words under "Amount"[^;]*; 4 more rows hold words under a column of figures or dates \(rows 3, 4, 5, 9\)\. Read them/);
       const shared = sheetOf([["Item", "Amount"], ["a", 1], ["b", 2], ["Region", "Sales"], ["North", "high"], ["South", "low"], ["East", "low"]]);
       refused("the same when the figure to add arrives as text", shared, one([{ Item: "z", Amount: "20" }]), /the rows under "Amount" hold words on 4 rows and figures or dates on 2/);
+      refused("or as a date in text", shared, one([{ Item: "z", Amount: "2026-11-04" }]), /the rows under "Amount" hold words on 4 rows and figures or dates on 2/);
       refused("a column to take figures that holds more words than figures", shared, one([{ Item: "z", Amount: 1 }]), /under those headers: the rows under "Amount" hold words on 4 rows and figures or dates on 2: more than one table may lie under those headers\. Read them/);
 
       // A hidden last row is said to be hidden; a long row is said to be cut.
