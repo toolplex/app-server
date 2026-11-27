@@ -43,6 +43,7 @@ import {
 } from "./documents.js";
 import JSZip from "jszip";
 import { compareWithBase, dropFormulaResults, signaturesOf } from "./documentFill.js";
+import { formulaDifferences, formulasInFile } from "./workbookFormulas.js";
 import { resolveDocumentMime, extractDocumentText } from "./textExtract.js";
 
 
@@ -1349,10 +1350,20 @@ export class FileStore {
         // A copy made with this library keeps cell content, styles, formulas
         // and layout. It does not keep charts or pivot tables; whoever gets
         // the copy has to be told when the original had them.
-        const parts = Object.keys((await JSZip.loadAsync(await readFile(baseRec.uploadPath))).files);
+        const baseFile = await readFile(baseRec.uploadPath);
+        const parts = Object.keys((await JSZip.loadAsync(baseFile)).files);
         const lost = [parts.some((f) => f.startsWith("xl/charts/")) ? "charts" : "", parts.some((f) => f.startsWith("xl/pivotTables/")) ? "pivot tables" : ""].filter(Boolean);
         if (lost.length > 0) {
           notes.push(`The original workbook has ${lost.join(" and ")}. They are not carried into this copy: tell the user, who may want the figures pasted into the original instead.`);
+        }
+        // The original's formulas and names, read from the file itself, to hold
+        // the copy to. What the library that makes the copy is known not to
+        // carry is refused here, before the workbook is loaded at all.
+        const NEW_WORKBOOK = "Build a new workbook that lists each key with its figures instead, and tell the user why their own file could not be written into.";
+        const baseFormulas = await formulasInFile(baseFile);
+        if (baseFormulas.cannotCarry.length > 0) {
+          const what = [...new Set(baseFormulas.cannotCarry)];
+          throw new FileStoreError(422, `This workbook holds what a copy made here cannot carry: ${what.slice(0, 4).join("; ")}${what.length > 4 ? "; …" : ""}. Nothing was saved. ${NEW_WORKBOOK}`);
         }
         let wb: ExcelJS.Workbook | null = new ExcelJS.Workbook();
         await wb.xlsx.readFile(xlsxPath);
@@ -1374,6 +1385,15 @@ export class FileStore {
         const wrong = compareWithBase(before.sheets, saved, done.written);
         if (wrong.length > 0) {
           throw new FileStoreError(500, `The workbook did not save as it was written, so it was not kept: ${wrong.join("; ")}.`);
+        }
+        // And the two files as files: every formula and every name of the
+        // original is in the copy unchanged, outside the cells an op wrote.
+        // This is what catches a change the library made on its own, which
+        // reading the copy back through the same library cannot see.
+        const touched = new Map([...done.written].map(([sheet, cells]) => [sheet, new Set(cells.keys())] as const));
+        const differ = formulaDifferences(baseFormulas, await formulasInFile(await readFile(xlsxPath)), touched, done.released);
+        if (differ.length > 0) {
+          throw new FileStoreError(422, `A copy of this workbook made here would not keep its formulas as they are, so it was not kept: ${differ.join("; ")}. Nothing was saved. ${NEW_WORKBOOK}`);
         }
         report = done.reports;
       } else {
@@ -2223,7 +2243,9 @@ function cellDisplayText(cell: ExcelJS.Cell): string {
     if (o.result !== undefined && o.result !== null && typeof o.result !== "object") return String(o.result);
   }
   try {
-    return cell.text ?? "";
+    // Not always text: a cell that is a link over a number gives the number,
+    // and a workbook with one such cell could not be taken in at all.
+    return String(cell.text ?? "");
   } catch {
     return typeof v === "object" ? "" : String(v);
   }

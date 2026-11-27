@@ -307,9 +307,14 @@ export function buildWorkbook(
  * throws DocOpError; the workbook in memory may then be part-written and is
  * to be thrown away, not saved.
  */
-export function applyOps(wb: ExcelJS.Workbook, ops: ResolvedOp[]): { reports: OpReport[]; written: Map<string, Written> } {
+export function applyOps(wb: ExcelJS.Workbook, ops: ResolvedOp[]): { reports: OpReport[]; written: Map<string, Written>; released: Map<string, Set<string>> } {
   const reports: OpReport[] = [];
   const written = new Map<string, Written>();
+  // Cells that were given their own formula because the first cell of their filled-down formula was written.
+  const released = new Map<string, Set<string>>();
+  const freed = (sheet: string, cells: string[]) => {
+    if (cells.length > 0) released.set(sheet, new Set([...(released.get(sheet) ?? []), ...cells]));
+  };
   const record = (sheet: string, cells: Written) => {
     const have = written.get(sheet) ?? new Map();
     for (const [address, value] of cells) have.set(address, value);
@@ -328,6 +333,7 @@ export function applyOps(wb: ExcelJS.Workbook, ops: ResolvedOp[]): { reports: Op
         const ws = sheetOrThrow(wb, op.sheet);
         const done = fillByKey(ws, op);
         record(ws.name, done.written);
+        freed(ws.name, done.released);
         reports.push(done.report);
         break;
       }
@@ -335,6 +341,7 @@ export function applyOps(wb: ExcelJS.Workbook, ops: ResolvedOp[]): { reports: Op
         const ws = sheetOrThrow(wb, op.sheet);
         const done = populateBlock(ws, { startCell: op.startCell, columns: op.columns?.map((c) => c.key), overwrite: op.overwrite, rows: op.rows });
         record(ws.name, done.written);
+        freed(ws.name, done.released);
         reports.push(done.report);
         break;
       }
@@ -359,7 +366,7 @@ export function applyOps(wb: ExcelJS.Workbook, ops: ResolvedOp[]): { reports: Op
             `set_cell: ${cell.address} on sheet "${ws.name}" is the first cell of a filled-down formula, and the cells that take their formula from it cannot safely be given their own here (it names another sheet, a name, text in quotes or a whole column). Nothing was written. Leave that cell to the sheet, or write every cell that shares the formula.`,
           );
         }
-        releaseSharedFormulas(ws, one);
+        freed(ws.name, releaseSharedFormulas(ws, one));
         cell.value = value;
         record(ws.name, new Map([[cell.address, value]]));
         reports.push({ op: op.op, sheet: ws.name, range: cell.address, cellsWritten: 1 });
@@ -372,7 +379,7 @@ export function applyOps(wb: ExcelJS.Workbook, ops: ResolvedOp[]): { reports: Op
       }
     }
   }
-  return { reports, written };
+  return { reports, written, released };
 }
 
 // ---------------------------------------------------------------------------

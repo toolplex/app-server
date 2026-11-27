@@ -15,6 +15,7 @@ import ExcelJS from "exceljs";
 import JSZip from "jszip";
 
 import { FileStore, FileStoreError, numbersFromText, plainNumbersFromText } from "../src/files/store.js";
+import { formulaDifferences, formulasInFile, formulasInSheetXml } from "../src/files/workbookFormulas.js";
 
 // The store refuses a dir under the OS temp dir (data-durability guard), so the
 // test scratch lives under cwd (the repo tree) and is removed in `finally`.
@@ -394,6 +395,68 @@ async function main(): Promise<void> {
     const emptyRows = await failure({ title: "x", base: { fileId: dup.fileId }, ops: [{ op: "fill_by_key", sheet: "Items", sharedKeys: "fill_each", key: { sheet: "CODE", data: "c" }, set: { SOLD: "q" }, rows: null, source: { rows: [{ c: "A-1", q: 1 }] } } as never] });
     check('an empty "rows" on an op does not stand in for its source', emptyRows.message === "");
     void smuggled;
+
+    // 19. Found by a fourth review: the library that makes the copy changes or drops what it does not model,
+    // on sheets no op touches, and cannot be asked whether it did. The copy is held to the original as a file.
+    const crafted = async (name: string, edit?: (zip: JSZip) => Promise<void> | void) => {
+      const wb = new ExcelJS.Workbook();
+      wb.addWorksheet("Data").addRows([["CODE", "SOLD"], ["A-1", null], ["A-2", null]]);
+      const calc = wb.addWorksheet("Calc");
+      calc.addRows([["x", "double"], [1], [2], [3]]);
+      calc.getCell("B2").value = { formula: "Data!B2*2", result: 0 };
+      calc.getCell("B3").value = { formula: "Data!B3*2", result: 0 };
+      calc.fillFormula("C2:C4", 'IF(A2>1,"hi","lo")', ["lo", "hi", "hi"]);
+      const zip = await JSZip.loadAsync(await wb.xlsx.writeBuffer());
+      await edit?.(zip);
+      return (await store.ingest(`${name}.xlsx`, await zip.generateAsync({ type: "nodebuffer" }), requester, { pinned: true })).fileId;
+    };
+    const change = async (zip: JSZip, path: string, from: string | RegExp, to: string) => {
+      const before = await zip.file(path)!.async("string");
+      const after = before.replace(from, to);
+      assert.notStrictEqual(after, before, `the test's edit of ${path} changed nothing`);
+      zip.file(path, after);
+    };
+    const fillOf = (fileId: string) => failure({ title: "held to the original", base: { fileId }, ops: [{ op: "fill_by_key", sheet: "Data", key: { sheet: "CODE", data: "c" }, set: { SOLD: "q" }, source: { rows: [{ c: "A-1", q: 5 }, { c: "A-2", q: 6 }] } }] });
+    check("a workbook the copy carries whole is filled", (await fillOf(await crafted("whole"))).message === "");
+    check("with a name for a range, too", (await fillOf(await crafted("named", (zip) => change(zip, "xl/workbook.xml", "</sheets>", '</sheets><definedNames><definedName name="Sold">Data!$B$2:$B$3</definedName></definedNames>')))).message === "");
+    const spill = await fillOf(await crafted("spill", (zip) => change(zip, "xl/worksheets/sheet2.xml", '<c r="B2"', '<c r="B2" cm="1"')));
+    check("a formula that spills is not copied: refused before the workbook is loaded", spill.status === 422 && /cannot carry: a formula that spills into the cells around it \(Calc!B2\)\. Nothing was saved\. Build a new workbook/.test(spill.message));
+    const constant = await fillOf(await crafted("constant", (zip) => change(zip, "xl/workbook.xml", "</sheets>", '</sheets><definedNames><definedName name="Rate">0.12</definedName></definedNames>')));
+    check("a name the copy would lose is found by comparing the files", constant.status === 422 && /would not keep its formulas as they are, so it was not kept: the name "Rate" \(0\.12\) is not in the copy/.test(constant.message));
+    const twoScopes = await fillOf(await crafted("scopes", (zip) => change(zip, "xl/workbook.xml", "</sheets>", '</sheets><definedNames><definedName name="Local" localSheetId="0">Data!$B$2</definedName><definedName name="Local" localSheetId="1">Calc!$B$2</definedName></definedNames>')));
+    check("a name two sheets each define for themselves is refused", twoScopes.status === 422 && /the name "Local", which more than one sheet defines for itself/.test(twoScopes.message));
+    const linked = await fillOf(
+      await crafted("linked", async (zip) => {
+        await change(zip, "xl/worksheets/sheet2.xml", "</sheetData>", '</sheetData><hyperlinks><hyperlink ref="B2" r:id="rId77"/></hyperlinks>');
+        zip.file("xl/worksheets/_rels/sheet2.xml.rels", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId77" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com/" TargetMode="External"/></Relationships>');
+      }),
+    );
+    check("a formula on a cell that is also a link, which the copy would save as a value, is found the same way", linked.status === 422 && /Calc!B2 holds a formula in the original \(=Data!B2\*2\) and none in the copy/.test(linked.message));
+
+    // The reading of a sheet's formulas from its XML.
+    const lost: string[] = [];
+    const read = formulasInSheetXml(
+      '<worksheet><sheetData><row r="1"><c r="A1" s="1"/><c r="B1"><f>A1&amp;&quot;x&quot;</f><v>1</v></c><c r="C1" t="s"><v>0</v></c></row>' +
+        '<row r="2"><c r="A2"><f t="shared" ref="A2:A4" si="0">B2*2</f></c><c r="B2"><f t="array" ref="B2:B3">C2:C3*2</f></c></row><row r="3"><c r="A3"><f t="shared" si="0"/></c></row></sheetData>' +
+        '<conditionalFormatting sqref="A1"><cfRule type="expression"><formula>A1&gt;1</formula></cfRule></conditionalFormatting><dataValidations><dataValidation><formula1>Z1</formula1></dataValidation></dataValidations></worksheet>',
+      "S",
+      lost,
+    );
+    check("formulas are read as they are written, and rules that are not cells are not", JSON.stringify([...read]) === JSON.stringify([["B1", '=A1&"x"'], ["A2", "first of A2:A4: =B2*2"], ["B2", "array over B2:B3: =C2:C3*2"], ["A3", "as A2"]]) && lost.length === 0);
+    formulasInSheetXml('<x:worksheet xmlns:x="m"><x:sheetData/></x:worksheet>', "P", lost);
+    check("a sheet written in a form that is not read is said, not passed", lost.length === 1 && /sheet "P" is written in a form/.test(lost[0]));
+    // (A workbook with a what-if data table does not get as far as being copied: it cannot be taken in at all.)
+    const tableLost: string[] = [];
+    formulasInSheetXml('<worksheet><sheetData><row r="3"><c r="B3"><f t="dataTable" ref="B3:B4" dt2D="0" dtr="0" r1="A1"/><v>1</v></c><c r="C3" cm="1"><f t="array" ref="C3:C5">SEQUENCE(3)</f></c></row></sheetData></worksheet>', "W", tableLost);
+    check("a what-if data table and a formula that spills are named as what a copy cannot carry", tableLost.join("; ") === "a what-if data table (W!B3); a formula that spills into the cells around it (W!C3)");
+    const fa = await formulasInFile(await readFile((await store.getBinaryInfo(await crafted("pair"), requester)).path));
+    const fb = { ...fa, sheets: new Map([...fa.sheets].map(([k, v]) => [k, new Map(v)])) };
+    fb.sheets.get("Calc")!.set("B2", "=Data!B2*3");
+    fb.sheets.get("Calc")!.delete("B3");
+    fb.sheets.get("Calc")!.set("Z9", "=1");
+    const diffs = formulaDifferences(fa, fb, new Map([["Calc", new Set(["Z9"])]]), new Map());
+    check("a changed formula and a lost one are both named; a cell an op wrote is not held to the original", diffs.length === 2 && /the formula at Calc!B2 reads "=Data!B2\*2" in the original and "=Data!B2\*3" in the copy/.test(diffs.join(" ")) && /Calc!B3 holds a formula in the original/.test(diffs.join(" ")));
+    check("a cell that was to keep a formula of its own must hold one", formulaDifferences(fa, fb, new Map(), new Map([["Calc", new Set(["B3"])]])).some((d) => /Calc!B3 was to keep its formula and holds none/.test(d)) && fa.formulas === 5);
 
     console.log(`\n✓ render-store: ${passed} checks passed`);
   } finally {

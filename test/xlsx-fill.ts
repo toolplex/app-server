@@ -140,17 +140,24 @@ async function main(): Promise<void> {
     // What matches and what does not is counted and named.
     {
       const wb = tracker();
-      const { reports } = applyOps(wb, [{ ...FILL, rows: [DATA[1], DATA[3], { code: "Z-999", sold: 9, on_hand: 9 }] }]);
+      const { reports } = applyOps(wb, [{ ...FILL, lastRow: 8, rows: [DATA[1], DATA[3], { code: "Z-999", sold: 9, on_hand: 9 }] }]);
       const r = reports[0];
       const ws = wb.getWorksheet("Items")!;
       check("matched rows are filled", ws.getCell("D4").value === 1 && ws.getCell("D5").value === 2);
+      // Without the table's last row said: an empty line, then rows the data has nothing for. Whether they
+      // belong to the table changes nothing here (they would be left as they are either way), so the
+      // reading goes on and they are counted as rows without data.
+      const open = applyOps(tracker(), [{ ...FILL, rows: [DATA[1], DATA[3]] }]).reports[0];
+      check("a gap with nothing of the data below it is read across", open.stoppedAtRow === undefined && open.lastRow === 9 && open.sheetRowsWithoutData === 2 && open.sheetKeysWithoutData?.join() === "B-300,B-400");
+      // The same sheet with rows without data to be given 0: now it matters, and it is asked.
+      refused("zeros for rows without data, across a gap", tracker(), [{ ...FILL, unmatched: "zero", rows: [DATA[1], DATA[3]] }], /Where the table under row 3 of sheet "Items" ends cannot be told.*Row 7 \(A7 "B-300", B7 "Polo", C7 "Navy"\) has an empty row above it, and no key the data has, and 2 rows with a key lie from there down, which would or would not be given 0/);
       check("a sheet row with no data is left as it was", ws.getCell("D7").value === null && ws.getCell("E8").value === null);
       check("sheet rows without data are counted and named", r.sheetRowsWithoutData === 2 && r.sheetKeysWithoutData?.join() === "B-300,B-400");
       check("data rows not in the sheet are counted and named", r.dataRowsNotInSheet === 1 && r.dataKeysNotInSheet?.join() === "Z-999");
     }
     {
       const wb = tracker();
-      applyOps(wb, [{ ...FILL, unmatched: "zero", rows: [DATA[1]] }]);
+      applyOps(wb, [{ ...FILL, lastRow: 8, unmatched: "zero", rows: [DATA[1]] }]);
       const ws = wb.getWorksheet("Items")!;
       check('"unmatched: zero" writes 0 where there is no data', ws.getCell("D5").value === 0 && ws.getCell("E8").value === 0 && ws.getCell("D4").value === 1);
       check('"unmatched: zero" leaves keyless rows alone', ws.getCell("D6").value === null);
@@ -255,7 +262,7 @@ async function main(): Promise<void> {
       const ws = wb.getWorksheet("Items")!;
       ws.getCell("A5").value = 12.5;
       ws.getCell("A7").value = { formula: 'A4&"x"' } as ExcelJS.CellValue;
-      const { reports } = applyOps(wb, [{ ...FILL, rows: DATA }]);
+      const { reports } = applyOps(wb, [{ ...FILL, lastRow: 8, rows: DATA }]);
       check("a key that is a decimal, or a formula with no stored result, is passed over and reported", ws.getCell("D5").value === null && ws.getCell("D7").value === null && ws.getCell("D4").value === 1 && reports[0].rowsWithUnreadableKey === 2 && /not whole/.test(reports[0].unreadableKeys![0]) && /formula with no stored result/.test(reports[0].unreadableKeys![1]));
     }
     {
@@ -471,7 +478,7 @@ async function main(): Promise<void> {
         return wb;
       };
       const wb = sheet();
-      const { reports } = applyOps(wb, [{ ...FILL, unmatched: "zero", overwrite: true, rows: [DATA[1]] }]);
+      const { reports } = applyOps(wb, [{ ...FILL, lastRow: 10, unmatched: "zero", overwrite: true, rows: [DATA[1]] }]);
       const ws = wb.getWorksheet("Items")!;
       check("totals keep their formulas", (ws.getCell("D9").value as ExcelJS.CellFormulaValue).formula === "SUM(D4:D8)" && (ws.getCell("E9").value as ExcelJS.CellFormulaValue).formula === "SUM(E4:E8)");
       check("a typed total is not turned into 0", ws.getCell("D10").value === 600);
@@ -488,7 +495,7 @@ async function main(): Promise<void> {
       check('by default rows without data are left as they were, and the report says "leave"', left.getWorksheet("Items")!.getCell("D5").value === 77 && left.getWorksheet("Items")!.getCell("E5").value === null && leftReport.unmatched === "leave" && leftReport.unmatchedCellsSet === undefined);
       // A row the data has, with no value for a column, is not a row without data: nothing is put there.
       const nulls = tracker();
-      const nr = applyOps(nulls, [{ ...FILL, unmatched: "zero", rows: [{ code: "A-100", sold: null, on_hand: 10 }] }]).reports[0];
+      const nr = applyOps(nulls, [{ ...FILL, lastRow: 8, unmatched: "zero", rows: [{ code: "A-100", sold: null, on_hand: 10 }] }]).reports[0];
       check("an empty value in a row the data has is not turned into 0", nulls.getWorksheet("Items")!.getCell("D4").value === null && nulls.getWorksheet("Items")!.getCell("E4").value === 10 && nr.emptyValuesLeft === 1);
       refused("an option that does not exist", tracker(), [{ ...FILL, unmatched: "blank" as never, rows: DATA }], /"unmatched" is "leave" or "zero"/);
     }
@@ -667,17 +674,21 @@ async function main(): Promise<void> {
       };
       const three = [{ c: "A-1", q: 1 }, { c: "A-2", q: 2 }, { c: "B-2", q: 9 }];
       const sold = (extra: object, rows: object[]) => [{ op: "fill_by_key" as const, sheet: "S", key: { sheet: "CODE", data: "c" }, set: { SOLD: "q" }, ...extra, rows: rows as Record<string, unknown>[] }];
-      // A key of the data sits below the row of headings: which table it belongs to is asked, not guessed.
-      refused("a row of headings with the data's keys below it", stacked(), sold({}, three), /Row 6 of sheet "S" looks like the headings of another table \(A6 "ITEM", B6 "RETURNED"\), and 1 of the data's keys are found below it \(for example "B-2"\).*"lastRow": 5.*the sheet's last row with anything in it is 8/);
+      // A key of the data sits below an empty row and a title: which table it belongs to is asked, not guessed.
+      refused("a gap and a title with the data's keys below", stacked(), sold({}, three), /Where the table under row 1 of sheet "S" ends cannot be told from the sheet\. Row 5 \(A5 "Returns"\) has an empty row above it, and no key the data has, and 1 of the data's keys are found from there down \(for example "B-2"\).*"lastRow": 4 if another table, a note or a footer begins at row 5.*The sheet's last row with anything in it is 8: that is the answer only if every row down to it belongs to this one table/);
       const wb = stacked();
       const ws = wb.getWorksheet("S")!;
-      const { reports } = applyOps(wb, sold({ lastRow: 5 }, three));
+      const { reports } = applyOps(wb, sold({ lastRow: 4 }, three));
       check("a sold figure is never written under the other table's heading", ws.getCell("B8").value === null && ws.getCell("B7").value === 3 && ws.getCell("B2").value === 1 && ws.getCell("B3").value === 2);
-      check("told where the table ends, the fill reads to there and says so", reports[0].lastRow === 5 && reports[0].stoppedAtRow === undefined && reports[0].dataRowsNotInSheet === 1 && reports[0].sheetKeysWithoutData?.join() === "Returns");
-      // With none of the data's keys below, nothing is in doubt: the fill ends there and reports it.
+      check("told where the table ends, the fill reads to there and says what of the data lies beyond", reports[0].lastRow === 4 && reports[0].stoppedAtRow === undefined && reports[0].dataRowsNotInSheet === 1 && reports[0].dataKeysBelowLastRow === 1);
+      // Told wrongly that it is all one table, a header of this table's own key heading over other columns is still seen.
+      const sameKey = stacked();
+      sameKey.getWorksheet("S")!.getCell("A6").value = "CODE";
+      refused("another table's header inside the rows said to be one table", sameKey, sold({ lastRow: 8 }, three), /Row 6 of sheet "S" holds the key heading again over other column headings \(A6 "CODE", B6 "RETURNED"\): another table begins there, inside the rows said to be one table \("lastRow": 8\)\. Nothing was written\. Give "lastRow": 5/);
+      // With none of the data's keys below, nothing is in doubt: the title is read across, and the reading ends at the headings.
       const quiet = stacked();
       const q = applyOps(quiet, sold({}, three.slice(0, 2))).reports[0];
-      check("without keys below, the fill stops at the row of headings and says so", q.stoppedAtRow === 6 && q.stoppedBecause === "a row of headings" && q.dataKeysBelowStop === 0 && q.lastRow === 5 && quiet.getWorksheet("S")!.getCell("B8").value === null);
+      check("without keys below, the fill stops at what reads like headings and says so", q.stoppedAtRow === 6 && q.stoppedBecause === "what reads like column headings" && q.dataKeysBelowStop === 0 && q.lastRow === 5 && q.sheetKeysWithoutData?.join() === "Returns" && quiet.getWorksheet("S")!.getCell("B8").value === null);
       // The table below is filled by naming its own headers.
       applyOps(wb, [{ op: "fill_by_key", sheet: "S", key: { sheet: "ITEM", data: "c" }, set: { RETURNED: "q" }, rows: [{ c: "B-2", q: 4 }] }]);
       check("the second table is reached by its own headers", ws.getCell("B8").value === 4);
@@ -741,7 +752,7 @@ async function main(): Promise<void> {
       };
       const one = [{ Date: "d3", Qty: 3 }];
       refused("a total above the data", sheet("SUM(B4:B5)", "B1"), [{ op: "append_rows", sheet: "Log", rows: one }], /would not take in the rows to be added: B1 \(=SUM\(B4:B5\)\)/);
-      refused("a total followed by a line of text", sheet("SUM(B4:B5)", "B6", true), [{ op: "append_rows", sheet: "Log", rows: one }], /would not take in the rows to be added: B6/);
+      refused("a total followed by a line of text", sheet("SUM(B4:B5)", "B6", true), [{ op: "append_rows", sheet: "Log", rows: one }], /has an empty row \(row 7\) between its headers \(row 3\) and the last row that holds anything \(row 8: A8 "Prepared by: someone"\)/);
       const roomy = sheet("SUM(B4:B6)", "B1");
       applyOps(roomy, [{ op: "append_rows", sheet: "Log", rows: one }]);
       check("a total that reaches the new row lets it in", roomy.getWorksheet("Log")!.getCell("B6").value === 3);
@@ -983,21 +994,21 @@ async function main(): Promise<void> {
       through("words in one cell only", [null, null, "see note"]);
       through("a row the data has, though it holds words", ["A-9", "Cap, old line", "pending"], { overwrite: true }, [...two, { c: "A-9", q: 9 }]);
       // Words where the figure goes, nothing but words in the row, a key the data does not have, and keys below: asked.
-      refused("a unit row with the data's keys below it", table(["Accessories", "all sizes", "pcs"]), fill(), /Row 3 of sheet "S" looks like the headings of another table \(A3 "Accessories", B3 "all sizes", C3 "pcs"\).*if row 3 is an ordinary row and the table goes on, send it with "lastRow"/);
+      refused("a unit row with the data's keys below it", table(["Accessories", "all sizes", "pcs"]), fill(), /Row 3 \(A3 "Accessories", B3 "all sizes", C3 "pcs"\) has what reads like column headings, and 1 of the data's keys are found from there down.*if row 3 is only a label or an item the data has no row for and the table goes on/);
       const said = table(["Accessories", "all sizes", "pcs"]);
       const rs = applyOps(said, fill({ lastRow: 4 })).reports[0];
       check("told where the table ends, it is filled to there", said.getWorksheet("S")!.getCell("C4").value === 2 && rs.matched === 2 && rs.sheetKeysWithoutData?.join() === "Accessories" && rs.unmatchedValuesKept === 1);
       // Headings that carry a year or a date are headings still.
-      refused("headings with a year among them", table(["ITEM", 2026, "RETURNED"]), fill(), /Row 3 of sheet "S" looks like the headings of another table/);
-      refused("headings with a date among them", table(["ITEM", new Date(Date.UTC(2026, 0, 1)), "RETURNED"]), fill(), /looks like the headings of another table/);
+      refused("headings with a year among them", table(["ITEM", 2026, "RETURNED"]), fill(), /Where the table under row 1 of sheet "S" ends cannot be told from the sheet\. Row 3 /);
+      refused("headings with a date among them", table(["ITEM", new Date(Date.UTC(2026, 0, 1)), "RETURNED"]), fill(), /ends cannot be told from the sheet\. Row 3 /);
       // This table's own column headings under another key heading.
-      refused("the same column headings under another key heading", table(["ITEM", "Name", "SOLD", "STATUS"]), fill(), /Row 3 of sheet "S" looks like the headings of another table/);
+      refused("the same column headings under another key heading", table(["ITEM", "Name", "SOLD", "STATUS"]), fill(), /Row 3 \(A3 "ITEM", B3 "Name", C3 "SOLD", D3 "STATUS"\) has this table's column headings again, under another key heading/);
       // A fill of words only: nothing can be judged by figures, but the table's own headings still show.
-      refused("a fill of words meeting the same column headings under another key heading", table(["ITEM", "Name", "SOLD", "STATUS"]), [{ ...fill()[0], set: { STATUS: "s" }, rows: [{ c: "A-1", s: "ok" }, { c: "A-2", s: "late" }] }], /Row 3 of sheet "S" looks like the headings of another table/);
+      refused("a fill of words meeting the same column headings under another key heading", table(["ITEM", "Name", "SOLD", "STATUS"]), [{ ...fill()[0], set: { STATUS: "s" }, rows: [{ c: "A-1", s: "ok" }, { c: "A-2", s: "late" }] }], /Where the table under row 1 of sheet "S" ends cannot be told from the sheet\. Row 3 /);
       // A fill of a figure and of words: the figure column is the one that is judged.
-      refused("a figure column and a column of words", table(["ITEM", "Name", "RETURNED", "REASON"]), [{ ...fill()[0], set: { SOLD: "q", STATUS: "s" }, rows: [{ c: "A-1", q: 1, s: "ok" }, { c: "A-2", q: 2, s: "late" }] }], /looks like the headings of another table/);
+      refused("a figure column and a column of words", table(["ITEM", "Name", "RETURNED", "REASON"]), [{ ...fill()[0], set: { SOLD: "q", STATUS: "s" }, rows: [{ c: "A-1", q: 1, s: "ok" }, { c: "A-2", q: 2, s: "late" }] }], /ends cannot be told from the sheet\. Row 3 /);
       // Rows without data to be given 0 are figures too, even when the data's own column is empty.
-      refused("zeros for rows without data would land under another heading", table(["ITEM", "Name", "RETURNED"]), fill({ unmatched: "zero" }, [{ c: "A-1", q: null }, { c: "A-2", q: null }]), /looks like the headings of another table/);
+      refused("zeros for rows without data would land under another heading", table(["ITEM", "Name", "RETURNED"]), fill({ unmatched: "zero" }, [{ c: "A-1", q: null }, { c: "A-2", q: null }]), /ends cannot be told from the sheet\. Row 3 /);
       // A merged cell in a row without data is not given a 0.
       const merged = table(["A-9", "Cap"], (ws) => ws.mergeCells("C3:D3"));
       const rm = applyOps(merged, fill({ unmatched: "zero" })).reports[0];
@@ -1090,6 +1101,132 @@ async function main(): Promise<void> {
         refused(`a formula that reads elsewhere is the row's own: ${f}`, beside(f), block, /already hold data in other columns \(C2\).*If nothing in those rows identifies them, build a new workbook/);
       }
       check("what a formula reads, by sheet", readsColumns("Other!B2+C2", "T", 3, 3) && !readsColumns("Other!B2+C2", "T", 2, 2) && readsColumns("'T'!$B$2", "T", 2, 2) && !readsColumns("ATAN2(1,1)", "T", 1, 100));
+    }
+
+    // -----------------------------------------------------------------------
+    // Found by a fourth independent review. The answer to most of it is the
+    // same: where the sheet leaves a doubt that changes what would be written,
+    // nothing is written and the caller is asked.
+    // -----------------------------------------------------------------------
+    const sheetOf = (rows: unknown[][], more?: (ws: ExcelJS.Worksheet) => void) => {
+      const wb = new ExcelJS.Workbook();
+      const ws = wb.addWorksheet("S");
+      rows.forEach((r, i) => void (ws.getRow(i + 1).values = r));
+      more?.(ws);
+      return wb;
+    };
+    const byCode = (set: Record<string, string>, rows: object[], extra: object = {}) => [{ op: "fill_by_key" as const, sheet: "S", key: { sheet: "CODE", data: "c" }, set, ...extra, rows: rows as Record<string, unknown>[] }];
+
+    // Told that the sheet is one table, a second table's header inside it is still seen.
+    {
+      const two = () =>
+        sheetOf([["CODE", "QTY", "AMOUNT"], ["A"], ["North"], ["B"], [], ["CODE", "RETURNED", "REFUND"], ["D"], ["E"]], (ws) => ws.mergeCells("A3:C3"));
+      const data = [{ c: "A", q: 1, a: 10 }, { c: "B", q: 2, a: 20 }, { c: "D", q: 4, a: 40 }, { c: "E", q: 5, a: 50 }];
+      const set = { QTY: "q", AMOUNT: "a" };
+      const wb = two();
+      const r = applyOps(wb, byCode(set, data)).reports[0];
+      const ws = wb.getWorksheet("S")!;
+      check("a banner merged across the row does not end the table, and the key heading again does", ws.getCell("B4").value === 2 && ws.getCell("B7").value === null && r.stoppedAtRow === 6 && r.stoppedBecause === "the key heading again, over other column headings" && r.dataKeysBelowStop === 2);
+      refused("the whole sheet said to be one table", two(), byCode(set, data, { lastRow: 8 }), /Row 6 of sheet "S" holds the key heading again over other column headings \(A6 "CODE", B6 "RETURNED", C6 "REFUND"\): another table begins there.*Give "lastRow": 5 for the table under row 1, and fill the table that begins at row 6 with an op of its own \("headerRow": 6/);
+      const other = sheetOf([["CODE", "QTY"], ["A"], ["ITEM", "QTY"], ["D"]]);
+      refused("this table's headings under another key heading, inside the rows said to be one table", other, byCode({ QTY: "q" }, [{ c: "A", q: 1 }, { c: "D", q: 4 }], { lastRow: 4 }), /Row 3 of sheet "S" holds this table's column headings again under another key heading \(A3 "ITEM", B3 "QTY"\)/);
+      // Both tables filled in one request, each by its header row.
+      const both = two();
+      applyOps(both, [...byCode(set, data.slice(0, 2), { lastRow: 4 }), { op: "fill_by_key", sheet: "S", headerRow: 6, key: { sheet: "CODE", data: "c" }, set: { RETURNED: "q", REFUND: "a" }, rows: data.slice(2) }]);
+      check("two tables filled in one request, each under its own headings", both.getWorksheet("S")!.getCell("B4").value === 2 && both.getWorksheet("S")!.getCell("B7").value === 4 && both.getWorksheet("S")!.getCell("C8").value === 50);
+    }
+
+    // Another table that does not announce itself in words.
+    {
+      const set = { QTY: "q" };
+      const d = [{ c: "A", q: 1 }, { c: "X", q: 9 }];
+      const asked = /Where the table under row 1 of sheet "S" ends cannot be told from the sheet/;
+      refused('headings such as "Q1", directly below', sheetOf([["CODE", "QTY"], ["A"], ["ITEM", "Q1"], ["X"]]), byCode(set, d), asked);
+      refused("headings that are dates, directly below", sheetOf([["CODE", "QTY"], ["A"], ["ITEM", new Date(Date.UTC(2026, 0, 1))], ["X"]]), byCode(set, d), asked);
+      refused("headings that are years, after an empty row", sheetOf([["CODE", "QTY"], ["A"], [], ["Branch", 2025], ["X"]]), byCode(set, d), /Row 4 \(A4 "Branch", B4 "2025"\) has an empty row above it, and no key the data has/);
+      refused("a narrower table, after an empty row", sheetOf([["CODE", "NAME", "QTY"], ["A"], [], ["ITEM"], ["X"]]), byCode(set, d), asked);
+      refused("a fill of words, after an empty row", sheetOf([["CODE", "QTY"], ["A"], [], ["ITEM", "NOTE"], ["X"]]), byCode(set, [{ c: "A", q: "ok" }, { c: "X", q: "late" }]), asked);
+      refused("a first table with headers and no rows yet", sheetOf([["CODE", "QTY"], ["ITEM", "RETURNED"], ["X"]]), byCode(set, [{ c: "X", q: 9 }]), /Row 2 \(A2 "ITEM", B2 "RETURNED"\) has what reads like column headings/);
+      refused("zeros for rows without data, with another table's rows below a gap", sheetOf([["CODE", "QTY"], ["A"], [], ["ITEM", "RETURNED"], ["Z"]]), byCode(set, [{ c: "A", q: 1 }], { unmatched: "zero" }), /2 rows with a key lie from there down, which would or would not be given 0/);
+      // A key of the data written differently below the gap is a key of the data all the same.
+      refused("the data's key below a gap, as a number where the data has text", sheetOf([["CODE", "QTY"], ["A"], [], ["Returns"], [123]]), byCode(set, [{ c: "A", q: 1 }, { c: "00123", q: 9 }]), /1 of the data's keys are found from there down \(for example "123"\)/);
+      // What is plainly one table is not asked about.
+      const spaced = sheetOf([["CODE", "QTY"], ["A"], [], ["X"], [], ["Z", 7]]);
+      const rs = applyOps(spaced, byCode(set, d)).reports[0];
+      check("an empty line before a row the data has is read across", spaced.getWorksheet("S")!.getCell("B4").value === 9 && rs.stoppedAtRow === undefined && rs.sheetKeysWithoutData?.join() === "Z");
+      const partly = sheetOf([["CODE", "QTY", "AMT"], ["A"], ["X", "QTY", 5], ["Y"]]);
+      applyOps(partly, byCode({ QTY: "q", AMT: "a" }, [{ c: "A", q: 1, a: 2 }, { c: "Y", q: 3, a: 4 }]));
+      check("one heading of two repeated in a row with a figure is an ordinary row", partly.getWorksheet("S")!.getCell("B2").value === 1 && partly.getWorksheet("S")!.getCell("B4").value === 3);
+      const twice = sheetOf([["CODE", "QTY"], ["A"], ["TOTAL", 5], ["B"], ["TOTAL", 6]]);
+      applyOps(twice, byCode(set, [{ c: "A", q: 1 }, { c: "B", q: 2 }]));
+      check("a label on two rows that the data has nothing for is not a key in doubt", twice.getWorksheet("S")!.getCell("B4").value === 2 && twice.getWorksheet("S")!.getCell("B5").value === 6);
+      // Columns named by letter over empty header cells: nothing there to be repeated.
+      const bare = sheetOf([[null, "SOLD"], ["K1"], [null, 5], ["K2"]]);
+      applyOps(bare, [{ op: "fill_by_key", sheet: "S", key: { sheet: "column:A", data: "c" }, set: { SOLD: "q" }, rows: [{ c: "K1", q: 1 }, { c: "K2", q: 2 }] }]);
+      check("a key column with no heading: a row with no key is not the heading again", bare.getWorksheet("S")!.getCell("B4").value === 2);
+      const bare2 = sheetOf([["CODE"], ["K1"], ["ZZ"], ["K2"]]);
+      applyOps(bare2, byCode({ "column:B": "q" }, [{ c: "K1", q: 1 }, { c: "K2", q: 2 }]));
+      check("a column to fill with no heading: an empty cell is not its heading again", bare2.getWorksheet("S")!.getCell("B4").value === 2);
+    }
+
+    // The refusals that name a row to give back name the right one.
+    {
+      const stackedSame = sheetOf([["Title"], ["CODE", "QTY"], ["A"], ["CODE", "QTY"], ["D"]]);
+      refused("no key of the data in the first table", stackedSame, byCode({ QTY: "q" }, [{ c: "D", q: 4 }]), /No row of sheet "S" in rows 3–3 has a key found in the data.*row 4 has the same headers again, and 1 of the data's keys are found below it\. To fill the table that begins there, pass "headerRow": 4/);
+      const empty = sheetOf([["Title"], ["CODE", "QTY"], [null, "note"], ["CODE", "QTY"], ["D"]]);
+      refused("a first table with no rows", empty, byCode({ QTY: "q" }, [{ c: "D", q: 4 }]), /has no rows with a readable key under "CODE" in rows 3–3.*Row 4 has the same headers again, so the table under row 2 has no rows; if the table meant begins at row 4, pass "headerRow": 4/);
+      refused("a row of the table given as its header row", sheetOf([["CODE", "QTY"], ["A"], ["B"]]), [{ op: "fill_by_key", sheet: "S", headerRow: 2, key: { sheet: "column:A", data: "c" }, set: { "column:B": "q" }, rows: [{ c: "A", q: 1 }, { c: "B", q: 2 }] }], /Row 2 of sheet "S" holds a key the data has \("A"\): it is a row of the table, not the row of its headers/);
+      refused("a header row with one heading on two columns", sheetOf([["CODE", "QTY", "QTY"], ["A"]]), byCode({ QTY: "q" }, [{ c: "A", q: 1 }], { headerRow: 1 }), /"QTY" heads columns B and C/);
+      const far = sheetOf([["CODE", "SOLD QTY"], ["A"], [], [], [], ["CODE", "SOLD"], ["A"]]);
+      refused("the headers found far below a row that has some of them", far, byCode({ SOLD: "q" }, [{ c: "A", q: 1 }]), /has these headers on row 6, and some of them on row 1 above it, which lacks "SOLD" \(it holds: "CODE", "SOLD QTY"\)\. Which table is meant cannot be told\. For the table whose headers are on row 6, add "headerRow": 6/);
+      applyOps(far, byCode({ SOLD: "q" }, [{ c: "A", q: 1 }], { headerRow: 6 }));
+      check("and with the header row said, that table is filled", far.getWorksheet("S")!.getCell("B7").value === 1 && far.getWorksheet("S")!.getCell("B2").value === null);
+      // Merged headers of other shapes.
+      const target = sheetOf([["CODE", "TOTAL"], ["(code)", null], ["A"]], (ws) => ws.mergeCells("B1:B2"));
+      check("a column heading merged over two rows", applyOps(target, byCode({ TOTAL: "q" }, [{ c: "A", q: 1 }])).reports[0].firstRow === 3 && target.getWorksheet("S")!.getCell("B3").value === 1);
+      const three = sheetOf([["CODE", "QTY"], [], [], ["A"]], (ws) => ws.mergeCells("A1:A3"));
+      check("a key heading merged over three rows", applyOps(three, byCode({ QTY: "q" }, [{ c: "A", q: 1 }])).reports[0].firstRow === 4 && three.getWorksheet("S")!.getCell("B4").value === 1);
+    }
+
+    // A refresh in which the data has no value where the sheet has a figure.
+    {
+      const sheet = () => sheetOf([["CODE", "QTY", "AMT"], ["A", 7, 70], ["B", null, { formula: "B3*2" }]]);
+      const set = { QTY: "q", AMT: "a" };
+      refused("a refresh with no value for a cell that holds a figure", sheet(), byCode(set, [{ c: "A", q: null, a: 1 }], { overwrite: true }), /the data has no value \(NULL\) for 1 cell that hold a figure now \(for example B2, "QTY" of "A"\)\. They would keep the figure they hold, which in a refresh is the earlier period's\. Nothing was written\. Make the query give a value for them \(COALESCE\(x, 0\)/);
+      const kept = sheet();
+      const rk = applyOps(kept, byCode({ QTY: "q" }, [{ c: "A", q: null }, { c: "B", q: 2 }])).reports[0];
+      check("without overwrite, no value means the cell is left, and that is counted", kept.getWorksheet("S")!.getCell("B2").value === 7 && kept.getWorksheet("S")!.getCell("B3").value === 2 && rk.emptyValuesLeft === 1);
+      const over = sheet();
+      applyOps(over, byCode(set, [{ c: "B", q: null, a: null }, { c: "A", q: 1, a: 2 }], { overwrite: true }));
+      check("no value against an empty cell or a formula is nothing to ask about", over.getWorksheet("S")!.getCell("B2").value === 1 && (over.getWorksheet("S")!.getCell("C3").value as ExcelJS.CellFormulaValue).formula === "B3*2");
+    }
+
+    // append_rows: only at the foot of a table that plainly runs to the end of the sheet.
+    {
+      const one = (rows: object[]) => [{ op: "append_rows" as const, sheet: "S", rows: rows as Record<string, unknown>[] }];
+      refused("another table below an empty row", sheetOf([["CODE", "QTY"], ["A", 1], [], ["ITEM", "RETURNED"], ["X", 2]]), one([{ CODE: "B", QTY: 2 }]), /has an empty row \(row 3\) between its headers \(row 1\) and the last row that holds anything \(row 5: A5 "X", B5 "2"\)/);
+      refused("a footer directly below the rows", sheetOf([["CODE", "QTY"], ["A", 1], ["Prepared by: someone"]]), one([{ CODE: "B", QTY: 2 }]), /\(row 3: A3 "Prepared by: someone"\) has a value under at most one of the headers being filled: it reads like a note or a footer/);
+      const plain = sheetOf([["Report"], [], ["CODE", "QTY"], ["A", 1]], (ws) => void (ws.getCell("D1").value = { formula: "SUM(B1:B2)", result: 0 }));
+      plain.addWorksheet("Other").getCell("A1").value = { formula: "SUM(S!A4:B4)+SUM(Données!B4:B5)", result: 0 };
+      applyOps(plain, one([{ CODE: "B", QTY: 2 }]));
+      check("a table that runs to the end takes the rows; a range above its headers, or of one row read from another sheet, is no total", plain.getWorksheet("S")!.getCell("B5").value === 2);
+      check("a sheet name in another alphabet is read as one", rangesOn("SUM(Données!B4:B5)", "Données", false).length === 1 && rangesOn("SUM(Données!B4:B5)", "S", true).length === 0);
+      const single = sheetOf([["CODE"], ["A"]]);
+      applyOps(single, one([{ CODE: "B" }]));
+      check("a table of one column has no footer to tell from a row", single.getWorksheet("S")!.getCell("A3").value === "B");
+    }
+
+    // A block over the first cell of a plain filled-down formula: the cells left get their own, and the file saves.
+    {
+      const wb0 = new ExcelJS.Workbook();
+      const w0 = wb0.addWorksheet("P");
+      w0.getCell("A1").value = "Double";
+      w0.getCell("C1").value = 4;
+      w0.fillFormula("A2:A4", "C1*2", [8, 0, 0]);
+      const { released } = applyOps(wb0, [{ op: "populate_sheet", sheet: "P", startCell: "A2", overwrite: true, rows: [{ x: 1 }] }]);
+      const back = await save(wb0, out);
+      check("a block over the first cell leaves the rest with their own formulas, and says which", back.getWorksheet("P")!.getCell("A2").value === 1 && back.getWorksheet("P")!.getCell("A3").formula === "C2*2" && back.getWorksheet("P")!.getCell("A4").formula === "C3*2" && [...(released.get("P") ?? [])].join() === "A3,A4");
+      for (const f of ["1.E3*B2", "ABC1234567+B2", "B1048577*2"]) check(`not carried over: ${f}`, !translatesSafely(f));
     }
 
     console.log(`\n✓ xlsx-fill: ${passed} checks passed`);
